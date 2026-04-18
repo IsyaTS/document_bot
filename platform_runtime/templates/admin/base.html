@@ -17,6 +17,7 @@
       <div class="stack">
         <p class="meta">{{ runtime.account.name }} · {{ runtime.account.slug }}</p>
         <p class="meta">{{ runtime.actor_user.full_name or runtime.actor_user.email }}</p>
+        <p class="meta">Role: {{ runtime.role_code }}</p>
       </div>
       {% if accessible_accounts %}
       <div class="account-switcher">
@@ -25,7 +26,7 @@
           {% for account in accessible_accounts %}
           <a
             class="switch-link {{ 'active' if account.slug == runtime.account.slug else '' }}"
-            href="/admin/{{ account.slug }}/{{ page_path }}?{{ page_query }}"
+            href="/admin/switch-account/{{ account.slug }}?next=/admin/{{ account.slug }}/{{ page_path }}"
           >
             {{ account.name }}
           </a>
@@ -34,12 +35,14 @@
       </div>
       {% endif %}
       <nav class="nav">
-        <a class="{{ 'active' if page == 'dashboard' else '' }}" href="/admin/{{ runtime.account.slug }}/dashboard?{{ page_query }}">Dashboard</a>
-        <a class="{{ 'active' if page == 'integrations' else '' }}" href="/admin/{{ runtime.account.slug }}/integrations?{{ page_query }}">Integrations</a>
-        <a class="{{ 'active' if page == 'alerts_tasks' else '' }}" href="/admin/{{ runtime.account.slug }}/alerts-tasks?{{ page_query }}">Alerts / Tasks</a>
-        <a class="{{ 'active' if page == 'ops_sync' else '' }}" href="/admin/{{ runtime.account.slug }}/ops-sync?{{ page_query }}">Ops / Sync</a>
-        <a class="{{ 'active' if page == 'goals' else '' }}" href="/admin/{{ runtime.account.slug }}/goals?{{ page_query }}">Goals</a>
+        {% for item in nav_items %}
+        <a class="{{ 'active' if page == item.key else '' }}" href="/admin/{{ runtime.account.slug }}/{{ item.path }}">{{ item.label }}</a>
+        {% endfor %}
       </nav>
+      <div class="sidebar-actions">
+        <a class="switch-link" href="/admin?choose=1">Choose account</a>
+        <a class="switch-link" href="/admin/logout">Logout</a>
+      </div>
       {% endif %}
     </aside>
     <main class="content">

@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Choose Account</title>
+  <link rel="stylesheet" href="{{ url_for('admin-static', path='admin.css') }}">
+</head>
+<body>
+  <main class="content" style="max-width: 900px; margin: 0 auto; padding-top: 60px;">
+    <section class="card hero">
+      <div class="actions" style="justify-content: space-between; align-items: center;">
+        <div>
+          <h2 style="margin: 0;">Choose Account</h2>
+          <p class="subtle">{{ actor_email }}</p>
+        </div>
+        <a class="switch-link" href="/admin/logout">Logout</a>
+      </div>
+      <div class="grid cols-2" style="margin-top: 18px;">
+        {% for account in accounts %}
+        <a class="card" href="/admin/switch-account/{{ account.slug }}">
+          <h3>{{ account.name }}</h3>
+          <p class="subtle">{{ account.slug }}</p>
+          <p class="status-line">Open owner/operator console</p>
+        </a>
+        {% endfor %}
+      </div>
+    </section>
+  </main>
+</body>
+</html>

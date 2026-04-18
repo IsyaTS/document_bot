@@ -19,7 +19,7 @@
         <p class="subtle">General setup, provider credentials и safe replace semantics.</p>
       </div>
       {% if selected_setup %}
-      <a class="pill-link" href="/admin/{{ runtime.account.slug }}/integrations?{{ page_query }}">new integration</a>
+      <a class="pill-link" href="/admin/{{ runtime.account.slug }}/integrations">new integration</a>
       {% endif %}
     </div>
 
@@ -190,7 +190,7 @@
             <td>{{ human_sync_error(sync.latest_failure) if sync else "—" }}</td>
             <td>
               <div class="actions">
-                <a class="pill-link" href="/admin/{{ runtime.account.slug }}/integrations?{{ page_query }}&integration_id={{ integration.id }}">Edit setup</a>
+                <a class="pill-link" href="/admin/{{ runtime.account.slug }}/integrations?integration_id={{ integration.id }}">Edit setup</a>
                 <button type="button" class="run-sync secondary" data-integration-id="{{ integration.id }}">Run sync</button>
               </div>
             </td>
@@ -224,7 +224,6 @@
 </section>
 
 <script>
-  const actorEmail = {{ runtime.actor_user.email|tojson }};
   let currentIntegrationId = {{ selected_setup.integration.id if selected_setup else 'null' }};
 
   function activeProviderKey() {
@@ -284,7 +283,7 @@
       const response = await fetch(`/admin/{{ runtime.account.slug }}/integrations/${integrationId}/sync`, {
         method: "POST",
         headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({actor_email: actorEmail}),
+        body: JSON.stringify({}),
       });
       if (!response.ok) {
         throw new Error(await response.text());
@@ -308,7 +307,6 @@
         method: "POST",
         headers: {"Content-Type": "application/json"},
         body: JSON.stringify({
-          actor_email: actorEmail,
           integration_id: currentIntegrationId,
           integration: integrationPayload(),
           credentials: collectProviderCredentials(),
@@ -319,7 +317,7 @@
       }
       const body = await response.json();
       statusNode.textContent = `Saved integration #${body.integration.id}`;
-      window.location.href = `/admin/{{ runtime.account.slug }}/integrations?{{ page_query }}&integration_id=${body.integration.id}`;
+      window.location.href = `/admin/{{ runtime.account.slug }}/integrations?integration_id=${body.integration.id}`;
     } catch (error) {
       statusNode.textContent = "";
       alert(`Save failed: ${error}`);
@@ -335,7 +333,6 @@
         method: "POST",
         headers: {"Content-Type": "application/json"},
         body: JSON.stringify({
-          actor_email: actorEmail,
           credentials: collectProviderCredentials(),
         }),
       });

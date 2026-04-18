@@ -18,6 +18,7 @@ class PlatformSettings:
     credentials_key: str | None
     default_timezone: str
     internal_api_token: str
+    admin_access_code: str
     api_host: str
     api_port: int
     worker_id: str
@@ -45,6 +46,7 @@ def load_platform_settings() -> PlatformSettings:
         credentials_key=os.getenv("PLATFORM_CREDENTIALS_KEY") or None,
         default_timezone=os.getenv("PLATFORM_DEFAULT_TIMEZONE", "Etc/UTC").strip() or "Etc/UTC",
         internal_api_token=os.getenv("PLATFORM_INTERNAL_API_TOKEN", secret_key).strip() or secret_key,
+        admin_access_code=os.getenv("PLATFORM_ADMIN_ACCESS_CODE", secret_key).strip() or secret_key,
         api_host=os.getenv("PLATFORM_API_HOST", "0.0.0.0").strip() or "0.0.0.0",
         api_port=max(1, int(os.getenv("PLATFORM_API_PORT", "8000"))),
         worker_id=os.getenv("PLATFORM_WORKER_ID", "worker-default").strip() or "worker-default",

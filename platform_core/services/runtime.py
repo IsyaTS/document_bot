@@ -60,6 +60,8 @@ class ResolvedRuntimeContext:
     context: TenantContext
     account: Account
     actor_user: User
+    membership: AccountUser
+    role_code: str
     permissions: set[str]
 
 
@@ -121,7 +123,15 @@ class RuntimeContextService:
             is_system=False,
         )
         permissions = self._authz.list_permissions(context)
-        return ResolvedRuntimeContext(context=context, account=account, actor_user=actor, permissions=permissions)
+        role_code = membership.role.code if membership.role is not None else ""
+        return ResolvedRuntimeContext(
+            context=context,
+            account=account,
+            actor_user=actor,
+            membership=membership,
+            role_code=role_code,
+            permissions=permissions,
+        )
 
 
 class RuntimeLeaseService:

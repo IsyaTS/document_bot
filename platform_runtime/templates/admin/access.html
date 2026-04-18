@@ -3,25 +3,29 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Hermes Admin Access</title>
+  <title>Hermes Admin Login</title>
   <link rel="stylesheet" href="{{ url_for('admin-static', path='admin.css') }}">
 </head>
 <body>
   <main class="content" style="max-width: 760px; margin: 0 auto; padding-top: 60px;">
     <section class="card hero">
-      <h2 style="margin-top: 0;">Hermes Admin App</h2>
-      <p class="subtle">Минимальный internal web app поверх runtime API. Авторизация как полноценный login flow пока вне scope; вход идёт через account slug и operator email.</p>
-      <form class="stack" action="/admin" method="get" style="margin-top: 18px;">
+      <h2 style="margin-top: 0;">Hermes Admin Login</h2>
+      <p class="subtle">Minimal internal session-based access for owner/operator use. Login uses your existing user email and one internal access code.</p>
+      {% if error_message %}
+      <div class="notice bad" style="margin-top: 16px;">{{ error_message }}</div>
+      {% endif %}
+      <form class="stack" action="/admin/login" method="post" style="margin-top: 18px;">
+        <input type="hidden" name="next" value="{{ next_path or '' }}">
         <label>
-          Account slug
-          <input name="account_slug" value="hermes" required>
+          User email
+          <input name="email" type="email" value="{{ prefill_email or '' }}" placeholder="owner@hermes.local" required>
         </label>
         <label>
-          Operator email
-          <input name="actor_email" value="owner@hermes.local" required>
+          Access code
+          <input name="access_code" type="password" required>
         </label>
         <div class="actions">
-          <button type="submit">Open Admin App</button>
+          <button type="submit">Login</button>
         </div>
       </form>
     </section>

@@ -260,6 +260,34 @@ For stage 6.9 operational hardening:
   - `GET /api/admin/accounts/{account_id}/ops-summary`
   - `bash -lc 'set -a; source .env; set +a; ./.venv/bin/python scripts/hermes_ops_report.py'`
 
+### Hermes Admin App
+
+Current admin surface is a lightweight server-rendered FastAPI app, not a separate frontend stack.
+
+Main pages:
+
+- `/admin/login`
+- `/admin`
+- `/admin/{account_slug}/dashboard`
+- `/admin/{account_slug}/integrations`
+- `/admin/{account_slug}/alerts-tasks`
+- `/admin/{account_slug}/ops-sync`
+- `/admin/{account_slug}/goals`
+
+Current access flow:
+
+- login with existing user email + `PLATFORM_ADMIN_ACCESS_CODE`
+- session cookie `hermes_admin_session`
+- account chooser for users with more than one active membership
+- explicit account switch in the sidebar
+- logout via `/admin/logout`
+
+Current UI access behavior:
+
+- `owner` / `admin`: full dashboard, integrations, ops and goal management
+- `viewer`: dashboard + goals read-only + alerts/tasks visibility, but no integrations or ops management
+- server-side permission checks remain enforced even if a restricted URL is opened directly
+
 ### Avito provider contract
 
 Поддерживаемый concrete Avito live contract в текущем runtime:

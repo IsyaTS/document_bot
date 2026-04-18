@@ -4,11 +4,12 @@ import json
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
-from urllib.parse import urlencode
+from urllib.parse import parse_qs, urlencode
 from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from starlette.middleware.sessions import SessionMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import select, text
@@ -44,6 +45,13 @@ from platform_runtime.schemas import (
 def create_app() -> FastAPI:
     settings = load_platform_settings()
     app = FastAPI(title="Platform Runtime API", version="0.1.0")
+    app.add_middleware(
+        SessionMiddleware,
+        secret_key=settings.secret_key,
+        session_cookie="hermes_admin_session",
+        same_site="lax",
+        https_only=settings.environment == "production",
+    )
     templates = Jinja2Templates(directory=str(Path(__file__).resolve().parent / "templates"))
     app.mount("/admin-static", StaticFiles(directory=str(Path(__file__).resolve().parent / "static")), name="admin-static")
 
@@ -68,8 +76,25 @@ def create_app() -> FastAPI:
             request_id=request.headers.get("x-request-id"),
         )
 
-    def admin_query_string(actor_email: str) -> str:
-        return urlencode({"actor_email": actor_email})
+    def _session_actor_email(request: Request) -> str | None:
+        value = request.session.get("admin_actor_email")
+        if not isinstance(value, str):
+            return None
+        value = value.strip()
+        return value or None
+
+    def _session_account_slug(request: Request) -> str | None:
+        value = request.session.get("admin_account_slug")
+        if not isinstance(value, str):
+            return None
+        value = value.strip()
+        return value or None
+
+    def _login_redirect(next_path: str | None = None) -> RedirectResponse:
+        suffix = ""
+        if next_path:
+            suffix = f"?{urlencode({'next': next_path})}"
+        return RedirectResponse(url=f"/admin/login{suffix}", status_code=status.HTTP_302_FOUND)
 
     def _admin_page_path(page: str) -> str:
         return {
@@ -88,6 +113,26 @@ def create_app() -> FastAPI:
             .where(User.email == actor_email, AccountUser.status == "active")
             .order_by(Account.name.asc(), Account.slug.asc())
         ).scalars().all()
+
+    def _require_admin_email(request: Request) -> str:
+        actor_email = _session_actor_email(request)
+        if actor_email is None:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Admin session is required.")
+        return actor_email
+
+    def _admin_nav_items(runtime: ResolvedRuntimeContext) -> list[dict[str, str]]:
+        permissions = runtime.permissions
+        items: list[dict[str, str]] = []
+        if "dashboard.read" in permissions or "*" in permissions:
+            items.append({"key": "dashboard", "label": "Dashboard", "path": "dashboard"})
+            items.append({"key": "goals", "label": "Goals", "path": "goals"})
+        if "alerts.read" in permissions or "tasks.read" in permissions or "*" in permissions:
+            items.append({"key": "alerts_tasks", "label": "Alerts / Tasks", "path": "alerts-tasks"})
+        if "integrations.manage" in permissions or "*" in permissions:
+            items.append({"key": "integrations", "label": "Integrations", "path": "integrations"})
+        if {"integrations.manage", "rules.manage", "tasks.read", "alerts.read"}.issubset(permissions) or "*" in permissions:
+            items.append({"key": "ops_sync", "label": "Ops / Sync", "path": "ops-sync"})
+        return items
 
     def _provider_catalog() -> list[dict[str, object]]:
         return [
@@ -157,8 +202,11 @@ def create_app() -> FastAPI:
             "runtime": runtime,
             "page": page,
             "page_path": _admin_page_path(page),
-            "page_query": admin_query_string(actor_email),
             "accessible_accounts": _accessible_accounts(session, actor_email),
+            "nav_items": _admin_nav_items(runtime),
+            "can_manage_integrations": "*" in runtime.permissions or "integrations.manage" in runtime.permissions,
+            "can_manage_goals": "*" in runtime.permissions or "rules.manage" in runtime.permissions,
+            "can_view_ops": "*" in runtime.permissions or {"integrations.manage", "rules.manage", "tasks.read", "alerts.read"}.issubset(runtime.permissions),
         }
 
     def _goal_period_defaults(period_kind: str, runtime: ResolvedRuntimeContext) -> tuple[date, date]:
@@ -222,15 +270,15 @@ def create_app() -> FastAPI:
         }
 
     def _goal_metric_links(account_slug: str, actor_email: str, metric_code: str) -> dict[str, str]:
-        query = admin_query_string(actor_email)
+        del actor_email
         severity = "critical"
         priority = "high"
         if metric_code == "cpl":
             severity = "warning"
         return {
-            "alerts": f"/admin/{account_slug}/alerts-tasks?{query}&severity={severity}",
-            "tasks": f"/admin/{account_slug}/alerts-tasks?{query}&priority={priority}",
-            "ops": f"/admin/{account_slug}/ops-sync?{query}",
+            "alerts": f"/admin/{account_slug}/alerts-tasks?severity={severity}",
+            "tasks": f"/admin/{account_slug}/alerts-tasks?priority={priority}",
+            "ops": f"/admin/{account_slug}/ops-sync",
         }
 
     def _goal_blocker_rows(
@@ -746,27 +794,113 @@ def create_app() -> FastAPI:
             "summary": metrics["summary"],
         }
 
-    @app.get("/admin", response_class=HTMLResponse)
+    @app.get("/admin/login", response_class=HTMLResponse)
+    def admin_login_page(
+        request: Request,
+        next: str | None = Query(default=None),
+    ) -> HTMLResponse:
+        if _session_actor_email(request):
+            return RedirectResponse(url=next or "/admin", status_code=status.HTTP_302_FOUND)
+        return templates.TemplateResponse(
+            request,
+            "admin/access.html",
+            {"next_path": next, "error_message": None, "prefill_email": ""},
+        )
+
+    @app.post("/admin/login", response_class=HTMLResponse)
+    async def admin_login_submit(
+        request: Request,
+        session: Session = Depends(get_db_session),
+    ):
+        payload = parse_qs((await request.body()).decode("utf-8"), keep_blank_values=True)
+        email = str((payload.get("email") or [""])[0]).strip().lower()
+        access_code = str((payload.get("access_code") or [""])[0]).strip()
+        next_path = str((payload.get("next") or [""])[0]).strip() or None
+        if not email or not access_code:
+            return templates.TemplateResponse(
+                request,
+                "admin/access.html",
+                {"next_path": next_path, "error_message": "Email and access code are required.", "prefill_email": email},
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+        if access_code != settings.admin_access_code:
+            return templates.TemplateResponse(
+                request,
+                "admin/access.html",
+                {"next_path": next_path, "error_message": "Invalid access code.", "prefill_email": email},
+                status_code=status.HTTP_401_UNAUTHORIZED,
+            )
+        memberships = _accessible_accounts(session, email)
+        if not memberships:
+            return templates.TemplateResponse(
+                request,
+                "admin/access.html",
+                {"next_path": next_path, "error_message": "No active account memberships found for this email.", "prefill_email": email},
+                status_code=status.HTTP_403_FORBIDDEN,
+            )
+        request.session["admin_actor_email"] = email
+        current_account = _session_account_slug(request)
+        allowed_slugs = {item.slug for item in memberships}
+        request.session["admin_account_slug"] = current_account if current_account in allowed_slugs else memberships[0].slug
+        return RedirectResponse(url=next_path or "/admin", status_code=status.HTTP_302_FOUND)
+
+    @app.get("/admin/logout")
+    def admin_logout(request: Request) -> RedirectResponse:
+        request.session.clear()
+        return RedirectResponse(url="/admin/login", status_code=status.HTTP_302_FOUND)
+
+    @app.get("/admin")
     def admin_home(
         request: Request,
-        account_slug: str | None = Query(default=None),
-        actor_email: str | None = Query(default=None),
+        choose: bool = Query(default=False),
+        session: Session = Depends(get_db_session),
     ):
-        if account_slug and actor_email:
-            return RedirectResponse(
-                url=f"/admin/{account_slug}/dashboard?{admin_query_string(actor_email)}",
-                status_code=status.HTTP_302_FOUND,
-            )
-        return templates.TemplateResponse(request, "admin/access.html", {})
+        actor_email = _session_actor_email(request)
+        if actor_email is None:
+            return _login_redirect("/admin")
+        accounts = _accessible_accounts(session, actor_email)
+        if not accounts:
+            request.session.clear()
+            return _login_redirect("/admin")
+        active_slug = _session_account_slug(request)
+        if not choose and active_slug and any(item.slug == active_slug for item in accounts):
+            return RedirectResponse(url=f"/admin/{active_slug}/dashboard", status_code=status.HTTP_302_FOUND)
+        if len(accounts) == 1:
+            request.session["admin_account_slug"] = accounts[0].slug
+            return RedirectResponse(url=f"/admin/{accounts[0].slug}/dashboard", status_code=status.HTTP_302_FOUND)
+        return templates.TemplateResponse(
+            request,
+            "admin/account_select.html",
+            {"accounts": accounts, "actor_email": actor_email},
+        )
+
+    @app.get("/admin/switch-account/{account_slug}")
+    def admin_switch_account(
+        request: Request,
+        account_slug: str,
+        next: str | None = Query(default=None),
+        session: Session = Depends(get_db_session),
+    ) -> RedirectResponse:
+        actor_email = _session_actor_email(request)
+        if actor_email is None:
+            return _login_redirect(f"/admin/switch-account/{account_slug}")
+        allowed = {item.slug for item in _accessible_accounts(session, actor_email)}
+        if account_slug not in allowed:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cross-account switch denied.")
+        request.session["admin_account_slug"] = account_slug
+        return RedirectResponse(url=next or f"/admin/{account_slug}/dashboard", status_code=status.HTTP_302_FOUND)
 
     @app.get("/admin/{account_slug}/dashboard", response_class=HTMLResponse)
     def admin_dashboard(
         request: Request,
         account_slug: str,
-        actor_email: str = Query(...),
         session: Session = Depends(get_db_session),
     ) -> HTMLResponse:
+        actor_email = _session_actor_email(request)
+        if actor_email is None:
+            return _login_redirect(f"/admin/{account_slug}/dashboard")
         runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
+        request.session["admin_account_slug"] = runtime.account.slug
         ensure_permission(runtime, "dashboard.read")
         dashboard = ExecutiveDashboardService(session).get_dashboard(runtime.context, "today")
         widgets = {item["widget_key"]: item["payload"] for item in dashboard["widgets"]}
@@ -808,12 +942,15 @@ def create_app() -> FastAPI:
     def admin_integrations(
         request: Request,
         account_slug: str,
-        actor_email: str = Query(...),
         integration_id: int | None = Query(default=None),
         provider: str | None = Query(default=None),
         session: Session = Depends(get_db_session),
     ) -> HTMLResponse:
+        actor_email = _session_actor_email(request)
+        if actor_email is None:
+            return _login_redirect(f"/admin/{account_slug}/integrations")
         runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
+        request.session["admin_account_slug"] = runtime.account.slug
         ensure_permission(runtime, "integrations.manage")
         service = RuntimeIntegrationService(session)
         integrations = service.list_integrations(runtime.context)
@@ -849,12 +986,15 @@ def create_app() -> FastAPI:
     def admin_alerts_tasks(
         request: Request,
         account_slug: str,
-        actor_email: str = Query(...),
         severity: str | None = Query(default=None),
         priority: str | None = Query(default=None),
         session: Session = Depends(get_db_session),
     ) -> HTMLResponse:
+        actor_email = _session_actor_email(request)
+        if actor_email is None:
+            return _login_redirect(f"/admin/{account_slug}/alerts-tasks")
         runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
+        request.session["admin_account_slug"] = runtime.account.slug
         ensure_permission(runtime, "alerts.read")
         ensure_permission(runtime, "tasks.read")
         automation = RuntimeAutomationService(session)
@@ -896,10 +1036,13 @@ def create_app() -> FastAPI:
     def admin_ops_sync(
         request: Request,
         account_slug: str,
-        actor_email: str = Query(...),
         session: Session = Depends(get_db_session),
     ) -> HTMLResponse:
+        actor_email = _session_actor_email(request)
+        if actor_email is None:
+            return _login_redirect(f"/admin/{account_slug}/ops-sync")
         runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
+        request.session["admin_account_slug"] = runtime.account.slug
         ensure_permission(runtime, "integrations.manage")
         ensure_permission(runtime, "rules.manage")
         ensure_permission(runtime, "tasks.read")
@@ -919,11 +1062,14 @@ def create_app() -> FastAPI:
     def admin_goals(
         request: Request,
         account_slug: str,
-        actor_email: str = Query(...),
         goal_id: int | None = Query(default=None),
         session: Session = Depends(get_db_session),
     ) -> HTMLResponse:
+        actor_email = _session_actor_email(request)
+        if actor_email is None:
+            return _login_redirect(f"/admin/{account_slug}/goals")
         runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
+        request.session["admin_account_slug"] = runtime.account.slug
         ensure_permission(runtime, "dashboard.read")
         service = GoalService(session)
         goals = service.list_goals(runtime.context)
@@ -981,10 +1127,7 @@ def create_app() -> FastAPI:
         integration_id: int,
         session: Session = Depends(get_db_session),
     ) -> JSONResponse:
-        payload = await request.json()
-        actor_email = str(payload.get("actor_email") or "").strip()
-        if not actor_email:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="actor_email is required.")
+        actor_email = _require_admin_email(request)
         runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
         ensure_permission(runtime, "integrations.manage")
         service = RuntimeIntegrationService(session)
@@ -1013,9 +1156,7 @@ def create_app() -> FastAPI:
         session: Session = Depends(get_db_session),
     ) -> JSONResponse:
         payload = await request.json()
-        actor_email = str(payload.get("actor_email") or "").strip()
-        if not actor_email:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="actor_email is required.")
+        actor_email = _require_admin_email(request)
         runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
         ensure_permission(runtime, "integrations.manage")
         body = _parse_admin_payload(payload, "integration")
@@ -1069,9 +1210,7 @@ def create_app() -> FastAPI:
         session: Session = Depends(get_db_session),
     ) -> JSONResponse:
         payload = await request.json()
-        actor_email = str(payload.get("actor_email") or "").strip()
-        if not actor_email:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="actor_email is required.")
+        actor_email = _require_admin_email(request)
         runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
         ensure_permission(runtime, "integrations.manage")
         credentials = _parse_admin_payload(payload, "credentials")
@@ -1092,9 +1231,7 @@ def create_app() -> FastAPI:
         session: Session = Depends(get_db_session),
     ) -> JSONResponse:
         payload = await request.json()
-        actor_email = str(payload.get("actor_email") or "").strip()
-        if not actor_email:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="actor_email is required.")
+        actor_email = _require_admin_email(request)
         runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
         ensure_permission(runtime, "rules.manage")
         body = payload.get("goal") or {}

@@ -6,21 +6,26 @@
     <p class="subtle">Minimal goals foundation: account-scoped, owner-scoped, period-based targets and plan vs fact.</p>
   </div>
   <div class="chips">
-    <a class="pill-link" href="/admin/{{ runtime.account.slug }}/goals?{{ page_query }}">new goal</a>
+    {% if can_manage_goals %}
+    <a class="pill-link" href="/admin/{{ runtime.account.slug }}/goals">new goal</a>
+    {% endif %}
   </div>
 </div>
 
 <section class="grid cols-2">
   <article class="card">
     <h3>{{ "Edit Goal" if selected_goal else "Create Goal" }}</h3>
+    {% if not can_manage_goals %}
+    <p class="subtle">Read-only view for your current role. Goal editing requires `rules.manage`.</p>
+    {% endif %}
     <div class="form-grid two">
       <label>
         Title
-        <input id="goal-title" value="{{ selected_goal.goal.title if selected_goal else '' }}">
+        <input id="goal-title" value="{{ selected_goal.goal.title if selected_goal else '' }}" {% if not can_manage_goals %}disabled{% endif %}>
       </label>
       <label>
         Status
-        <select id="goal-status">
+        <select id="goal-status" {% if not can_manage_goals %}disabled{% endif %}>
           {% for status_code in ["draft", "active", "archived"] %}
           <option value="{{ status_code }}" {{ 'selected' if selected_goal and selected_goal.goal.status == status_code else '' }}>{{ status_code }}</option>
           {% endfor %}
@@ -28,7 +33,7 @@
       </label>
       <label>
         Period kind
-        <select id="goal-period-kind">
+        <select id="goal-period-kind" {% if not can_manage_goals %}disabled{% endif %}>
           {% for kind in ["day", "week", "month"] %}
           <option value="{{ kind }}" {{ 'selected' if selected_goal and selected_goal.goal.period_kind == kind else ('selected' if not selected_goal and kind == 'month' else '') }}>{{ kind }}</option>
           {% endfor %}
@@ -36,7 +41,7 @@
       </label>
       <label>
         Owner
-        <select id="goal-owner">
+        <select id="goal-owner" {% if not can_manage_goals %}disabled{% endif %}>
           <option value="">current operator</option>
           {% for owner in owners %}
           <option value="{{ owner.id }}" {{ 'selected' if selected_goal and selected_goal.goal.owner_user_id == owner.id else '' }}>{{ owner.full_name or owner.email }}</option>
@@ -45,19 +50,19 @@
       </label>
       <label>
         Period start
-        <input id="goal-period-start" type="date" value="{{ selected_goal.goal.period_start if selected_goal else default_period_start }}">
+        <input id="goal-period-start" type="date" value="{{ selected_goal.goal.period_start if selected_goal else default_period_start }}" {% if not can_manage_goals %}disabled{% endif %}>
       </label>
       <label>
         Period end
-        <input id="goal-period-end" type="date" value="{{ selected_goal.goal.period_end if selected_goal else default_period_end }}">
+        <input id="goal-period-end" type="date" value="{{ selected_goal.goal.period_end if selected_goal else default_period_end }}" {% if not can_manage_goals %}disabled{% endif %}>
       </label>
     </div>
     <label style="margin-top: 12px;">
       Description
-      <textarea id="goal-description">{{ selected_goal.goal.description if selected_goal else '' }}</textarea>
+      <textarea id="goal-description" {% if not can_manage_goals %}disabled{% endif %}>{{ selected_goal.goal.description if selected_goal else '' }}</textarea>
     </label>
     <label style="margin-top: 12px;">
-      <input id="goal-is-primary" type="checkbox" style="width:auto;" {% if selected_goal and selected_goal.goal.is_primary %}checked{% endif %}>
+      <input id="goal-is-primary" type="checkbox" style="width:auto;" {% if selected_goal and selected_goal.goal.is_primary %}checked{% endif %} {% if not can_manage_goals %}disabled{% endif %}>
       Primary dashboard goal
     </label>
 
@@ -68,22 +73,24 @@
         {% set selected_target = selected_targets_by_code.get(metric.code) %}
         <label>
           {{ metric.label }}
-          <input type="number" step="0.01" class="goal-target" data-metric-code="{{ metric.code }}" data-direction="{{ metric.direction }}" value="{{ selected_target.target_value if selected_target else '' }}">
+          <input type="number" step="0.01" class="goal-target" data-metric-code="{{ metric.code }}" data-direction="{{ metric.direction }}" value="{{ selected_target.target_value if selected_target else '' }}" {% if not can_manage_goals %}disabled{% endif %}>
         </label>
         {% endfor %}
       </div>
     </div>
+    {% if can_manage_goals %}
     <div class="actions" style="margin-top: 16px;">
       <button type="button" id="save-goal">{{ "Update goal" if selected_goal else "Create goal" }}</button>
       <span class="subtle" id="goal-save-status"></span>
     </div>
+    {% endif %}
   </article>
 
   <article class="card">
     <h3>Existing Goals</h3>
     <div class="stack">
       {% for goal in goals %}
-      <a class="card" style="padding: 14px;" href="/admin/{{ runtime.account.slug }}/goals?{{ page_query }}&goal_id={{ goal.id }}">
+      <a class="card" style="padding: 14px;" href="/admin/{{ runtime.account.slug }}/goals?goal_id={{ goal.id }}">
         <div class="actions" style="justify-content: space-between;">
           <strong>{{ goal.title }}</strong>
           {% if selected_goal and selected_goal.goal.id == goal.id %}
@@ -161,7 +168,7 @@
 {% endif %}
 
 <script>
-  const actorEmail = {{ runtime.actor_user.email|tojson }};
+  {% if can_manage_goals %}
   const currentGoalId = {{ selected_goal.goal.id if selected_goal else 'null' }};
   document.getElementById("save-goal").addEventListener("click", async () => {
     const targets = [];
@@ -174,7 +181,6 @@
       });
     }
     const payload = {
-      actor_email: actorEmail,
       goal_id: currentGoalId,
       goal: {
         title: document.getElementById("goal-title").value,
@@ -201,11 +207,12 @@
       }
       const body = await response.json();
       statusNode.textContent = `Saved goal #${body.goal.id}`;
-      window.location.href = `/admin/{{ runtime.account.slug }}/goals?{{ page_query }}&goal_id=${body.goal.id}`;
+      window.location.href = `/admin/{{ runtime.account.slug }}/goals?goal_id=${body.goal.id}`;
     } catch (error) {
       statusNode.textContent = "";
       alert(`Goal save failed: ${error}`);
     }
   });
+  {% endif %}
 </script>
 {% endblock %}
