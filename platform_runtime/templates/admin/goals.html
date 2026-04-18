@@ -1,0 +1,172 @@
+{% extends "admin/base.html" %}
+{% block content %}
+<div class="topbar">
+  <div>
+    <h2>Goals</h2>
+    <p class="subtle">Minimal goals foundation: account-scoped, owner-scoped, period-based targets and plan vs fact.</p>
+  </div>
+  <div class="chips">
+    <a class="pill-link" href="/admin/{{ runtime.account.slug }}/goals?{{ page_query }}">new goal</a>
+  </div>
+</div>
+
+<section class="grid cols-2">
+  <article class="card">
+    <h3>{{ "Edit Goal" if selected_goal else "Create Goal" }}</h3>
+    <div class="form-grid two">
+      <label>
+        Title
+        <input id="goal-title" value="{{ selected_goal.goal.title if selected_goal else '' }}">
+      </label>
+      <label>
+        Status
+        <select id="goal-status">
+          {% for status_code in ["draft", "active", "archived"] %}
+          <option value="{{ status_code }}" {{ 'selected' if selected_goal and selected_goal.goal.status == status_code else '' }}>{{ status_code }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>
+        Period kind
+        <select id="goal-period-kind">
+          {% for kind in ["day", "week", "month"] %}
+          <option value="{{ kind }}" {{ 'selected' if selected_goal and selected_goal.goal.period_kind == kind else ('selected' if not selected_goal and kind == 'month' else '') }}>{{ kind }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>
+        Owner
+        <select id="goal-owner">
+          <option value="">current operator</option>
+          {% for owner in owners %}
+          <option value="{{ owner.id }}" {{ 'selected' if selected_goal and selected_goal.goal.owner_user_id == owner.id else '' }}>{{ owner.full_name or owner.email }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>
+        Period start
+        <input id="goal-period-start" type="date" value="{{ selected_goal.goal.period_start if selected_goal else default_period_start }}">
+      </label>
+      <label>
+        Period end
+        <input id="goal-period-end" type="date" value="{{ selected_goal.goal.period_end if selected_goal else default_period_end }}">
+      </label>
+    </div>
+    <label style="margin-top: 12px;">
+      Description
+      <textarea id="goal-description">{{ selected_goal.goal.description if selected_goal else '' }}</textarea>
+    </label>
+    <label style="margin-top: 12px;">
+      <input id="goal-is-primary" type="checkbox" style="width:auto;" {% if selected_goal and selected_goal.goal.is_primary %}checked{% endif %}>
+      Primary dashboard goal
+    </label>
+
+    <div class="card" style="margin-top: 16px; padding: 14px;">
+      <h4>Metric Targets</h4>
+      <div class="form-grid two">
+        {% for metric in metric_definitions %}
+        {% set selected_target = selected_targets_by_code.get(metric.code) %}
+        <label>
+          {{ metric.label }}
+          <input type="number" step="0.01" class="goal-target" data-metric-code="{{ metric.code }}" data-direction="{{ metric.direction }}" value="{{ selected_target.target_value if selected_target else '' }}">
+        </label>
+        {% endfor %}
+      </div>
+    </div>
+    <div class="actions" style="margin-top: 16px;">
+      <button type="button" id="save-goal">{{ "Update goal" if selected_goal else "Create goal" }}</button>
+      <span class="subtle" id="goal-save-status"></span>
+    </div>
+  </article>
+
+  <article class="card">
+    <h3>Existing Goals</h3>
+    <div class="stack">
+      {% for goal in goals %}
+      <a class="card" style="padding: 14px;" href="/admin/{{ runtime.account.slug }}/goals?{{ page_query }}&goal_id={{ goal.id }}">
+        <div class="actions" style="justify-content: space-between;">
+          <strong>{{ goal.title }}</strong>
+          {% if selected_goal and selected_goal.goal.id == goal.id %}
+          <span class="badge good">selected</span>
+          {% endif %}
+        </div>
+        <p class="subtle">{{ goal.period_kind }} · {{ goal.period_start }} — {{ goal.period_end }} · {{ goal.status }}</p>
+      </a>
+      {% else %}
+      <p class="empty">Goals пока не созданы.</p>
+      {% endfor %}
+    </div>
+  </article>
+</section>
+
+{% if selected_goal %}
+<section class="card" style="margin-top: 16px;">
+  <h3>Plan vs Fact</h3>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Metric</th><th>Target</th><th>Actual</th><th>Delta</th><th>Status</th></tr></thead>
+      <tbody>
+        {% for metric in selected_goal.metrics %}
+        <tr>
+          <td>{{ metric.label }}</td>
+          <td>{{ metric.target }}</td>
+          <td>{{ metric.actual }}</td>
+          <td>{{ metric.delta }}</td>
+          <td><span class="badge {{ 'good' if metric.status == 'on_track' else 'warn' if metric.status == 'warning' else 'bad' }}">{{ metric.status }}</span></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endif %}
+
+<script>
+  const actorEmail = {{ runtime.actor_user.email|tojson }};
+  const currentGoalId = {{ selected_goal.goal.id if selected_goal else 'null' }};
+  document.getElementById("save-goal").addEventListener("click", async () => {
+    const targets = [];
+    for (const input of document.querySelectorAll(".goal-target")) {
+      if (!input.value) continue;
+      targets.push({
+        metric_code: input.dataset.metricCode,
+        target_value: Number(input.value),
+        direction: input.dataset.direction,
+      });
+    }
+    const payload = {
+      actor_email: actorEmail,
+      goal_id: currentGoalId,
+      goal: {
+        title: document.getElementById("goal-title").value,
+        description: document.getElementById("goal-description").value,
+        period_kind: document.getElementById("goal-period-kind").value,
+        period_start: document.getElementById("goal-period-start").value,
+        period_end: document.getElementById("goal-period-end").value,
+        owner_user_id: document.getElementById("goal-owner").value || null,
+        is_primary: document.getElementById("goal-is-primary").checked,
+        status: document.getElementById("goal-status").value,
+      },
+      targets,
+    };
+    const statusNode = document.getElementById("goal-save-status");
+    statusNode.textContent = "Saving...";
+    try {
+      const response = await fetch(`/admin/{{ runtime.account.slug }}/goals/save`, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(payload),
+      });
+      if (!response.ok) {
+        throw new Error(await response.text());
+      }
+      const body = await response.json();
+      statusNode.textContent = `Saved goal #${body.goal.id}`;
+      window.location.href = `/admin/{{ runtime.account.slug }}/goals?{{ page_query }}&goal_id=${body.goal.id}`;
+    } catch (error) {
+      statusNode.textContent = "";
+      alert(`Goal save failed: ${error}`);
+    }
+  });
+</script>
+{% endblock %}

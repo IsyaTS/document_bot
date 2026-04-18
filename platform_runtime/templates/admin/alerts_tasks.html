@@ -1,0 +1,106 @@
+{% extends "admin/base.html" %}
+{% block content %}
+<div class="topbar">
+  <div>
+    <h2>Alerts / Tasks</h2>
+    <p class="subtle">Active alerts, open tasks, overdue work и быстрый фильтр по severity / priority.</p>
+  </div>
+</div>
+
+<form class="card filters" method="get">
+  <input type="hidden" name="actor_email" value="{{ runtime.actor_user.email }}">
+  <label>
+    Alert severity
+    <select name="severity">
+      <option value="">all</option>
+      <option value="critical" {{ 'selected' if severity_filter == 'critical' else '' }}>critical</option>
+      <option value="warning" {{ 'selected' if severity_filter == 'warning' else '' }}>warning</option>
+      <option value="info" {{ 'selected' if severity_filter == 'info' else '' }}>info</option>
+    </select>
+  </label>
+  <label>
+    Task priority
+    <select name="priority">
+      <option value="">all</option>
+      <option value="critical" {{ 'selected' if priority_filter == 'critical' else '' }}>critical</option>
+      <option value="high" {{ 'selected' if priority_filter == 'high' else '' }}>high</option>
+      <option value="normal" {{ 'selected' if priority_filter == 'normal' else '' }}>normal</option>
+      <option value="low" {{ 'selected' if priority_filter == 'low' else '' }}>low</option>
+    </select>
+  </label>
+  <div class="actions" style="align-items: end;">
+    <button type="submit">Apply filter</button>
+  </div>
+</form>
+
+<section class="grid cols-2" style="margin-top: 16px;">
+  <article class="card">
+    <h3>Active Alerts</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Code</th><th>Title</th><th>Severity</th><th>Owner</th><th>SLA</th></tr></thead>
+        <tbody>
+          {% for item in alerts %}
+          <tr>
+            <td>{{ item.code }}</td>
+            <td>{{ item.title }}</td>
+            <td><span class="badge {{ 'bad' if item.severity == 'critical' else 'warn' }}">{{ item.severity }}</span></td>
+            <td>
+              {% if item.assigned_user_id in users %}
+                {{ users[item.assigned_user_id].full_name or users[item.assigned_user_id].email }}
+              {% else %}
+                unassigned
+              {% endif %}
+            </td>
+            <td>{{ alert_slas.get(item.code, "same day") }}</td>
+          </tr>
+          {% else %}
+          <tr><td colspan="5" class="empty">Нет активных alerts.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </article>
+
+  <article class="card">
+    <h3>Open Tasks</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Title</th><th>Priority</th><th>Assignee</th><th>Due at</th><th>SLA</th></tr></thead>
+        <tbody>
+          {% for item in tasks %}
+          <tr>
+            <td>{{ item.title }}</td>
+            <td><span class="badge {{ 'bad' if item.priority == 'critical' else 'warn' if item.priority == 'high' else '' }}">{{ item.priority }}</span></td>
+            <td>
+              {% if item.assignee_user_id in users %}
+                {{ users[item.assignee_user_id].full_name or users[item.assignee_user_id].email }}
+              {% elif item.assignee_employee_id in employees %}
+                {{ employees[item.assignee_employee_id].full_name }}
+              {% else %}
+                unassigned
+              {% endif %}
+            </td>
+            <td>{{ item.due_at or "—" }}</td>
+            <td>{{ "overdue" if item in overdue_tasks else "in range" }}</td>
+          </tr>
+          {% else %}
+          <tr><td colspan="5" class="empty">Нет открытых tasks.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </article>
+</section>
+
+<section class="card" style="margin-top: 16px;">
+  <h3>Overdue Tasks</h3>
+  <div class="chips">
+    {% for item in overdue_tasks %}
+      <span class="chip">{{ item.title }} · {{ item.priority }} · {{ item.due_at }}</span>
+    {% else %}
+      <span class="empty">Просроченных задач нет.</span>
+    {% endfor %}
+  </div>
+</section>
+{% endblock %}

@@ -1,33 +1,118 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+from pathlib import Path
+from urllib.parse import urlencode
+from zoneinfo import ZoneInfo
 
-from fastapi import Depends, FastAPI, HTTPException, Query, status
-from sqlalchemy import text
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
-from platform_core.services import ExecutiveDashboardService
+from platform_core.models import AccountUser, Employee, Goal, GoalTarget, User
+from platform_core.exceptions import PlatformCoreError, TenantContextError
+from platform_core.services import ExecutiveDashboardService, GOAL_METRIC_DEFINITIONS, GoalService
 from platform_core.services.runtime import (
     AdminQueryService,
     ResolvedRuntimeContext,
     RuntimeAutomationService,
+    RuntimeContextService,
     RuntimeIntegrationService,
     SchedulerService,
 )
 from platform_core.settings import load_platform_settings
 from platform_runtime.deps import get_db_session, get_runtime_context
-from platform_runtime.schemas import RuleRunRequest, SchedulerRunRequest, SyncJobCreateRequest
+from platform_runtime.schemas import (
+    GoalCreateRequest,
+    GoalUpdateRequest,
+    RuleRunRequest,
+    SchedulerRunRequest,
+    SyncJobCreateRequest,
+)
 
 
 def create_app() -> FastAPI:
     settings = load_platform_settings()
     app = FastAPI(title="Platform Runtime API", version="0.1.0")
+    templates = Jinja2Templates(directory=str(Path(__file__).resolve().parent / "templates"))
+    app.mount("/admin-static", StaticFiles(directory=str(Path(__file__).resolve().parent / "static")), name="admin-static")
 
     def ensure_permission(runtime: ResolvedRuntimeContext, permission_code: str) -> None:
         if "*" in runtime.permissions or permission_code in runtime.permissions:
             return
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"Missing permission: {permission_code}")
+
+    def resolve_admin_runtime(
+        request: Request,
+        session: Session,
+        *,
+        account_slug: str,
+        actor_email: str,
+    ) -> ResolvedRuntimeContext:
+        return RuntimeContextService(session).resolve(
+            account_id=None,
+            account_slug=account_slug,
+            actor_user_id=None,
+            actor_email=actor_email,
+            source="admin-ui",
+            request_id=request.headers.get("x-request-id"),
+        )
+
+    def admin_query_string(actor_email: str) -> str:
+        return urlencode({"actor_email": actor_email})
+
+    def _goal_period_defaults(period_kind: str, runtime: ResolvedRuntimeContext) -> tuple[date, date]:
+        try:
+            zone = ZoneInfo(runtime.account.default_timezone)
+        except Exception:
+            zone = timezone.utc
+        today = datetime.now(zone).date()
+        if period_kind == "week":
+            start = today - timedelta(days=today.weekday())
+            return start, start + timedelta(days=6)
+        if period_kind == "month":
+            start = today.replace(day=1)
+            if start.month == 12:
+                next_month = start.replace(year=start.year + 1, month=1, day=1)
+            else:
+                next_month = start.replace(month=start.month + 1, day=1)
+            return start, next_month - timedelta(days=1)
+        return today, today
+
+    def _goal_period_from_payload(
+        runtime: ResolvedRuntimeContext,
+        period_kind: str,
+        period_start: date | None,
+        period_end: date | None,
+    ) -> tuple[date, date]:
+        default_start, default_end = _goal_period_defaults(period_kind, runtime)
+        return period_start or default_start, period_end or default_end
+
+    def _alert_sla_map() -> dict[str, str]:
+        return {
+            "bank.balance_below_safe_threshold": "same business hour",
+            "inventory.stock_below_threshold": "same day",
+            "lead.no_first_response": "30 min max",
+            "marketing.cpl_above_threshold": "same day",
+            "leads.lost_above_threshold": "same day",
+            "task.overdue_escalation": "same day",
+        }
+
+    def _human_sync_error(job) -> str | None:
+        if job is None:
+            return None
+        if job.error_message:
+            return job.error_message
+        if job.error_code:
+            return f"{job.error_code}: sync failed."
+        if job.status in {"failed", "retry"}:
+            return f"Last sync ended with status {job.status}."
+        return None
+
 
     @app.get("/health")
     def health(session: Session = Depends(get_db_session)) -> dict[str, object]:
@@ -139,6 +224,7 @@ def create_app() -> FastAPI:
         ensure_permission(runtime, "integrations.manage")
         return [_serialize_integration(item) for item in RuntimeIntegrationService(session).list_integrations(runtime.context)]
 
+
     @app.post("/api/integrations/{integration_id}/sync")
     def enqueue_integration_sync(
         integration_id: int,
@@ -237,6 +323,416 @@ def create_app() -> FastAPI:
                 for item in payload["integration_sync_status"]
             ],
         }
+
+    @app.get("/api/goals")
+    def list_goals_api(
+        status_filter: str | None = Query(default=None, alias="status"),
+        session: Session = Depends(get_db_session),
+        runtime: ResolvedRuntimeContext = Depends(get_runtime_context),
+    ) -> list[dict[str, object]]:
+        ensure_permission(runtime, "dashboard.read")
+        service = GoalService(session)
+        payload = []
+        for goal in service.list_goals(runtime.context, status=status_filter):
+            metrics = service.get_goal_metrics(runtime.context, goal.id)
+            payload.append(_serialize_goal(goal, summary=metrics["summary"]))
+        return payload
+
+    @app.post("/api/goals")
+    def create_goal_api(
+        body: GoalCreateRequest,
+        session: Session = Depends(get_db_session),
+        runtime: ResolvedRuntimeContext = Depends(get_runtime_context),
+    ) -> dict[str, object]:
+        ensure_permission(runtime, "rules.manage")
+        service = GoalService(session)
+        period_start, period_end = _goal_period_from_payload(runtime, body.period_kind, body.period_start, body.period_end)
+        try:
+            goal = service.create_goal(
+                runtime.context,
+                title=body.title,
+                description=body.description,
+                period_kind=body.period_kind,
+                period_start=period_start,
+                period_end=period_end,
+                owner_user_id=body.owner_user_id,
+                is_primary=body.is_primary,
+                status=body.status,
+                targets=[item.model_dump(exclude_none=True) for item in body.targets],
+            )
+        except PlatformCoreError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        metrics = service.get_goal_metrics(runtime.context, goal.id)
+        return {
+            "goal": _serialize_goal(goal, summary=metrics["summary"]),
+            "targets": [_serialize_goal_target(item) for item in metrics["targets"]],
+        }
+
+    @app.get("/api/goals/{goal_id}")
+    def get_goal_api(
+        goal_id: int,
+        session: Session = Depends(get_db_session),
+        runtime: ResolvedRuntimeContext = Depends(get_runtime_context),
+    ) -> dict[str, object]:
+        ensure_permission(runtime, "dashboard.read")
+        service = GoalService(session)
+        try:
+            metrics = service.get_goal_metrics(runtime.context, goal_id)
+        except TenantContextError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        return {
+            "goal": _serialize_goal(metrics["goal"], summary=metrics["summary"]),
+            "targets": [_serialize_goal_target(item) for item in metrics["targets"]],
+        }
+
+    @app.patch("/api/goals/{goal_id}")
+    def update_goal_api(
+        goal_id: int,
+        body: GoalUpdateRequest,
+        session: Session = Depends(get_db_session),
+        runtime: ResolvedRuntimeContext = Depends(get_runtime_context),
+    ) -> dict[str, object]:
+        ensure_permission(runtime, "rules.manage")
+        service = GoalService(session)
+        payload = body.model_dump(exclude_unset=True, exclude_none=False)
+        if "period_kind" in payload:
+            period_start, period_end = _goal_period_from_payload(
+                runtime,
+                payload["period_kind"],
+                payload.get("period_start"),
+                payload.get("period_end"),
+            )
+            payload["period_start"] = period_start
+            payload["period_end"] = period_end
+        try:
+            goal = service.update_goal(
+                runtime.context,
+                goal_id,
+                title=payload.get("title"),
+                description=payload.get("description"),
+                period_kind=payload.get("period_kind"),
+                period_start=payload.get("period_start"),
+                period_end=payload.get("period_end"),
+                owner_user_id=payload.get("owner_user_id"),
+                is_primary=payload.get("is_primary"),
+                status=payload.get("status"),
+                targets=[item.model_dump(exclude_none=True) for item in body.targets] if body.targets is not None else None,
+            )
+        except TenantContextError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        except PlatformCoreError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        metrics = service.get_goal_metrics(runtime.context, goal.id)
+        return {
+            "goal": _serialize_goal(goal, summary=metrics["summary"]),
+            "targets": [_serialize_goal_target(item) for item in metrics["targets"]],
+        }
+
+    @app.get("/api/goals/{goal_id}/metrics")
+    def get_goal_metrics_api(
+        goal_id: int,
+        session: Session = Depends(get_db_session),
+        runtime: ResolvedRuntimeContext = Depends(get_runtime_context),
+    ) -> dict[str, object]:
+        ensure_permission(runtime, "dashboard.read")
+        service = GoalService(session)
+        try:
+            metrics = service.get_goal_metrics(runtime.context, goal_id)
+        except TenantContextError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        return {
+            "goal": _serialize_goal(metrics["goal"], summary=metrics["summary"]),
+            "metrics": metrics["metrics"],
+            "summary": metrics["summary"],
+        }
+
+    @app.get("/admin", response_class=HTMLResponse)
+    def admin_home(
+        request: Request,
+        account_slug: str | None = Query(default=None),
+        actor_email: str | None = Query(default=None),
+    ):
+        if account_slug and actor_email:
+            return RedirectResponse(
+                url=f"/admin/{account_slug}/dashboard?{admin_query_string(actor_email)}",
+                status_code=status.HTTP_302_FOUND,
+            )
+        return templates.TemplateResponse(request, "admin/access.html", {})
+
+    @app.get("/admin/{account_slug}/dashboard", response_class=HTMLResponse)
+    def admin_dashboard(
+        request: Request,
+        account_slug: str,
+        actor_email: str = Query(...),
+        session: Session = Depends(get_db_session),
+    ) -> HTMLResponse:
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
+        ensure_permission(runtime, "dashboard.read")
+        dashboard = ExecutiveDashboardService(session).get_dashboard(runtime.context, "today")
+        widgets = {item["widget_key"]: item["payload"] for item in dashboard["widgets"]}
+        goals = GoalService(session).get_dashboard_goal_snapshot(runtime.context)
+        alerts = [
+            item for item in RuntimeAutomationService(session).list_alerts(runtime.context)
+            if item.status == "open"
+        ][:8]
+        tasks = RuntimeAutomationService(session).list_tasks(runtime.context)
+        overdue_tasks = [item for item in tasks if item.status == "open" and item.due_at is not None and item.due_at <= datetime.now(timezone.utc)][:8]
+        return templates.TemplateResponse(
+            request,
+            "admin/dashboard.html",
+            {
+                "runtime": runtime,
+                "page": "dashboard",
+                "page_query": admin_query_string(actor_email),
+                "dashboard": dashboard,
+                "widgets": widgets,
+                "goal_snapshots": goals,
+                "critical_alerts": alerts,
+                "overdue_tasks": overdue_tasks,
+            },
+        )
+
+    @app.get("/admin/{account_slug}/integrations", response_class=HTMLResponse)
+    def admin_integrations(
+        request: Request,
+        account_slug: str,
+        actor_email: str = Query(...),
+        session: Session = Depends(get_db_session),
+    ) -> HTMLResponse:
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
+        ensure_permission(runtime, "integrations.manage")
+        integrations = RuntimeIntegrationService(session).list_integrations(runtime.context)
+        sync_status = {
+            item["integration"].id: item
+            for item in AdminQueryService(session).integration_sync_status(runtime.account.id)
+        }
+        return templates.TemplateResponse(
+            request,
+            "admin/integrations.html",
+            {
+                "runtime": runtime,
+                "page": "integrations",
+                "page_query": admin_query_string(actor_email),
+                "integrations": integrations,
+                "sync_status": sync_status,
+                "human_sync_error": _human_sync_error,
+            },
+        )
+
+    @app.get("/admin/{account_slug}/alerts-tasks", response_class=HTMLResponse)
+    def admin_alerts_tasks(
+        request: Request,
+        account_slug: str,
+        actor_email: str = Query(...),
+        severity: str | None = Query(default=None),
+        priority: str | None = Query(default=None),
+        session: Session = Depends(get_db_session),
+    ) -> HTMLResponse:
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
+        ensure_permission(runtime, "alerts.read")
+        ensure_permission(runtime, "tasks.read")
+        automation = RuntimeAutomationService(session)
+        alerts = [item for item in automation.list_alerts(runtime.context) if item.status == "open"]
+        tasks = [item for item in automation.list_tasks(runtime.context) if item.status == "open"]
+        if severity:
+            alerts = [item for item in alerts if item.severity == severity]
+        if priority:
+            tasks = [item for item in tasks if item.priority == priority]
+        user_ids = {item.assigned_user_id for item in alerts if item.assigned_user_id is not None}
+        user_ids.update(item.assignee_user_id for item in tasks if item.assignee_user_id is not None)
+        employee_ids = {item.assignee_employee_id for item in tasks if item.assignee_employee_id is not None}
+        users = {
+            item.id: item
+            for item in session.execute(select(User).where(User.id.in_(user_ids))).scalars().all()
+        } if user_ids else {}
+        employees = {
+            item.id: item
+            for item in session.execute(select(Employee).where(Employee.id.in_(employee_ids))).scalars().all()
+        } if employee_ids else {}
+        overdue_tasks = [item for item in tasks if item.due_at is not None and item.due_at <= datetime.now(timezone.utc)]
+        return templates.TemplateResponse(
+            request,
+            "admin/alerts_tasks.html",
+            {
+                "runtime": runtime,
+                "page": "alerts_tasks",
+                "page_query": admin_query_string(actor_email),
+                "alerts": alerts,
+                "tasks": tasks,
+                "overdue_tasks": overdue_tasks,
+                "severity_filter": severity,
+                "priority_filter": priority,
+                "users": users,
+                "employees": employees,
+                "alert_slas": _alert_sla_map(),
+            },
+        )
+
+    @app.get("/admin/{account_slug}/ops-sync", response_class=HTMLResponse)
+    def admin_ops_sync(
+        request: Request,
+        account_slug: str,
+        actor_email: str = Query(...),
+        session: Session = Depends(get_db_session),
+    ) -> HTMLResponse:
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
+        ensure_permission(runtime, "integrations.manage")
+        ensure_permission(runtime, "rules.manage")
+        ensure_permission(runtime, "tasks.read")
+        ensure_permission(runtime, "alerts.read")
+        ops = AdminQueryService(session).ops_summary(runtime.account.id)
+        return templates.TemplateResponse(
+            request,
+            "admin/ops_sync.html",
+            {
+                "runtime": runtime,
+                "page": "ops_sync",
+                "page_query": admin_query_string(actor_email),
+                "ops": ops,
+                "human_sync_error": _human_sync_error,
+            },
+        )
+
+    @app.get("/admin/{account_slug}/goals", response_class=HTMLResponse)
+    def admin_goals(
+        request: Request,
+        account_slug: str,
+        actor_email: str = Query(...),
+        goal_id: int | None = Query(default=None),
+        session: Session = Depends(get_db_session),
+    ) -> HTMLResponse:
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
+        ensure_permission(runtime, "dashboard.read")
+        service = GoalService(session)
+        goals = service.list_goals(runtime.context)
+        try:
+            selected_goal_payload = service.get_goal_metrics(runtime.context, goal_id) if goal_id is not None else None
+        except TenantContextError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        selected_targets_by_code = {
+            item.metric_code: item
+            for item in (selected_goal_payload["targets"] if selected_goal_payload is not None else [])
+        }
+        owners = session.execute(
+            select(User)
+            .join(AccountUser, AccountUser.user_id == User.id)
+            .where(AccountUser.account_id == runtime.account.id, AccountUser.status == "active")
+            .order_by(User.full_name.asc(), User.email.asc())
+        ).scalars().all()
+        period_start, period_end = _goal_period_defaults("month", runtime)
+        return templates.TemplateResponse(
+            request,
+            "admin/goals.html",
+            {
+                "runtime": runtime,
+                "page": "goals",
+                "page_query": admin_query_string(actor_email),
+                "goals": goals,
+                "selected_goal": selected_goal_payload,
+                "selected_targets_by_code": selected_targets_by_code,
+                "metric_definitions": list(GOAL_METRIC_DEFINITIONS.values()),
+                "owners": owners,
+                "default_period_start": period_start.isoformat(),
+                "default_period_end": period_end.isoformat(),
+            },
+        )
+
+    @app.post("/admin/{account_slug}/integrations/{integration_id}/sync")
+    async def admin_run_sync(
+        request: Request,
+        account_slug: str,
+        integration_id: int,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        payload = await request.json()
+        actor_email = str(payload.get("actor_email") or "").strip()
+        if not actor_email:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="actor_email is required.")
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
+        ensure_permission(runtime, "integrations.manage")
+        service = RuntimeIntegrationService(session)
+        idempotency_key = f"admin-ui-sync:{integration_id}:{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')}"
+        job, _ = service.enqueue_sync_job(
+            runtime.context,
+            integration_id=integration_id,
+            job_type="full_sync",
+            trigger_mode="manual",
+            idempotency_key=idempotency_key,
+            scope_json={"source": "admin-ui"},
+        )
+        execution = service.execute_job(job.id, owner=settings.worker_id, ttl_seconds=settings.runtime_lease_ttl_seconds)
+        session.flush()
+        return JSONResponse(
+            {
+                "job": _serialize_sync_job(job),
+                "execution": _serialize_job_execution(execution),
+            }
+        )
+
+    @app.post("/admin/{account_slug}/goals/save")
+    async def admin_save_goal(
+        request: Request,
+        account_slug: str,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        payload = await request.json()
+        actor_email = str(payload.get("actor_email") or "").strip()
+        if not actor_email:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="actor_email is required.")
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
+        ensure_permission(runtime, "rules.manage")
+        body = payload.get("goal") or {}
+        targets = payload.get("targets") or []
+        period_kind = str(body.get("period_kind") or "month")
+        period_start_raw = body.get("period_start")
+        period_end_raw = body.get("period_end")
+        period_start = date.fromisoformat(period_start_raw) if period_start_raw else None
+        period_end = date.fromisoformat(period_end_raw) if period_end_raw else None
+        period_start, period_end = _goal_period_from_payload(runtime, period_kind, period_start, period_end)
+        service = GoalService(session)
+        goal_id = payload.get("goal_id")
+        if goal_id:
+            try:
+                goal = service.update_goal(
+                    runtime.context,
+                    int(goal_id),
+                    title=body.get("title"),
+                    description=body.get("description"),
+                    period_kind=period_kind,
+                    period_start=period_start,
+                    period_end=period_end,
+                    owner_user_id=int(body["owner_user_id"]) if body.get("owner_user_id") else None,
+                    is_primary=bool(body.get("is_primary")),
+                    status=str(body.get("status") or "active"),
+                    targets=targets,
+                )
+            except TenantContextError as exc:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+            except PlatformCoreError as exc:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        else:
+            try:
+                goal = service.create_goal(
+                    runtime.context,
+                    title=str(body.get("title") or "").strip(),
+                    description=body.get("description"),
+                    period_kind=period_kind,
+                    period_start=period_start,
+                    period_end=period_end,
+                    owner_user_id=int(body["owner_user_id"]) if body.get("owner_user_id") else None,
+                    is_primary=bool(body.get("is_primary")),
+                    status=str(body.get("status") or "active"),
+                    targets=targets,
+                )
+            except PlatformCoreError as exc:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        metrics = service.get_goal_metrics(runtime.context, goal.id)
+        return JSONResponse(
+            {
+                "goal": _serialize_goal(goal, summary=metrics["summary"]),
+                "metrics": metrics["metrics"],
+            }
+        )
 
     return app
 
@@ -377,6 +873,36 @@ def _serialize_rule_execution(execution) -> dict[str, object]:
         "last_evaluated_at": _serialize_datetime(execution.last_evaluated_at),
         "last_triggered_at": _serialize_datetime(execution.last_triggered_at),
         "updated_at": _serialize_datetime(execution.updated_at),
+    }
+
+
+def _serialize_goal(goal: Goal, *, summary: dict[str, object] | None = None) -> dict[str, object]:
+    return {
+        "id": goal.id,
+        "account_id": goal.account_id,
+        "owner_user_id": goal.owner_user_id,
+        "title": goal.title,
+        "description": goal.description,
+        "status": goal.status,
+        "period_kind": goal.period_kind,
+        "period_start": goal.period_start.isoformat(),
+        "period_end": goal.period_end.isoformat(),
+        "is_primary": goal.is_primary,
+        "settings": goal.settings_json,
+        "created_at": _serialize_datetime(goal.created_at),
+        "updated_at": _serialize_datetime(goal.updated_at),
+        "summary": summary,
+    }
+
+
+def _serialize_goal_target(target: GoalTarget) -> dict[str, object]:
+    return {
+        "id": target.id,
+        "goal_id": target.goal_id,
+        "metric_code": target.metric_code,
+        "direction": target.direction,
+        "target_value": _serialize_decimal(target.target_value),
+        "settings": target.settings_json,
     }
 
 

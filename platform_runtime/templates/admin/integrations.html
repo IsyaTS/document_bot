@@ -1,0 +1,73 @@
+{% extends "admin/base.html" %}
+{% block content %}
+<div class="topbar">
+  <div>
+    <h2>Integrations</h2>
+    <p class="subtle">Статус подключений, последние sync results и ручной запуск sync без прямой работы с БД.</p>
+  </div>
+</div>
+
+<section class="card">
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Name</th>
+          <th>Provider</th>
+          <th>Status</th>
+          <th>Last sync</th>
+          <th>Last success</th>
+          <th>Last error</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for integration in integrations %}
+        {% set sync = sync_status.get(integration.id) %}
+        <tr>
+          <td>
+            <strong>{{ integration.display_name }}</strong>
+            <div class="status-line">{{ integration.external_ref or "no external ref" }}</div>
+          </td>
+          <td>{{ integration.provider_name }}</td>
+          <td><span class="badge {{ 'good' if integration.status == 'active' else 'warn' }}">{{ integration.status }}</span></td>
+          <td>{{ integration.last_sync_at or "—" }}</td>
+          <td>{{ sync.latest_success.finished_at if sync and sync.latest_success else "—" }}</td>
+          <td>{{ human_sync_error(sync.latest_failure) if sync else "—" }}</td>
+          <td>
+            <button type="button" class="run-sync" data-integration-id="{{ integration.id }}">Run sync</button>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<script>
+  const actorEmail = {{ runtime.actor_user.email|tojson }};
+  for (const button of document.querySelectorAll(".run-sync")) {
+    button.addEventListener("click", async () => {
+      button.disabled = true;
+      button.textContent = "Running...";
+      const integrationId = button.dataset.integrationId;
+      try {
+        const response = await fetch(`/admin/{{ runtime.account.slug }}/integrations/${integrationId}/sync`, {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({actor_email: actorEmail}),
+        });
+        if (!response.ok) {
+          const error = await response.text();
+          throw new Error(error);
+        }
+        window.location.reload();
+      } catch (error) {
+        alert(`Sync failed: ${error}`);
+        button.disabled = false;
+        button.textContent = "Run sync";
+      }
+    });
+  }
+</script>
+{% endblock %}

@@ -27,6 +27,7 @@ from platform_core.models.business import (
 )
 from platform_core.models.core import Account, AccountUser, AuditLog, Permission, Role, RolePermission, User
 from platform_core.models.dashboard import DashboardConfig, DashboardWidgetConfig
+from platform_core.models.goals import Goal, GoalTarget
 from platform_core.models.integrations import (
     Integration,
     IntegrationCredential,
@@ -56,6 +57,8 @@ __all__ = [
     "Document",
     "Employee",
     "Expense",
+    "Goal",
+    "GoalTarget",
     "Integration",
     "IntegrationCredential",
     "IntegrationEntityMapping",

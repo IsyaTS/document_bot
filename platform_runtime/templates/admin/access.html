@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Hermes Admin Access</title>
+  <link rel="stylesheet" href="{{ url_for('admin-static', path='admin.css') }}">
+</head>
+<body>
+  <main class="content" style="max-width: 760px; margin: 0 auto; padding-top: 60px;">
+    <section class="card hero">
+      <h2 style="margin-top: 0;">Hermes Admin App</h2>
+      <p class="subtle">Минимальный internal web app поверх runtime API. Авторизация как полноценный login flow пока вне scope; вход идёт через account slug и operator email.</p>
+      <form class="stack" action="/admin" method="get" style="margin-top: 18px;">
+        <label>
+          Account slug
+          <input name="account_slug" value="hermes" required>
+        </label>
+        <label>
+          Operator email
+          <input name="actor_email" value="owner@hermes.local" required>
+        </label>
+        <div class="actions">
+          <button type="submit">Open Admin App</button>
+        </div>
+      </form>
+    </section>
+  </main>
+</body>
+</html>

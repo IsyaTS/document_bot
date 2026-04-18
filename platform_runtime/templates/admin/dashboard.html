@@ -1,0 +1,135 @@
+{% extends "admin/base.html" %}
+{% block content %}
+<div class="topbar">
+  <div>
+    <h2>Dashboard</h2>
+    <p class="subtle">Owner panel, plan vs fact и главные проблемы на сегодня.</p>
+  </div>
+  <div class="chips">
+    <span class="chip">Period: {{ dashboard.period.label }}</span>
+    <span class="chip">Timezone: {{ dashboard.period.timezone }}</span>
+  </div>
+</div>
+
+<section class="card hero">
+  <h3>Owner Panel</h3>
+  <div class="grid cols-4">
+    {% for metric in widgets.owner_panel.top_numbers %}
+    <div class="metric">
+      <span class="subtle">{{ metric.metric_code }}</span>
+      <span class="value">{{ metric.value }}</span>
+    </div>
+    {% endfor %}
+  </div>
+</section>
+
+<section class="grid cols-2" style="margin-top: 16px;">
+  <article class="card">
+    <h3>Plan vs Fact</h3>
+    {% if goal_snapshots %}
+      <div class="stack">
+        {% for snapshot in goal_snapshots %}
+        <div class="card" style="padding: 14px;">
+          <div class="actions" style="justify-content: space-between;">
+            <div>
+              <h4>{{ snapshot.goal.title }}</h4>
+              <p class="subtle">{{ snapshot.goal.period_kind }} · {{ snapshot.goal.period_start }} — {{ snapshot.goal.period_end }}</p>
+            </div>
+            <span class="badge {{ 'good' if snapshot.summary.status == 'on_track' else 'warn' if snapshot.summary.status == 'warning' else 'bad' }}">{{ snapshot.summary.status }}</span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Metric</th>
+                  <th>Target</th>
+                  <th>Actual</th>
+                  <th>Delta</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for metric in snapshot.metrics %}
+                <tr>
+                  <td>{{ metric.label }}</td>
+                  <td>{{ metric.target }}</td>
+                  <td>{{ metric.actual }}</td>
+                  <td>{{ metric.delta }}</td>
+                  <td><span class="badge {{ 'good' if metric.status == 'on_track' else 'warn' if metric.status == 'warning' else 'bad' }}">{{ metric.status }}</span></td>
+                </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        </div>
+        {% endfor %}
+      </div>
+    {% else %}
+      <p class="empty">Активных goals на текущий период пока нет.</p>
+    {% endif %}
+  </article>
+
+  <article class="card">
+    <h3>Top Problems</h3>
+    {% if widgets.owner_panel.top_problems %}
+      <div class="stack">
+        {% for item in widgets.owner_panel.top_problems %}
+        <div class="card" style="padding: 14px;">
+          <div class="actions" style="justify-content: space-between;">
+            <strong>{{ item.title }}</strong>
+            <span class="badge {{ 'bad' if item.severity == 'critical' else 'warn' }}">{{ item.severity }}</span>
+          </div>
+          <p class="subtle">{{ item.code }} · score {{ item.score }}</p>
+        </div>
+        {% endfor %}
+      </div>
+    {% else %}
+      <p class="empty">Open problems не найдены.</p>
+    {% endif %}
+  </article>
+</section>
+
+<section class="grid cols-2" style="margin-top: 16px;">
+  <article class="card">
+    <h3>Critical Alerts</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Code</th><th>Title</th><th>Severity</th><th>Last detected</th></tr></thead>
+        <tbody>
+          {% for item in critical_alerts %}
+          <tr>
+            <td>{{ item.code }}</td>
+            <td>{{ item.title }}</td>
+            <td><span class="badge {{ 'bad' if item.severity == 'critical' else 'warn' }}">{{ item.severity }}</span></td>
+            <td>{{ item.last_detected_at }}</td>
+          </tr>
+          {% else %}
+          <tr><td colspan="4" class="empty">Нет открытых critical alerts.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </article>
+
+  <article class="card">
+    <h3>Overdue Tasks</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Title</th><th>Priority</th><th>Due at</th><th>Entity</th></tr></thead>
+        <tbody>
+          {% for item in overdue_tasks %}
+          <tr>
+            <td>{{ item.title }}</td>
+            <td><span class="badge {{ 'bad' if item.priority == 'critical' else 'warn' if item.priority == 'high' else '' }}">{{ item.priority }}</span></td>
+            <td>{{ item.due_at }}</td>
+            <td>{{ item.related_entity_type }} #{{ item.related_entity_id }}</td>
+          </tr>
+          {% else %}
+          <tr><td colspan="4" class="empty">Просроченных tasks сейчас нет.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </article>
+</section>
+{% endblock %}

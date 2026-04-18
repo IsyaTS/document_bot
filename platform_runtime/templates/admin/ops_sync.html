@@ -1,0 +1,80 @@
+{% extends "admin/base.html" %}
+{% block content %}
+<div class="topbar">
+  <div>
+    <h2>Ops / Sync</h2>
+    <p class="subtle">Operational visibility layer: failed sync jobs, failed rule runs, overdue tasks и integration sync health.</p>
+  </div>
+</div>
+
+<section class="grid cols-4">
+  <article class="card metric"><span class="subtle">Failed sync jobs</span><span class="value">{{ ops.recent_failed_sync_jobs|length }}</span></article>
+  <article class="card metric"><span class="subtle">Failed rule runs</span><span class="value">{{ ops.recent_failed_rule_runs|length }}</span></article>
+  <article class="card metric"><span class="subtle">Overdue tasks</span><span class="value">{{ ops.overdue_tasks|length }}</span></article>
+  <article class="card metric"><span class="subtle">Critical alerts</span><span class="value">{{ ops.active_critical_alerts|length }}</span></article>
+</section>
+
+<section class="grid cols-2" style="margin-top: 16px;">
+  <article class="card">
+    <h3>Recent Failed Sync Jobs</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Job</th><th>Provider</th><th>Status</th><th>Error</th></tr></thead>
+        <tbody>
+          {% for item in ops.recent_failed_sync_jobs %}
+          <tr>
+            <td>#{{ item.id }}</td>
+            <td>{{ item.provider_name }}</td>
+            <td><span class="badge bad">{{ item.status }}</span></td>
+            <td>{{ human_sync_error(item) or "—" }}</td>
+          </tr>
+          {% else %}
+          <tr><td colspan="4" class="empty">Failed sync jobs не обнаружены.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </article>
+
+  <article class="card">
+    <h3>Recent Failed Rule Runs</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Execution key</th><th>Status</th><th>Error</th><th>Updated</th></tr></thead>
+        <tbody>
+          {% for item in ops.recent_failed_rule_runs %}
+          <tr>
+            <td>{{ item.execution_key }}</td>
+            <td><span class="badge bad">{{ item.status }}</span></td>
+            <td>{{ item.error_message or "—" }}</td>
+            <td>{{ item.updated_at }}</td>
+          </tr>
+          {% else %}
+          <tr><td colspan="4" class="empty">Failed rule runs не обнаружены.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </article>
+</section>
+
+<section class="card" style="margin-top: 16px;">
+  <h3>Integration Sync Health</h3>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Integration</th><th>Provider</th><th>Last sync</th><th>Latest success</th><th>Latest failure</th></tr></thead>
+      <tbody>
+        {% for item in ops.integration_sync_status %}
+        <tr>
+          <td>{{ item.integration.external_ref or item.integration.display_name }}</td>
+          <td>{{ item.integration.provider_name }}</td>
+          <td>{{ item.integration.last_sync_at or "—" }}</td>
+          <td>{{ item.latest_success.finished_at if item.latest_success else "—" }}</td>
+          <td>{{ human_sync_error(item.latest_failure) if item.latest_failure else "—" }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endblock %}

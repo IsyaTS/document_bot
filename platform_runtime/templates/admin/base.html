@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ title or "Hermes Admin" }}</title>
+  <link rel="stylesheet" href="{{ url_for('admin-static', path='admin.css') }}">
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <h1>Hermes Admin</h1>
+        <p>Owner / operator console</p>
+      </div>
+      {% if runtime is defined %}
+      <div class="stack">
+        <p class="meta">{{ runtime.account.name }} · {{ runtime.account.slug }}</p>
+        <p class="meta">{{ runtime.actor_user.full_name or runtime.actor_user.email }}</p>
+      </div>
+      <nav class="nav">
+        <a class="{{ 'active' if page == 'dashboard' else '' }}" href="/admin/{{ runtime.account.slug }}/dashboard?{{ page_query }}">Dashboard</a>
+        <a class="{{ 'active' if page == 'integrations' else '' }}" href="/admin/{{ runtime.account.slug }}/integrations?{{ page_query }}">Integrations</a>
+        <a class="{{ 'active' if page == 'alerts_tasks' else '' }}" href="/admin/{{ runtime.account.slug }}/alerts-tasks?{{ page_query }}">Alerts / Tasks</a>
+        <a class="{{ 'active' if page == 'ops_sync' else '' }}" href="/admin/{{ runtime.account.slug }}/ops-sync?{{ page_query }}">Ops / Sync</a>
+        <a class="{{ 'active' if page == 'goals' else '' }}" href="/admin/{{ runtime.account.slug }}/goals?{{ page_query }}">Goals</a>
+      </nav>
+      {% endif %}
+    </aside>
+    <main class="content">
+      {% block content %}{% endblock %}
+    </main>
+  </div>
+</body>
+</html>
