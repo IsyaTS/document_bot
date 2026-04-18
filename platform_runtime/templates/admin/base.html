@@ -48,6 +48,9 @@
       </div>
       {% endif %}
       <nav class="nav">
+        {% if can_view_portfolio %}
+        <a class="{{ 'active' if page == 'portfolio' else '' }}" href="/admin/portfolio">Portfolio</a>
+        {% endif %}
         {% if can_manage_accounts_global %}
         <a class="{{ 'active' if page == 'accounts' else '' }}" href="/admin/accounts">Accounts</a>
         {% endif %}
@@ -66,12 +69,23 @@
         </form>
       </div>
       {% endif %}
-      {% if page in ['accounts', 'users'] %}
+      {% if page in ['portfolio', 'accounts', 'users'] %}
       <div class="stack">
         <p class="meta">{{ actor_email }}</p>
-        <p class="meta">{{ 'Global onboarding and account setup' if page == 'accounts' else 'Global user lifecycle and access management' }}</p>
+        <p class="meta">
+          {% if page == 'portfolio' %}
+          Cross-account owner console
+          {% elif page == 'accounts' %}
+          Global onboarding and account setup
+          {% else %}
+          Global user lifecycle and access management
+          {% endif %}
+        </p>
       </div>
       <nav class="nav">
+        {% if can_view_portfolio %}
+        <a class="{{ 'active' if page == 'portfolio' else '' }}" href="/admin/portfolio">Portfolio</a>
+        {% endif %}
         <a class="{{ 'active' if page == 'accounts' else '' }}" href="/admin/accounts">Accounts</a>
         {% if can_manage_users_global %}
         <a class="{{ 'active' if page == 'users' else '' }}" href="/admin/users">Users</a>

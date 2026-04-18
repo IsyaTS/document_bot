@@ -1,0 +1,275 @@
+{% extends "admin/base.html" %}
+{% block content %}
+<div class="topbar">
+  <div>
+    <h2>Portfolio</h2>
+    <p class="subtle">Owner-level console across owned accounts: health, goal risk, sync pressure and action hotspots.</p>
+  </div>
+  <div class="chips">
+    <span class="chip">{{ portfolio.accounts_count }} owner accounts</span>
+    <span class="chip">{{ portfolio.accounts_needing_action }} need action today</span>
+  </div>
+</div>
+
+<section class="grid cols-4">
+  <article class="card metric"><span class="subtle">Available cash</span><span class="value">{{ portfolio.available_cash_total }}</span></article>
+  <article class="card metric"><span class="subtle">Revenue</span><span class="value">{{ portfolio.revenue_total }}</span></article>
+  <article class="card metric"><span class="subtle">Net profit</span><span class="value">{{ portfolio.net_profit_total }}</span></article>
+  <article class="card metric"><span class="subtle">Incoming leads</span><span class="value">{{ portfolio.incoming_leads_total }}</span></article>
+</section>
+
+<section class="grid cols-4" style="margin-top: 16px;">
+  <article class="card metric"><span class="subtle">Healthy accounts</span><span class="value">{{ portfolio.healthy_accounts }}</span></article>
+  <article class="card metric"><span class="subtle">Critical accounts</span><span class="value">{{ portfolio.critical_accounts }}</span></article>
+  <article class="card metric"><span class="subtle">Critical alerts</span><span class="value">{{ portfolio.critical_alerts_total }}</span></article>
+  <article class="card metric"><span class="subtle">Overdue tasks</span><span class="value">{{ portfolio.overdue_tasks_total }}</span></article>
+</section>
+
+<section class="grid cols-2" style="margin-top: 16px;">
+  <article class="card">
+    <h3>Highest Risk Accounts</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Account</th><th>Health</th><th>Risk</th><th>Goals at risk</th><th>Sync</th></tr></thead>
+        <tbody>
+          {% for row in portfolio.highest_risk_accounts %}
+          <tr>
+            <td>
+              <strong>{{ row.account.name }}</strong>
+              <div class="status-line">{{ row.account.slug }}</div>
+            </td>
+            <td><span class="badge {{ 'good' if row.health_status == 'healthy' else 'warn' if row.health_status == 'warning' else 'bad' }}">{{ row.health_status }}</span></td>
+            <td>{{ row.risk_score }}</td>
+            <td>{{ row.goals_at_risk_count }}</td>
+            <td><span class="badge {{ 'good' if row.sync_health.status == 'healthy' else 'warn' if row.sync_health.status == 'warning' else 'bad' }}">{{ row.sync_health.status }}</span></td>
+          </tr>
+          {% else %}
+          <tr><td colspan="5" class="empty">No owner accounts in portfolio.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </article>
+
+  <article class="card">
+    <h3>Goal Rollup</h3>
+    <div class="chips">
+      <span class="chip">on_track {{ portfolio.goal_rollup.on_track }}</span>
+      <span class="chip">warning {{ portfolio.goal_rollup.warning }}</span>
+      <span class="chip">critical {{ portfolio.goal_rollup.critical }}</span>
+    </div>
+    <div class="stack" style="margin-top: 14px;">
+      {% for item in portfolio.goal_rows %}
+      <div class="inline-card">
+        <div class="actions" style="justify-content: space-between;">
+          <div>
+            <strong>{{ item.account.name }} · {{ item.goal.title }}</strong>
+            <div class="status-line">{{ item.goal.period_kind }} · {{ item.goal.period_start }} — {{ item.goal.period_end }}</div>
+          </div>
+          <span class="badge {{ 'good' if item.summary.status == 'on_track' else 'warn' if item.summary.status == 'warning' else 'bad' }}">{{ item.summary.status }}</span>
+        </div>
+        {% if item.blockers %}
+        <div class="stack" style="gap: 6px; margin-top: 8px;">
+          {% for blocker in item.blockers[:2] %}
+          <div class="status-line">{{ blocker.metric.label }} · {{ blocker.metric.status }} · delta {{ blocker.metric.delta }}</div>
+          {% endfor %}
+        </div>
+        {% endif %}
+      </div>
+      {% else %}
+      <p class="empty">No goal deviations across portfolio.</p>
+      {% endfor %}
+    </div>
+  </article>
+</section>
+
+<section class="grid cols-2" style="margin-top: 16px;">
+  <article class="card">
+    <h3>Broken Sync Accounts</h3>
+    <div class="stack">
+      {% for row in portfolio.broken_sync_accounts_rows %}
+      <div class="inline-card">
+        <div class="actions" style="justify-content: space-between;">
+          <strong>{{ row.account.name }}</strong>
+          <span class="badge {{ 'good' if row.sync_health.status == 'healthy' else 'warn' if row.sync_health.status == 'warning' else 'bad' }}">{{ row.sync_health.status }}</span>
+        </div>
+        <div class="chips">
+          <span class="chip">broken {{ row.sync_health.broken_count }}</span>
+          <span class="chip">stale {{ row.sync_health.stale_count }}</span>
+          <span class="chip">failed jobs {{ row.failed_sync_jobs_count }}</span>
+        </div>
+        <div class="actions" style="margin-top: 10px;">
+          <a class="pill-link" href="/admin/switch-account/{{ row.account.slug }}?next=/admin/{{ row.account.slug }}/ops-sync">ops</a>
+          <a class="pill-link" href="/admin/switch-account/{{ row.account.slug }}?next=/admin/{{ row.account.slug }}/integrations">integrations</a>
+        </div>
+      </div>
+      {% else %}
+      <p class="empty">No broken sync accounts.</p>
+      {% endfor %}
+    </div>
+  </article>
+
+  <article class="card">
+    <h3>Alert / Task Pressure</h3>
+    <div class="stack">
+      {% for row in portfolio.alert_pressure_accounts %}
+      <div class="inline-card">
+        <div class="actions" style="justify-content: space-between;">
+          <strong>{{ row.account.name }}</strong>
+          <span class="badge {{ 'good' if row.health_status == 'healthy' else 'warn' if row.health_status == 'warning' else 'bad' }}">{{ row.health_status }}</span>
+        </div>
+        <div class="chips">
+          <span class="chip">critical alerts {{ row.critical_alerts_count }}</span>
+          <span class="chip">overdue tasks {{ row.overdue_tasks_count }}</span>
+          <span class="chip">goals at risk {{ row.goals_at_risk_count }}</span>
+        </div>
+        <div class="actions" style="margin-top: 10px;">
+          <a class="pill-link" href="/admin/switch-account/{{ row.account.slug }}?next=/admin/{{ row.account.slug }}/alerts-tasks">alerts/tasks</a>
+          <a class="pill-link" href="/admin/switch-account/{{ row.account.slug }}?next=/admin/{{ row.account.slug }}/dashboard">dashboard</a>
+        </div>
+      </div>
+      {% else %}
+      <p class="empty">No alert or task pressure right now.</p>
+      {% endfor %}
+    </div>
+  </article>
+</section>
+
+<section class="grid cols-2" style="margin-top: 16px;">
+  <article class="card">
+    <h3>Top Portfolio Attention Items</h3>
+    <div class="stack">
+      {% for entry in portfolio.top_attention_items %}
+      <div class="inline-card">
+        <div class="actions" style="justify-content: space-between;">
+          <strong>{{ entry.account.name }} · {{ entry.item.title }}</strong>
+          <span class="badge {{ 'warn' if entry.item.status == 'warning' else 'bad' }}">{{ entry.item.status }}</span>
+        </div>
+        <div class="status-line">{{ entry.item.type }} · {{ entry.item.context }}</div>
+        <div class="actions" style="margin-top: 8px;">
+          <a class="pill-link" href="{{ entry.item.href }}">open</a>
+        </div>
+      </div>
+      {% else %}
+      <p class="empty">No attention items across portfolio.</p>
+      {% endfor %}
+    </div>
+  </article>
+
+  <article class="card">
+    <h3>Accounts Needing Action Today</h3>
+    <div class="stack">
+      {% for row in portfolio.highest_risk_accounts if row.risk_score > 0 %}
+      <div class="inline-card">
+        <div class="actions" style="justify-content: space-between;">
+          <strong>{{ row.account.name }}</strong>
+          <span class="badge {{ 'good' if row.health_status == 'healthy' else 'warn' if row.health_status == 'warning' else 'bad' }}">{{ row.health_status }}</span>
+        </div>
+        <div class="chips">
+          <span class="chip">risk {{ row.risk_score }}</span>
+          <span class="chip">cash {{ row.available_cash }}</span>
+          <span class="chip">revenue {{ row.revenue }}</span>
+        </div>
+      </div>
+      {% else %}
+      <p class="empty">No accounts need owner action right now.</p>
+      {% endfor %}
+    </div>
+  </article>
+</section>
+
+<section class="card" style="margin-top: 16px;">
+  <h3>Portfolio Accounts</h3>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Account</th>
+          <th>Health</th>
+          <th>Available cash</th>
+          <th>Revenue</th>
+          <th>Net profit</th>
+          <th>Incoming leads</th>
+          <th>Critical alerts</th>
+          <th>Overdue tasks</th>
+          <th>Sync</th>
+          <th>Goals at risk</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in portfolio_rows %}
+        <tr>
+          <td>
+            <strong>{{ row.account.name }}</strong>
+            <div class="status-line">{{ row.account.slug }}</div>
+          </td>
+          <td><span class="badge {{ 'good' if row.health_status == 'healthy' else 'warn' if row.health_status == 'warning' else 'bad' }}">{{ row.health_status }}</span></td>
+          <td>{{ row.available_cash }}</td>
+          <td>{{ row.revenue }}</td>
+          <td>{{ row.net_profit }}</td>
+          <td>{{ row.incoming_leads }}</td>
+          <td>{{ row.critical_alerts_count }}</td>
+          <td>{{ row.overdue_tasks_count }}</td>
+          <td><span class="badge {{ 'good' if row.sync_health.status == 'healthy' else 'warn' if row.sync_health.status == 'warning' else 'bad' }}">{{ row.sync_health.status }}</span></td>
+          <td>{{ row.goals_at_risk_count }}</td>
+          <td>
+            <div class="actions">
+              <a class="pill-link" href="/admin/switch-account/{{ row.account.slug }}?next=/admin/{{ row.account.slug }}/dashboard">dashboard</a>
+              <a class="pill-link" href="/admin/switch-account/{{ row.account.slug }}?next=/admin/{{ row.account.slug }}/goals">goals</a>
+              <a class="pill-link" href="/admin/switch-account/{{ row.account.slug }}?next=/admin/{{ row.account.slug }}/ops-sync">ops</a>
+            </div>
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="11" class="empty">No owner accounts in portfolio.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="grid cols-3" style="margin-top: 16px;">
+  <article class="card">
+    <h3>Failed Sync Jobs</h3>
+    <div class="stack">
+      {% for item in portfolio.failed_sync_jobs %}
+      <div class="inline-card">
+        <strong>{{ item.account.name }} · #{{ item.job.id }}</strong>
+        <div class="status-line">{{ item.job.provider_name }} · {{ human_sync_error(item.job) or item.job.status }}</div>
+      </div>
+      {% else %}
+      <p class="empty">No recent failed sync jobs.</p>
+      {% endfor %}
+    </div>
+  </article>
+
+  <article class="card">
+    <h3>Active Critical Alerts</h3>
+    <div class="stack">
+      {% for item in portfolio.active_critical_alerts %}
+      <div class="inline-card">
+        <strong>{{ item.account.name }} · {{ item.alert.title }}</strong>
+        <div class="status-line">{{ item.alert.code }} · {{ item.alert.last_detected_at }}</div>
+      </div>
+      {% else %}
+      <p class="empty">No active critical alerts.</p>
+      {% endfor %}
+    </div>
+  </article>
+
+  <article class="card">
+    <h3>Overdue Tasks</h3>
+    <div class="stack">
+      {% for item in portfolio.overdue_tasks %}
+      <div class="inline-card">
+        <strong>{{ item.account.name }} · {{ item.task.title }}</strong>
+        <div class="status-line">{{ item.task.priority }} · due {{ item.task.due_at }}</div>
+      </div>
+      {% else %}
+      <p class="empty">No overdue tasks.</p>
+      {% endfor %}
+    </div>
+  </article>
+</section>
+{% endblock %}

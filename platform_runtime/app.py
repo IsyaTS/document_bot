@@ -201,6 +201,7 @@ def create_app() -> FastAPI:
 
     def _admin_page_path(page: str) -> str:
         return {
+            "portfolio": "portfolio",
             "accounts": "accounts",
             "users": "users",
             "dashboard": "dashboard",
@@ -223,6 +224,9 @@ def create_app() -> FastAPI:
     def _is_manager_role(role_code: str | None) -> bool:
         return role_code in {"owner", "admin"}
 
+    def _is_owner_role(role_code: str | None) -> bool:
+        return role_code == "owner"
+
     def _actor_can_manage_accounts(session: Session, actor_email: str) -> bool:
         rows = session.execute(
             select(Role.code)
@@ -231,6 +235,32 @@ def create_app() -> FastAPI:
             .where(User.email == actor_email, AccountUser.status == "active")
         ).scalars().all()
         return any(_is_manager_role(code) for code in rows)
+
+    def _owner_accounts_with_memberships(session: Session, actor_email: str) -> list[dict[str, object]]:
+        rows = session.execute(
+            select(Account, AccountUser, Role)
+            .join(AccountUser, AccountUser.account_id == Account.id)
+            .join(User, User.id == AccountUser.user_id)
+            .join(Role, Role.id == AccountUser.role_id)
+            .where(
+                User.email == actor_email,
+                AccountUser.status == "active",
+                Role.code == "owner",
+            )
+            .order_by(Account.name.asc(), Account.slug.asc())
+        ).all()
+        return [
+            {"account": account, "membership": membership, "role": role}
+            for account, membership, role in rows
+        ]
+
+    def _actor_can_view_portfolio(session: Session, actor_email: str) -> bool:
+        return bool(_owner_accounts_with_memberships(session, actor_email))
+
+    def _require_portfolio_owner(session: Session, actor_email: str) -> None:
+        if _actor_can_view_portfolio(session, actor_email):
+            return
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Owner role is required for portfolio view.")
 
     def _require_account_manager(runtime: ResolvedRuntimeContext) -> None:
         if _is_manager_role(runtime.role_code):
@@ -397,7 +427,252 @@ def create_app() -> FastAPI:
             "can_manage_members": _is_manager_role(runtime.role_code),
             "can_manage_accounts_global": _actor_can_manage_accounts(session, actor_email),
             "can_manage_users_global": _actor_can_manage_accounts(session, actor_email),
+            "can_view_portfolio": _actor_can_view_portfolio(session, actor_email),
             "csrf_token": _ensure_session_csrf_token(request),
+        }
+
+    def _status_weight(status_code: str | None) -> int:
+        return {"critical": 3, "warning": 2, "healthy": 1, "on_track": 1}.get(str(status_code or "").strip(), 0)
+
+    def _portfolio_sync_health(rows: list[dict[str, object]]) -> dict[str, object]:
+        active_rows = [item for item in rows if getattr(item["integration"], "status", None) != "archived"]
+        broken: list[dict[str, object]] = []
+        stale: list[dict[str, object]] = []
+        for item in active_rows:
+            integration = item["integration"]
+            latest_success = item["latest_success"]
+            latest_failure = item["latest_failure"]
+            if integration.status == "disabled":
+                continue
+            success_at = latest_success.finished_at if latest_success is not None else None
+            failure_at = latest_failure.finished_at if latest_failure is not None else None
+            if latest_failure is not None and (success_at is None or (failure_at is not None and failure_at >= success_at)):
+                broken.append(item)
+                continue
+            if integration.status == "active" and latest_success is None:
+                stale.append(item)
+        if broken:
+            status_code = "critical"
+        elif stale:
+            status_code = "warning"
+        else:
+            status_code = "healthy"
+        return {
+            "status": status_code,
+            "active_count": len(active_rows),
+            "broken_count": len(broken),
+            "stale_count": len(stale),
+            "broken_rows": broken,
+            "stale_rows": stale,
+        }
+
+    def _owner_panel_metric(widgets: dict[str, object], metric_code: str, *, fallback: float | int = 0) -> float | int:
+        owner_panel = widgets.get("owner_panel", {}) if isinstance(widgets, dict) else {}
+        for item in owner_panel.get("top_numbers", []):
+            if item.get("metric_code") == metric_code:
+                return item.get("value", fallback)
+        return fallback
+
+    def _portfolio_attention_items(
+        *,
+        account_slug: str,
+        goal_snapshots: list[dict[str, object]],
+        critical_alerts: list[object],
+        overdue_tasks: list[object],
+    ) -> list[dict[str, object]]:
+        items: list[dict[str, object]] = []
+        for snapshot in goal_snapshots:
+            for blocker in snapshot.get("blockers", [])[:2]:
+                items.append(
+                    {
+                        "type": "goal_blocker",
+                        "status": blocker["metric"]["status"],
+                        "title": f"{snapshot['goal'].title}: {blocker['metric']['label']}",
+                        "context": f"delta {blocker['metric']['delta']}",
+                        "href": blocker["links"]["ops"],
+                        "account_slug": account_slug,
+                    }
+                )
+        for alert in critical_alerts[:3]:
+            items.append(
+                {
+                    "type": "alert",
+                    "status": alert.severity,
+                    "title": alert.title,
+                    "context": alert.code,
+                    "href": f"/admin/{account_slug}/alerts-tasks?severity=critical",
+                    "account_slug": account_slug,
+                }
+            )
+        for task in overdue_tasks[:3]:
+            items.append(
+                {
+                    "type": "task",
+                    "status": task.priority,
+                    "title": task.title,
+                    "context": f"due {task.due_at}",
+                    "href": f"/admin/{account_slug}/alerts-tasks?priority=high",
+                    "account_slug": account_slug,
+                }
+            )
+        items.sort(key=lambda item: -_status_weight(str(item.get("status") or "")))
+        return items[:5]
+
+    def _portfolio_account_row(session: Session, actor_email: str, account: Account) -> dict[str, object]:
+        resolved = RuntimeContextService(session).resolve(
+            account_id=account.id,
+            account_slug=None,
+            actor_user_id=None,
+            actor_email=actor_email,
+            source="admin-portfolio",
+            request_id=None,
+        )
+        dashboard = ExecutiveDashboardService(session).get_dashboard(resolved.context, "today")
+        widgets = {item["widget_key"]: item["payload"] for item in dashboard["widgets"]}
+        ops = AdminQueryService(session).ops_summary(account.id)
+        sync_health = _portfolio_sync_health(ops["integration_sync_status"])
+        automation = RuntimeAutomationService(session)
+        open_alerts = [item for item in automation.list_alerts(resolved.context) if item.status == "open"]
+        open_tasks = [item for item in automation.list_tasks(resolved.context) if item.status == "open"]
+        goal_snapshots = [
+            _enrich_goal_snapshot(
+                account_slug=account.slug,
+                actor_email=actor_email,
+                snapshot=item,
+                open_alerts=open_alerts,
+                open_tasks=open_tasks,
+                top_problems=widgets.get("owner_panel", {}).get("top_problems", []),
+                attention_zones=widgets.get("owner_panel", {}).get("attention_zones", []),
+            )
+            for item in GoalService(session).get_dashboard_goal_snapshot(resolved.context)
+        ]
+        goals_at_risk = [item for item in goal_snapshots if item["summary"]["status"] != "on_track"]
+        goal_critical_count = sum(int(item["summary"]["critical_count"]) for item in goal_snapshots)
+        goal_warning_count = sum(int(item["summary"]["warning_count"]) for item in goal_snapshots)
+        critical_alerts = list(ops["active_critical_alerts"])
+        overdue_tasks = list(ops["overdue_tasks"])
+        failed_sync_jobs = list(ops["recent_failed_sync_jobs"])
+        risk_score = (
+            goal_critical_count * 20
+            + goal_warning_count * 8
+            + len(critical_alerts) * 12
+            + len(overdue_tasks) * 7
+            + len(failed_sync_jobs) * 15
+            + sync_health["broken_count"] * 20
+            + sync_health["stale_count"] * 8
+        )
+        if goal_critical_count or sync_health["broken_count"] or failed_sync_jobs:
+            health_status = "critical"
+        elif goal_warning_count or critical_alerts or overdue_tasks or sync_health["stale_count"]:
+            health_status = "warning"
+        else:
+            health_status = "healthy"
+        return {
+            "account": account,
+            "health_status": health_status,
+            "risk_score": risk_score,
+            "available_cash": _owner_panel_metric(widgets, "available_cash"),
+            "revenue": _owner_panel_metric(widgets, "revenue"),
+            "net_profit": _owner_panel_metric(widgets, "net_profit"),
+            "incoming_leads": _owner_panel_metric(widgets, "incoming_leads"),
+            "critical_alerts_count": len(critical_alerts),
+            "overdue_tasks_count": len(overdue_tasks),
+            "failed_sync_jobs_count": len(failed_sync_jobs),
+            "goals_at_risk_count": len(goals_at_risk),
+            "goal_critical_count": goal_critical_count,
+            "goal_warning_count": goal_warning_count,
+            "sync_health": sync_health,
+            "goal_snapshots": goal_snapshots,
+            "goals_at_risk": goals_at_risk,
+            "top_attention_items": _portfolio_attention_items(
+                account_slug=account.slug,
+                goal_snapshots=goals_at_risk,
+                critical_alerts=critical_alerts,
+                overdue_tasks=overdue_tasks,
+            ),
+            "ops": ops,
+        }
+
+    def _portfolio_summary(rows: list[dict[str, object]]) -> dict[str, object]:
+        flattened_goal_rows = [
+            {
+                "account": row["account"],
+                "goal": snapshot["goal"],
+                "summary": snapshot["summary"],
+                "blockers": snapshot.get("blockers", []),
+            }
+            for row in rows
+            for snapshot in row["goals_at_risk"]
+        ]
+        goal_rollup = {
+            "on_track": sum(1 for row in rows for snapshot in row["goal_snapshots"] if snapshot["summary"]["status"] == "on_track"),
+            "warning": sum(1 for row in rows for snapshot in row["goal_snapshots"] if snapshot["summary"]["status"] == "warning"),
+            "critical": sum(1 for row in rows for snapshot in row["goal_snapshots"] if snapshot["summary"]["status"] == "critical"),
+        }
+        highest_risk = sorted(rows, key=lambda item: (-int(item["risk_score"]), item["account"].name.lower()))[:5]
+        broken_sync = [
+            item for item in rows
+            if item["sync_health"]["status"] != "healthy"
+        ]
+        broken_sync.sort(key=lambda item: (-int(item["sync_health"]["broken_count"]), -int(item["sync_health"]["stale_count"]), -int(item["risk_score"])))
+        goal_deviations = [item for item in rows if item["goals_at_risk_count"] > 0]
+        goal_deviations.sort(key=lambda item: (-int(item["goal_critical_count"]), -int(item["goal_warning_count"]), -int(item["risk_score"])))
+        alert_pressure = sorted(
+            rows,
+            key=lambda item: (
+                -(int(item["critical_alerts_count"]) + int(item["overdue_tasks_count"])),
+                -int(item["risk_score"]),
+            ),
+        )[:5]
+        failed_sync_jobs = [
+            {"account": row["account"], "job": job}
+            for row in rows
+            for job in row["ops"]["recent_failed_sync_jobs"]
+        ]
+        failed_sync_jobs.sort(key=lambda item: item["job"].created_at, reverse=True)
+        active_critical_alerts = [
+            {"account": row["account"], "alert": alert}
+            for row in rows
+            for alert in row["ops"]["active_critical_alerts"]
+        ]
+        active_critical_alerts.sort(key=lambda item: item["alert"].last_detected_at, reverse=True)
+        overdue_tasks = [
+            {"account": row["account"], "task": task}
+            for row in rows
+            for task in row["ops"]["overdue_tasks"]
+        ]
+        overdue_tasks.sort(key=lambda item: item["task"].due_at or datetime.max.replace(tzinfo=timezone.utc))
+        top_attention_items = sorted(
+            [
+                {"account": row["account"], "item": item}
+                for row in rows
+                for item in row["top_attention_items"]
+            ],
+            key=lambda item: -_status_weight(str(item["item"].get("status") or "")),
+        )[:10]
+        return {
+            "accounts_count": len(rows),
+            "healthy_accounts": sum(1 for item in rows if item["health_status"] == "healthy"),
+            "warning_accounts": sum(1 for item in rows if item["health_status"] == "warning"),
+            "critical_accounts": sum(1 for item in rows if item["health_status"] == "critical"),
+            "available_cash_total": sum(float(item["available_cash"] or 0) for item in rows),
+            "revenue_total": sum(float(item["revenue"] or 0) for item in rows),
+            "net_profit_total": sum(float(item["net_profit"] or 0) for item in rows),
+            "incoming_leads_total": sum(float(item["incoming_leads"] or 0) for item in rows),
+            "critical_alerts_total": sum(int(item["critical_alerts_count"]) for item in rows),
+            "overdue_tasks_total": sum(int(item["overdue_tasks_count"]) for item in rows),
+            "broken_sync_accounts": sum(1 for item in rows if item["sync_health"]["status"] != "healthy"),
+            "accounts_needing_action": sum(1 for item in rows if item["risk_score"] > 0),
+            "goal_rollup": goal_rollup,
+            "highest_risk_accounts": highest_risk,
+            "broken_sync_accounts_rows": broken_sync[:5],
+            "critical_goal_accounts": goal_deviations[:5],
+            "alert_pressure_accounts": alert_pressure,
+            "failed_sync_jobs": failed_sync_jobs[:10],
+            "active_critical_alerts": active_critical_alerts[:10],
+            "overdue_tasks": overdue_tasks[:10],
+            "goal_rows": flattened_goal_rows[:10],
+            "top_attention_items": top_attention_items,
         }
 
     def _membership_rows(account: Account, session: Session) -> list[AccountUser]:
@@ -1346,6 +1621,38 @@ def create_app() -> FastAPI:
         request.session["admin_account_slug"] = account_slug
         return RedirectResponse(url=next or f"/admin/{account_slug}/dashboard", status_code=status.HTTP_302_FOUND)
 
+    @app.get("/admin/portfolio", response_class=HTMLResponse)
+    def admin_portfolio(
+        request: Request,
+        session: Session = Depends(get_db_session),
+    ) -> HTMLResponse:
+        user = _current_session_user(session, request)
+        if user is None:
+            request.session.clear()
+            return _login_redirect("/admin/portfolio")
+        actor_email = user.email
+        _require_portfolio_owner(session, actor_email)
+        owner_rows = _owner_accounts_with_memberships(session, actor_email)
+        portfolio_rows = [_portfolio_account_row(session, actor_email, item["account"]) for item in owner_rows]
+        portfolio_rows.sort(key=lambda item: (-int(item["risk_score"]), item["account"].name.lower()))
+        portfolio = _portfolio_summary(portfolio_rows)
+        return templates.TemplateResponse(
+            request,
+            "admin/portfolio.html",
+            {
+                "page": "portfolio",
+                "page_path": "portfolio",
+                "actor_email": actor_email,
+                "csrf_token": _ensure_session_csrf_token(request),
+                "can_manage_accounts_global": _actor_can_manage_accounts(session, actor_email),
+                "can_manage_users_global": _actor_can_manage_accounts(session, actor_email),
+                "can_view_portfolio": True,
+                "portfolio_rows": portfolio_rows,
+                "portfolio": portfolio,
+                "human_sync_error": _human_sync_error,
+            },
+        )
+
     @app.get("/admin/accounts", response_class=HTMLResponse)
     def admin_accounts_page(
         request: Request,
@@ -1379,6 +1686,7 @@ def create_app() -> FastAPI:
                 "actor_email": actor_email,
                 "can_manage_accounts_global": True,
                 "can_manage_users_global": True,
+                "can_view_portfolio": _actor_can_view_portfolio(session, actor_email),
                 "csrf_token": _ensure_session_csrf_token(request),
             },
         )
@@ -1460,6 +1768,7 @@ def create_app() -> FastAPI:
                 "actor_email": actor_email,
                 "can_manage_accounts_global": True,
                 "can_manage_users_global": True,
+                "can_view_portfolio": _actor_can_view_portfolio(session, actor_email),
                 "csrf_token": _ensure_session_csrf_token(request),
                 "user_rows": user_rows,
                 "selected_user": selected_user,

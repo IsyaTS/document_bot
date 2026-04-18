@@ -268,6 +268,7 @@ Main pages:
 
 - `/admin/login`
 - `/admin`
+- `/admin/portfolio`
 - `/admin/accounts`
 - `/admin/users`
 - `/admin/{account_slug}/dashboard`
@@ -311,11 +312,33 @@ Current CSRF coverage:
 
 Current UI access behavior:
 
+- `owner`: cross-account portfolio view at `/admin/portfolio`
 - `owner` / `admin`: full dashboard, integrations, ops and goal management
 - `owner` / `admin`: account onboarding page and membership management UI
 - `owner` / `admin`: global user lifecycle page with invite, reset and disable flows
 - `viewer`: dashboard + goals read-only + alerts/tasks visibility, but no integrations or ops management
 - server-side permission checks remain enforced even if a restricted URL is opened directly
+
+Current portfolio behavior:
+
+- portfolio page is derived at read time from existing dashboard, goals and ops data
+- visible only to users who have active `owner` memberships
+- aggregates only the accounts where the actor is an `owner`
+- shows:
+  - health per account
+  - available cash
+  - revenue
+  - net profit
+  - incoming leads
+  - critical alerts
+  - overdue tasks
+  - sync health
+  - goals at risk
+- includes portfolio-level rankings for:
+  - highest risk accounts
+  - broken sync accounts
+  - critical goal deviations
+  - alert/task pressure
 
 Current account onboarding and lifecycle behavior:
 
