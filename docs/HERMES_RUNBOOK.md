@@ -40,8 +40,16 @@
 ## Health and Verification
 
 - API health: `curl http://127.0.0.1:${PLATFORM_PUBLIC_API_PORT:-18000}/health`
-- runtime DB verification: `PLATFORM_DATABASE_URL="$PLATFORM_DATABASE_URL" ./.venv/bin/python scripts/verify_runtime_db.py`
-- smoke checks: `PLATFORM_DATABASE_URL="$PLATFORM_DATABASE_URL" ./.venv/bin/python scripts/smoke_runtime.py`
+- runtime DB verification: `bash -lc 'set -a; source .env; set +a; ./.venv/bin/python scripts/verify_runtime_db.py'`
+- smoke checks: `bash -lc 'set -a; source .env; set +a; ./.venv/bin/python scripts/smoke_runtime.py'`
+- ops report: `bash -lc 'set -a; source .env; set +a; ./.venv/bin/python scripts/hermes_ops_report.py'`
+
+## Daily Operations
+
+- daily checklist: [HERMES_DAILY_OPERATIONS.md](/opt/aidar/document_bot/docs/HERMES_DAILY_OPERATIONS.md)
+- alert ownership/SLA matrix: [HERMES_ALERT_POLICY.md](/opt/aidar/document_bot/docs/HERMES_ALERT_POLICY.md)
+- pilot checklist: [HERMES_7_DAY_PILOT.md](/opt/aidar/document_bot/docs/HERMES_7_DAY_PILOT.md)
+- weekly review template: [HERMES_WEEKLY_REVIEW_TEMPLATE.md](/opt/aidar/document_bot/docs/HERMES_WEEKLY_REVIEW_TEMPLATE.md)
 
 ## Backup
 
@@ -58,9 +66,22 @@
 2. Restore backup:
    - `./scripts/restore_runtime.sh backups/runtime/runtime_<timestamp>.sql.gz`
 3. Re-run verification:
-   - `PLATFORM_DATABASE_URL="$PLATFORM_DATABASE_URL" ./.venv/bin/python scripts/verify_runtime_db.py`
+   - `bash -lc 'set -a; source .env; set +a; ./.venv/bin/python scripts/verify_runtime_db.py'`
 4. Start runtime again:
    - `docker compose up -d api worker`
+
+## Rollback Flow
+
+1. Stop `api` and `worker`:
+   - `docker compose stop api worker`
+2. Restore the latest known-good backup:
+   - `./scripts/restore_runtime.sh backups/runtime/runtime_<timestamp>.sql.gz`
+3. Re-verify DB:
+   - `bash -lc 'set -a; source .env; set +a; ./.venv/bin/python scripts/verify_runtime_db.py'`
+4. Restart runtime:
+   - `docker compose up -d api worker`
+5. Re-run smoke:
+   - `bash -lc 'set -a; source .env; set +a; ./.venv/bin/python scripts/smoke_runtime.py'`
 
 ## Hermes Runtime Checks
 
@@ -82,4 +103,7 @@
 4. Restart runtime:
    - `docker compose up -d api worker`
 5. Run smoke checks:
-   - `PLATFORM_DATABASE_URL="$PLATFORM_DATABASE_URL" ./.venv/bin/python scripts/smoke_runtime.py`
+   - `bash -lc 'set -a; source .env; set +a; ./.venv/bin/python scripts/smoke_runtime.py'`
+6. Run ops report:
+   - `bash -lc 'set -a; source .env; set +a; ./.venv/bin/python scripts/hermes_ops_report.py'`
+7. If smoke or ops report looks wrong, use rollback flow immediately

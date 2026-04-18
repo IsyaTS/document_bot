@@ -209,6 +209,35 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cross-account audit access denied.")
         return [_serialize_audit_log(item) for item in AdminQueryService(session).list_audit_logs(account_id, limit)]
 
+    @app.get("/api/admin/accounts/{account_id}/ops-summary")
+    def ops_summary(
+        account_id: int,
+        session: Session = Depends(get_db_session),
+        runtime: ResolvedRuntimeContext = Depends(get_runtime_context),
+    ) -> dict[str, object]:
+        ensure_permission(runtime, "integrations.manage")
+        ensure_permission(runtime, "rules.manage")
+        ensure_permission(runtime, "tasks.read")
+        ensure_permission(runtime, "alerts.read")
+        if runtime.context.account_id != account_id:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cross-account ops access denied.")
+        payload = AdminQueryService(session).ops_summary(account_id)
+        return {
+            "generated_at": payload["generated_at"],
+            "recent_failed_sync_jobs": [_serialize_sync_job(item) for item in payload["recent_failed_sync_jobs"]],
+            "recent_failed_rule_runs": [_serialize_rule_execution(item) for item in payload["recent_failed_rule_runs"]],
+            "overdue_tasks": [_serialize_task(item) for item in payload["overdue_tasks"]],
+            "active_critical_alerts": [_serialize_alert(item) for item in payload["active_critical_alerts"]],
+            "integration_sync_status": [
+                {
+                    "integration": _serialize_integration(item["integration"]),
+                    "latest_success": _serialize_sync_job(item["latest_success"]) if item["latest_success"] is not None else None,
+                    "latest_failure": _serialize_sync_job(item["latest_failure"]) if item["latest_failure"] is not None else None,
+                }
+                for item in payload["integration_sync_status"]
+            ],
+        }
+
     return app
 
 
@@ -277,6 +306,7 @@ def _serialize_integration(integration) -> dict[str, object]:
     return {
         "id": integration.id,
         "account_id": integration.account_id,
+        "external_ref": integration.external_ref,
         "provider_kind": integration.provider_kind,
         "provider_name": integration.provider_name,
         "display_name": integration.display_name,
@@ -324,6 +354,29 @@ def _serialize_integration_log(log) -> dict[str, object]:
         "message": log.message,
         "payload": log.payload_json,
         "created_at": _serialize_datetime(log.created_at),
+    }
+
+
+def _serialize_rule_execution(execution) -> dict[str, object]:
+    return {
+        "id": execution.id,
+        "account_id": execution.account_id,
+        "rule_id": execution.rule_id,
+        "rule_version_id": execution.rule_version_id,
+        "execution_key": execution.execution_key,
+        "status": execution.status,
+        "evaluated_entity_type": execution.evaluated_entity_type,
+        "evaluated_entity_id": execution.evaluated_entity_id,
+        "window_key": execution.window_key,
+        "run_count": execution.run_count,
+        "alert_id": execution.alert_id,
+        "task_id": execution.task_id,
+        "recommendation_id": execution.recommendation_id,
+        "details": execution.details_json,
+        "error_message": execution.error_message,
+        "last_evaluated_at": _serialize_datetime(execution.last_evaluated_at),
+        "last_triggered_at": _serialize_datetime(execution.last_triggered_at),
+        "updated_at": _serialize_datetime(execution.updated_at),
     }
 
 

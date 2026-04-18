@@ -228,10 +228,14 @@ PLATFORM_DATABASE_URL=sqlite+pysqlite:////opt/aidar/document_bot/data/platform.s
 - `docker-compose.yml`
 - [docs/HERMES_RUNBOOK.md](/opt/aidar/document_bot/docs/HERMES_RUNBOOK.md)
 - [docs/HERMES_7_DAY_PILOT.md](/opt/aidar/document_bot/docs/HERMES_7_DAY_PILOT.md)
+- [docs/HERMES_DAILY_OPERATIONS.md](/opt/aidar/document_bot/docs/HERMES_DAILY_OPERATIONS.md)
+- [docs/HERMES_ALERT_POLICY.md](/opt/aidar/document_bot/docs/HERMES_ALERT_POLICY.md)
+- [docs/HERMES_WEEKLY_REVIEW_TEMPLATE.md](/opt/aidar/document_bot/docs/HERMES_WEEKLY_REVIEW_TEMPLATE.md)
 - `scripts/wait_for_db.py`
 - `scripts/migrate_sqlite_to_postgres.py`
 - `scripts/verify_runtime_db.py`
 - `scripts/smoke_runtime.py`
+- `scripts/hermes_ops_report.py`
 - `scripts/backup_runtime.sh`
 - `scripts/restore_runtime.sh`
 - `scripts/start_runtime_api.sh`
@@ -244,8 +248,16 @@ PLATFORM_DATABASE_URL=sqlite+pysqlite:////opt/aidar/document_bot/data/platform.s
 3. `python scripts/migrate_sqlite_to_postgres.py ...`
 4. switch `PLATFORM_DATABASE_URL` to PostgreSQL
 5. `docker compose up -d api worker`
-6. `python scripts/verify_runtime_db.py`
-7. `python scripts/smoke_runtime.py`
+6. `bash -lc 'set -a; source .env; set +a; ./.venv/bin/python scripts/verify_runtime_db.py'`
+7. `bash -lc 'set -a; source .env; set +a; ./.venv/bin/python scripts/smoke_runtime.py'`
+
+For stage 6.9 operational hardening:
+
+- Hermes daily operator checklist is documented
+- alert ownership/SLA matrix is documented
+- lightweight ops visibility is available through:
+  - `GET /api/admin/accounts/{account_id}/ops-summary`
+  - `bash -lc 'set -a; source .env; set +a; ./.venv/bin/python scripts/hermes_ops_report.py'`
 
 ### Avito provider contract
 

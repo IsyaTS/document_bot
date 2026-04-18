@@ -19,6 +19,7 @@ from platform_core.models import (
     IntegrationLog,
     Recommendation,
     Rule,
+    RuleExecution,
     RuntimeLease,
     SyncJob,
     Task,
@@ -969,3 +970,112 @@ class AdminQueryService:
         return self.session.execute(
             select(AuditLog).where(AuditLog.account_id == account_id).order_by(AuditLog.created_at.desc(), AuditLog.id.desc()).limit(limit)
         ).scalars().all()
+
+    def recent_failed_sync_jobs(self, account_id: int, limit: int = 20) -> list[SyncJob]:
+        return self.session.execute(
+            select(SyncJob)
+            .where(
+                SyncJob.account_id == account_id,
+                SyncJob.status.in_(("retry", "failed")),
+            )
+            .order_by(SyncJob.finished_at.desc(), SyncJob.id.desc())
+            .limit(limit)
+        ).scalars().all()
+
+    def recent_failed_rule_runs(self, account_id: int, limit: int = 20) -> list[RuleExecution]:
+        return self.session.execute(
+            select(RuleExecution)
+            .where(
+                RuleExecution.account_id == account_id,
+                (RuleExecution.error_message.is_not(None)) | (RuleExecution.status.in_(("failed", "error"))),
+            )
+            .order_by(RuleExecution.updated_at.desc(), RuleExecution.id.desc())
+            .limit(limit)
+        ).scalars().all()
+
+    def overdue_tasks(self, account_id: int, *, now: datetime | None = None, limit: int = 50) -> list[Task]:
+        effective_now = now or datetime.now(timezone.utc)
+        return self.session.execute(
+            select(Task)
+            .where(
+                Task.account_id == account_id,
+                Task.status.notin_(["done", "completed", "cancelled"]),
+                Task.completed_at.is_(None),
+                Task.due_at.is_not(None),
+                Task.due_at < effective_now,
+            )
+            .order_by(Task.due_at.asc(), Task.id.desc())
+            .limit(limit)
+        ).scalars().all()
+
+    def active_critical_alerts(
+        self,
+        account_id: int,
+        *,
+        codes: set[str] | None = None,
+        limit: int = 50,
+    ) -> list[Alert]:
+        critical_codes = codes or {
+            "bank.balance_below_safe_threshold",
+            "inventory.stock_below_threshold",
+            "lead.no_first_response",
+            "marketing.cpl_above_threshold",
+            "leads.lost_above_threshold",
+            "task.overdue_escalation",
+        }
+        return self.session.execute(
+            select(Alert)
+            .where(
+                Alert.account_id == account_id,
+                Alert.status == "open",
+                Alert.code.in_(sorted(critical_codes)),
+            )
+            .order_by(Alert.last_detected_at.desc(), Alert.id.desc())
+            .limit(limit)
+        ).scalars().all()
+
+    def integration_sync_status(self, account_id: int) -> list[dict[str, object]]:
+        integrations = self.session.execute(
+            select(Integration).where(Integration.account_id == account_id).order_by(Integration.id.asc())
+        ).scalars().all()
+        rows: list[dict[str, object]] = []
+        for integration in integrations:
+            latest_success = self.session.execute(
+                select(SyncJob)
+                .where(
+                    SyncJob.account_id == account_id,
+                    SyncJob.integration_id == integration.id,
+                    SyncJob.status == "completed",
+                )
+                .order_by(SyncJob.finished_at.desc(), SyncJob.id.desc())
+                .limit(1)
+            ).scalars().first()
+            latest_failure = self.session.execute(
+                select(SyncJob)
+                .where(
+                    SyncJob.account_id == account_id,
+                    SyncJob.integration_id == integration.id,
+                    SyncJob.status.in_(("retry", "failed")),
+                )
+                .order_by(SyncJob.finished_at.desc(), SyncJob.id.desc())
+                .limit(1)
+            ).scalars().first()
+            rows.append(
+                {
+                    "integration": integration,
+                    "latest_success": latest_success,
+                    "latest_failure": latest_failure,
+                }
+            )
+        return rows
+
+    def ops_summary(self, account_id: int, *, now: datetime | None = None) -> dict[str, object]:
+        effective_now = now or datetime.now(timezone.utc)
+        return {
+            "generated_at": effective_now.astimezone(timezone.utc).isoformat(),
+            "recent_failed_sync_jobs": self.recent_failed_sync_jobs(account_id, limit=10),
+            "recent_failed_rule_runs": self.recent_failed_rule_runs(account_id, limit=10),
+            "overdue_tasks": self.overdue_tasks(account_id, now=effective_now, limit=20),
+            "active_critical_alerts": self.active_critical_alerts(account_id, limit=20),
+            "integration_sync_status": self.integration_sync_status(account_id),
+        }

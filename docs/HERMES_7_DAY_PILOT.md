@@ -6,7 +6,7 @@
    - `docker compose ps`
    - `curl http://127.0.0.1:${PLATFORM_PUBLIC_API_PORT:-18000}/health`
 2. Run smoke check:
-   - `PLATFORM_DATABASE_URL="$PLATFORM_DATABASE_URL" ./.venv/bin/python scripts/smoke_runtime.py`
+   - `bash -lc 'set -a; source .env; set +a; ./.venv/bin/python scripts/smoke_runtime.py'`
 3. Open Hermes dashboard and look at:
    - advertising CPL
    - incoming leads
@@ -34,6 +34,29 @@
 - `leads_sales.incoming_leads`
 - `leads_sales.lost_leads`
 - `leads_sales.first_response_sla_breaches`
+
+## Success Criteria
+
+- API, worker and PostgreSQL stay healthy for the full 7-day window
+- `hermes-avito-main` does not remain stuck in `failed`
+- dashboard metrics remain fresh enough for daily decisions
+- critical alerts are seen and acted on the same day
+- backup is created every day
+
+## Failure Criteria
+
+- health endpoint unavailable during business hours without immediate recovery
+- sync repeatedly fails and owner cannot trust dashboard data
+- first response alerts are missed operationally
+- daily backup skipped
+- operator cannot explain why a critical alert remained open
+
+## Manual Record If Automation Misses Something
+
+- provider outage / strange upstream response
+- phone response happened but lead state was not updated
+- ad spend anomaly noticed outside current sync window
+- stock/cash issue noticed operationally before platform reflected it
 
 ## Critical Alerts
 
