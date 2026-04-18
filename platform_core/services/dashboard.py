@@ -6,6 +6,7 @@ from decimal import Decimal
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from platform_core.dashboard_defaults import DEFAULT_DASHBOARD
@@ -66,7 +67,16 @@ class DashboardCatalogService:
                 settings_json=DEFAULT_DASHBOARD["settings"],
             )
             self.session.add(dashboard)
-            self.session.flush()
+            try:
+                self.session.flush()
+            except IntegrityError:
+                self.session.rollback()
+                dashboard = self.session.execute(
+                    select(DashboardConfig).where(
+                        DashboardConfig.account_id == account_id,
+                        DashboardConfig.code == DEFAULT_DASHBOARD["code"],
+                    )
+                ).scalar_one()
 
         for widget in DEFAULT_DASHBOARD["widgets"]:
             existing = self.session.execute(

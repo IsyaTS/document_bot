@@ -334,6 +334,17 @@ class RuntimeIntegrationService:
         )
         return integration
 
+    def set_integration_status(
+        self,
+        context: TenantContext,
+        *,
+        integration_id: int,
+        status: str,
+    ) -> Integration:
+        if status not in {"active", "disabled", "archived"}:
+            raise PlatformCoreError(f"Unsupported integration status: {status}.")
+        return self.update_integration(context, integration_id=integration_id, status=status)
+
     def save_credentials(
         self,
         context: TenantContext,
@@ -341,12 +352,17 @@ class RuntimeIntegrationService:
         integration_id: int,
         secret_payload: dict[str, object],
         credential_type: str = "primary",
+        replace_mode: str = "merge",
     ) -> IntegrationCredential:
         integration = self._get_integration(context.account_id, integration_id)
         existing = self._active_credential(integration.id)
-        merged = self._merge_credentials(
-            self._crypto.decrypt_mapping(existing.secret_ciphertext) if existing is not None else {},
-            secret_payload,
+        if replace_mode not in {"merge", "replace"}:
+            raise PlatformCoreError("replace_mode must be either 'merge' or 'replace'.")
+        current_payload = self._crypto.decrypt_mapping(existing.secret_ciphertext) if existing is not None else {}
+        merged = (
+            self._merge_credentials(current_payload, secret_payload)
+            if replace_mode == "merge"
+            else self._merge_credentials({}, secret_payload)
         )
         if not merged:
             raise PlatformCoreError("Credential payload is empty after merge.")
@@ -372,9 +388,30 @@ class RuntimeIntegrationService:
             "runtime.integrations.credentials.save",
             "integration",
             str(integration.id),
-            details={"credential_type": credential_type, "version": credential.version},
+            details={"credential_type": credential_type, "version": credential.version, "replace_mode": replace_mode},
         )
         return credential
+
+    def clear_credentials(
+        self,
+        context: TenantContext,
+        *,
+        integration_id: int,
+        credential_type: str = "primary",
+    ) -> None:
+        integration = self._get_integration(context.account_id, integration_id)
+        active = self._active_credential(integration.id)
+        if active is None:
+            return
+        active.status = "cleared"
+        self.session.flush()
+        self._audit.log(
+            context,
+            "runtime.integrations.credentials.clear",
+            "integration",
+            str(integration.id),
+            details={"credential_type": credential_type, "cleared_version": active.version},
+        )
 
     def test_connection(
         self,
@@ -438,11 +475,13 @@ class RuntimeIntegrationService:
             select(SyncJob)
             .where(SyncJob.account_id == context.account_id, SyncJob.integration_id == integration.id)
             .order_by(SyncJob.id.desc())
-            .limit(5)
+            .limit(10)
         ).scalars().all()
         return {
             "integration": integration,
             "masked_credentials": masked_credentials,
+            "credential_version": credential.version if credential is not None else None,
+            "credential_last_rotated_at": credential.last_rotated_at if credential is not None else None,
             "latest_jobs": latest_jobs,
         }
 

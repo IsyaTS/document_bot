@@ -268,7 +268,9 @@ Main pages:
 
 - `/admin/login`
 - `/admin`
+- `/admin/accounts`
 - `/admin/{account_slug}/dashboard`
+- `/admin/{account_slug}/members`
 - `/admin/{account_slug}/integrations`
 - `/admin/{account_slug}/alerts-tasks`
 - `/admin/{account_slug}/ops-sync`
@@ -285,8 +287,28 @@ Current access flow:
 Current UI access behavior:
 
 - `owner` / `admin`: full dashboard, integrations, ops and goal management
+- `owner` / `admin`: account onboarding page and membership management UI
 - `viewer`: dashboard + goals read-only + alerts/tasks visibility, but no integrations or ops management
 - server-side permission checks remain enforced even if a restricted URL is opened directly
+
+Current account onboarding and lifecycle behavior:
+
+- create a new account from `/admin/accounts`
+- assign initial `owner` and optional `admin`
+- creator is auto-added as `admin` when needed so the new account stays manageable through UI
+- track onboarding completion by steps:
+  - account created
+  - owner assigned
+  - admin or operator added
+  - goal configured
+  - integration configured
+  - first sync completed
+- manage members from `/admin/{account_slug}/members`
+- integration lifecycle from `/admin/{account_slug}/integrations` now includes:
+  - enable / disable / archive
+  - credential rotate via merge mode
+  - clear + replace via replace mode
+  - recent sync job history and last rotation visibility
 
 ### Avito provider contract
 

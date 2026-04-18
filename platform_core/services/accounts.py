@@ -6,11 +6,15 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from platform_core.models import Account, AccountUser, Role, User
+from platform_core.exceptions import PlatformCoreError
 
 
 class AccountService:
     def __init__(self, session: Session) -> None:
         self.session = session
+
+    def list_accounts(self) -> list[Account]:
+        return self.session.execute(select(Account).order_by(Account.name.asc(), Account.slug.asc())).scalars().all()
 
     def get_by_slug(self, slug: str) -> Account | None:
         return self.session.execute(select(Account).where(Account.slug == slug)).scalar_one_or_none()
@@ -31,6 +35,23 @@ class AccountService:
         self.session.add(account)
         self.session.flush()
         return account, True
+
+    def update_account(
+        self,
+        account: Account,
+        *,
+        name: str | None = None,
+        default_timezone: str | None = None,
+        status: str | None = None,
+    ) -> Account:
+        if name is not None:
+            account.name = name
+        if default_timezone is not None:
+            account.default_timezone = default_timezone
+        if status is not None:
+            account.status = status
+        self.session.flush()
+        return account
 
 
 class UserService:
@@ -59,6 +80,19 @@ class MembershipService:
     def __init__(self, session: Session) -> None:
         self.session = session
 
+    def list_memberships(self, account: Account) -> list[AccountUser]:
+        return self.session.execute(
+            select(AccountUser).where(AccountUser.account_id == account.id).order_by(AccountUser.id.asc())
+        ).scalars().all()
+
+    def get_membership(self, account: Account, membership_id: int) -> AccountUser:
+        membership = self.session.execute(
+            select(AccountUser).where(AccountUser.account_id == account.id, AccountUser.id == membership_id)
+        ).scalar_one_or_none()
+        if membership is None:
+            raise PlatformCoreError("Membership not found in selected account.")
+        return membership
+
     def ensure_membership(self, account: Account, user: User, role_code: str, status: str = "active") -> tuple[AccountUser, bool]:
         role = self.session.execute(select(Role).where(Role.code == role_code)).scalar_one()
         membership = self.session.execute(
@@ -85,3 +119,56 @@ class MembershipService:
         self.session.add(membership)
         self.session.flush()
         return membership, True
+
+    def update_membership(
+        self,
+        account: Account,
+        membership_id: int,
+        *,
+        role_code: str | None = None,
+        status: str | None = None,
+    ) -> AccountUser:
+        membership = self.get_membership(account, membership_id)
+        next_role_code = role_code or (membership.role.code if membership.role is not None else None)
+        next_status = status or membership.status
+        self._ensure_owner_guard(account.id, membership, next_role_code=next_role_code, next_status=next_status)
+        if role_code is not None and next_role_code is not None:
+            membership.role = self.session.execute(select(Role).where(Role.code == next_role_code)).scalar_one()
+        if status is not None:
+            membership.status = status
+        self.session.flush()
+        return membership
+
+    def disable_membership(self, account: Account, membership_id: int) -> AccountUser:
+        return self.update_membership(account, membership_id, status="disabled")
+
+    def remove_membership(self, account: Account, membership_id: int) -> None:
+        membership = self.get_membership(account, membership_id)
+        self._ensure_owner_guard(account.id, membership, next_role_code="removed", next_status="removed")
+        self.session.delete(membership)
+        self.session.flush()
+
+    def _ensure_owner_guard(
+        self,
+        account_id: int,
+        membership: AccountUser,
+        *,
+        next_role_code: str | None,
+        next_status: str | None,
+    ) -> None:
+        current_role_code = membership.role.code if membership.role is not None else None
+        if current_role_code != "owner":
+            return
+        if next_role_code == "owner" and next_status == "active":
+            return
+        active_owner_count = self.session.execute(
+            select(AccountUser)
+            .join(Role, Role.id == AccountUser.role_id)
+            .where(
+                AccountUser.account_id == account_id,
+                AccountUser.status == "active",
+                Role.code == "owner",
+            )
+        ).scalars().all()
+        if len(active_owner_count) <= 1:
+            raise PlatformCoreError("Account must keep at least one active owner.")

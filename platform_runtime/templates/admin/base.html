@@ -35,9 +35,25 @@
       </div>
       {% endif %}
       <nav class="nav">
+        {% if can_manage_accounts_global %}
+        <a class="{{ 'active' if page == 'accounts' else '' }}" href="/admin/accounts">Accounts</a>
+        {% endif %}
         {% for item in nav_items %}
         <a class="{{ 'active' if page == item.key else '' }}" href="/admin/{{ runtime.account.slug }}/{{ item.path }}">{{ item.label }}</a>
         {% endfor %}
+      </nav>
+      <div class="sidebar-actions">
+        <a class="switch-link" href="/admin?choose=1">Choose account</a>
+        <a class="switch-link" href="/admin/logout">Logout</a>
+      </div>
+      {% endif %}
+      {% if page == 'accounts' %}
+      <div class="stack">
+        <p class="meta">{{ actor_email }}</p>
+        <p class="meta">Global onboarding and account setup</p>
+      </div>
+      <nav class="nav">
+        <a class="active" href="/admin/accounts">Accounts</a>
       </nav>
       <div class="sidebar-actions">
         <a class="switch-link" href="/admin?choose=1">Choose account</a>

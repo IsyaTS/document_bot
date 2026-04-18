@@ -16,9 +16,10 @@ from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from platform_core.models import Account, AccountUser, Employee, Goal, GoalTarget, User
+from platform_core.models import Account, AccountUser, Employee, Goal, GoalTarget, Role, User
 from platform_core.exceptions import PlatformCoreError, TenantContextError
 from platform_core.services import ExecutiveDashboardService, GOAL_METRIC_DEFINITIONS, GoalService
+from platform_core.services.accounts import AccountService, MembershipService, UserService
 from platform_core.services.runtime import (
     AdminQueryService,
     ResolvedRuntimeContext,
@@ -98,11 +99,13 @@ def create_app() -> FastAPI:
 
     def _admin_page_path(page: str) -> str:
         return {
+            "accounts": "accounts",
             "dashboard": "dashboard",
             "integrations": "integrations",
             "alerts_tasks": "alerts-tasks",
             "ops_sync": "ops-sync",
             "goals": "goals",
+            "members": "members",
         }.get(page, "dashboard")
 
     def _accessible_accounts(session: Session, actor_email: str) -> list[Account]:
@@ -113,6 +116,37 @@ def create_app() -> FastAPI:
             .where(User.email == actor_email, AccountUser.status == "active")
             .order_by(Account.name.asc(), Account.slug.asc())
         ).scalars().all()
+
+    def _is_manager_role(role_code: str | None) -> bool:
+        return role_code in {"owner", "admin"}
+
+    def _actor_can_manage_accounts(session: Session, actor_email: str) -> bool:
+        rows = session.execute(
+            select(Role.code)
+            .join(AccountUser, AccountUser.role_id == Role.id)
+            .join(User, User.id == AccountUser.user_id)
+            .where(User.email == actor_email, AccountUser.status == "active")
+        ).scalars().all()
+        return any(_is_manager_role(code) for code in rows)
+
+    def _require_account_manager(runtime: ResolvedRuntimeContext) -> None:
+        if _is_manager_role(runtime.role_code):
+            return
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Owner or admin role is required.")
+
+    def _accessible_accounts_with_memberships(session: Session, actor_email: str) -> list[dict[str, object]]:
+        rows = session.execute(
+            select(Account, AccountUser, Role)
+            .join(AccountUser, AccountUser.account_id == Account.id)
+            .join(User, User.id == AccountUser.user_id)
+            .join(Role, Role.id == AccountUser.role_id)
+            .where(User.email == actor_email, AccountUser.status == "active")
+            .order_by(Account.name.asc(), Account.slug.asc())
+        ).all()
+        return [
+            {"account": account, "membership": membership, "role": role}
+            for account, membership, role in rows
+        ]
 
     def _require_admin_email(request: Request) -> str:
         actor_email = _session_actor_email(request)
@@ -128,6 +162,8 @@ def create_app() -> FastAPI:
             items.append({"key": "goals", "label": "Goals", "path": "goals"})
         if "alerts.read" in permissions or "tasks.read" in permissions or "*" in permissions:
             items.append({"key": "alerts_tasks", "label": "Alerts / Tasks", "path": "alerts-tasks"})
+        if _is_manager_role(runtime.role_code):
+            items.append({"key": "members", "label": "Members", "path": "members"})
         if "integrations.manage" in permissions or "*" in permissions:
             items.append({"key": "integrations", "label": "Integrations", "path": "integrations"})
         if {"integrations.manage", "rules.manage", "tasks.read", "alerts.read"}.issubset(permissions) or "*" in permissions:
@@ -207,6 +243,52 @@ def create_app() -> FastAPI:
             "can_manage_integrations": "*" in runtime.permissions or "integrations.manage" in runtime.permissions,
             "can_manage_goals": "*" in runtime.permissions or "rules.manage" in runtime.permissions,
             "can_view_ops": "*" in runtime.permissions or {"integrations.manage", "rules.manage", "tasks.read", "alerts.read"}.issubset(runtime.permissions),
+            "can_manage_members": _is_manager_role(runtime.role_code),
+            "can_manage_accounts_global": _actor_can_manage_accounts(session, actor_email),
+        }
+
+    def _membership_rows(account: Account, session: Session) -> list[AccountUser]:
+        return MembershipService(session).list_memberships(account)
+
+    def _goal_count_for_account(account_id: int, session: Session) -> int:
+        return len(session.execute(select(Goal).where(Goal.account_id == account_id, Goal.status != "archived")).scalars().all())
+
+    def _account_onboarding_status(account: Account, session: Session) -> dict[str, object]:
+        memberships = _membership_rows(account, session)
+        active_memberships = [item for item in memberships if item.status == "active"]
+        owners = [item for item in active_memberships if item.role and item.role.code == "owner"]
+        admins = [item for item in active_memberships if item.role and item.role.code == "admin"]
+        integration_status_rows = AdminQueryService(session).integration_sync_status(account.id)
+        goals_count = _goal_count_for_account(account.id, session)
+        last_success = None
+        for row in integration_status_rows:
+            if row["latest_success"] is None:
+                continue
+            if last_success is None or row["latest_success"].finished_at > last_success.finished_at:
+                last_success = row["latest_success"]
+        steps = [
+            {"key": "account", "label": "Account created", "done": account.status == "active"},
+            {"key": "owner", "label": "Owner assigned", "done": len(owners) >= 1},
+            {"key": "team", "label": "Admin or operator added", "done": len(active_memberships) >= 2 or len(admins) >= 1},
+            {"key": "goals", "label": "Goal configured", "done": goals_count >= 1},
+            {"key": "integration", "label": "Integration configured", "done": len(integration_status_rows) >= 1},
+            {"key": "sync", "label": "First sync completed", "done": last_success is not None},
+        ]
+        completed = sum(1 for item in steps if item["done"])
+        next_step = next((item["label"] for item in steps if not item["done"]), "Onboarding complete")
+        return {
+            "account": account,
+            "steps": steps,
+            "completed_steps": completed,
+            "total_steps": len(steps),
+            "next_step": next_step,
+            "active_memberships": active_memberships,
+            "owners_count": len(owners),
+            "admins_count": len(admins),
+            "goals_count": goals_count,
+            "integration_rows": integration_status_rows,
+            "last_success": last_success,
+            "status": "complete" if completed == len(steps) else "in_progress" if completed > 0 else "not_started",
         }
 
     def _goal_period_defaults(period_kind: str, runtime: ResolvedRuntimeContext) -> tuple[date, date]:
@@ -528,6 +610,8 @@ def create_app() -> FastAPI:
         return {
             "integration": _serialize_integration(payload["integration"]),
             "masked_credentials": payload["masked_credentials"],
+            "credential_version": payload["credential_version"],
+            "credential_last_rotated_at": _serialize_datetime(payload["credential_last_rotated_at"]),
             "latest_jobs": [_serialize_sync_job(item) for item in payload["latest_jobs"]],
         }
 
@@ -540,12 +624,15 @@ def create_app() -> FastAPI:
     ) -> dict[str, object]:
         ensure_permission(runtime, "integrations.manage")
         service = RuntimeIntegrationService(session)
+        if body.replace_mode == "replace" and not body.credentials:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Replace mode requires a new credential payload.")
         try:
             credential = service.save_credentials(
                 runtime.context,
                 integration_id=integration_id,
                 secret_payload=body.credentials,
                 credential_type=body.credential_type,
+                replace_mode=body.replace_mode,
             )
             payload = service.integration_setup_payload(runtime.context, integration_id=integration_id)
         except (TenantContextError, PlatformCoreError, IntegrityError) as exc:
@@ -553,6 +640,7 @@ def create_app() -> FastAPI:
         return {
             "credential_version": credential.version,
             "masked_credentials": payload["masked_credentials"],
+            "credential_last_rotated_at": _serialize_datetime(payload["credential_last_rotated_at"]),
         }
 
     @app.post("/api/integrations/{integration_id}/test-connection")
@@ -890,6 +978,84 @@ def create_app() -> FastAPI:
         request.session["admin_account_slug"] = account_slug
         return RedirectResponse(url=next or f"/admin/{account_slug}/dashboard", status_code=status.HTTP_302_FOUND)
 
+    @app.get("/admin/accounts", response_class=HTMLResponse)
+    def admin_accounts_page(
+        request: Request,
+        selected: str | None = Query(default=None),
+        session: Session = Depends(get_db_session),
+    ) -> HTMLResponse:
+        actor_email = _session_actor_email(request)
+        if actor_email is None:
+            return _login_redirect("/admin/accounts")
+        if not _actor_can_manage_accounts(session, actor_email):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Owner or admin access is required.")
+        account_rows = _accessible_accounts_with_memberships(session, actor_email)
+        for row in account_rows:
+            row["onboarding"] = _account_onboarding_status(row["account"], session)
+        selected_slug = selected or _session_account_slug(request) or (account_rows[0]["account"].slug if account_rows else None)
+        selected_onboarding = next(
+            (row["onboarding"] for row in account_rows if row["account"].slug == selected_slug),
+            None,
+        )
+        return templates.TemplateResponse(
+            request,
+            "admin/accounts.html",
+            {
+                "account_rows": account_rows,
+                "selected_onboarding": selected_onboarding,
+                "selected_slug": selected_slug,
+                "page": "accounts",
+                "page_path": "accounts",
+                "actor_email": actor_email,
+            },
+        )
+
+    @app.post("/admin/accounts/create")
+    async def admin_create_account(
+        request: Request,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        actor_email = _require_admin_email(request)
+        if not _actor_can_manage_accounts(session, actor_email):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Owner or admin access is required.")
+        payload = await request.json()
+        account_body = _parse_admin_payload(payload, "account")
+        owner_body = _parse_admin_payload(payload, "owner")
+        admin_body = payload.get("admin") or {}
+        if admin_body and not isinstance(admin_body, dict):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="admin must be an object.")
+        slug = str(account_body.get("slug") or "").strip().lower()
+        name = str(account_body.get("name") or "").strip()
+        default_timezone = str(account_body.get("default_timezone") or "Etc/UTC").strip()
+        owner_email = str(owner_body.get("email") or "").strip().lower()
+        owner_full_name = str(owner_body.get("full_name") or owner_email).strip()
+        admin_email = str(admin_body.get("email") or "").strip().lower()
+        admin_full_name = str(admin_body.get("full_name") or admin_email).strip()
+        if not slug or not name or not owner_email:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Account slug, name and owner email are required.")
+        account_service = AccountService(session)
+        user_service = UserService(session)
+        membership_service = MembershipService(session)
+        try:
+            if account_service.get_by_slug(slug) is not None:
+                raise PlatformCoreError("Account slug already exists.")
+            account, _ = account_service.ensure_account(slug=slug, name=name, default_timezone=default_timezone)
+            owner_user, _ = user_service.ensure_user(owner_email, owner_full_name or owner_email)
+            membership_service.ensure_membership(account, owner_user, "owner", status="active")
+            if admin_email:
+                admin_user, _ = user_service.ensure_user(admin_email, admin_full_name or admin_email)
+                membership_service.ensure_membership(account, admin_user, "admin", status="active")
+            if actor_email not in {owner_email, admin_email}:
+                actor_user = user_service.get_by_email(actor_email)
+                if actor_user is not None:
+                    membership_service.ensure_membership(account, actor_user, "admin", status="active")
+            session.flush()
+        except (PlatformCoreError, IntegrityError) as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        request.session["admin_account_slug"] = account.slug
+        onboarding = _account_onboarding_status(account, session)
+        return JSONResponse({"account": _serialize_account(account), "onboarding": _serialize_onboarding(onboarding)})
+
     @app.get("/admin/{account_slug}/dashboard", response_class=HTMLResponse)
     def admin_dashboard(
         request: Request,
@@ -979,6 +1145,40 @@ def create_app() -> FastAPI:
                 "selected_provider_key": selected_provider_key,
                 "selected_setup": selected_setup,
                 "selected_provider_spec": next((item for item in provider_catalog if item["key"] == selected_provider_key), provider_catalog[0]),
+            },
+        )
+
+    @app.get("/admin/{account_slug}/members", response_class=HTMLResponse)
+    def admin_members(
+        request: Request,
+        account_slug: str,
+        membership_id: int | None = Query(default=None),
+        session: Session = Depends(get_db_session),
+    ) -> HTMLResponse:
+        actor_email = _session_actor_email(request)
+        if actor_email is None:
+            return _login_redirect(f"/admin/{account_slug}/members")
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
+        request.session["admin_account_slug"] = runtime.account.slug
+        _require_account_manager(runtime)
+        membership_service = MembershipService(session)
+        memberships = membership_service.list_memberships(runtime.account)
+        selected_membership = None
+        if membership_id is not None:
+            try:
+                selected_membership = membership_service.get_membership(runtime.account, membership_id)
+            except PlatformCoreError as exc:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        roles = session.execute(select(Role).order_by(Role.id.asc())).scalars().all()
+        return templates.TemplateResponse(
+            request,
+            "admin/members.html",
+            {
+                **_admin_context(session, runtime, page="members"),
+                "memberships": memberships,
+                "selected_membership": selected_membership,
+                "roles": roles,
+                "onboarding": _account_onboarding_status(runtime.account, session),
             },
         )
 
@@ -1149,6 +1349,25 @@ def create_app() -> FastAPI:
             }
         )
 
+    @app.post("/admin/{account_slug}/integrations/{integration_id}/status")
+    async def admin_update_integration_status(
+        request: Request,
+        account_slug: str,
+        integration_id: int,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        actor_email = _require_admin_email(request)
+        payload = await request.json()
+        next_status = str(payload.get("status") or "").strip()
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
+        ensure_permission(runtime, "integrations.manage")
+        service = RuntimeIntegrationService(session)
+        try:
+            integration = service.set_integration_status(runtime.context, integration_id=integration_id, status=next_status)
+        except (PlatformCoreError, TenantContextError, IntegrityError) as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        return JSONResponse({"integration": _serialize_integration(integration)})
+
     @app.post("/admin/{account_slug}/integrations/save")
     async def admin_save_integration(
         request: Request,
@@ -1161,8 +1380,11 @@ def create_app() -> FastAPI:
         ensure_permission(runtime, "integrations.manage")
         body = _parse_admin_payload(payload, "integration")
         credentials = _parse_admin_payload(payload, "credentials")
+        replace_mode = str(payload.get("replace_mode") or "merge")
         service = RuntimeIntegrationService(session)
         integration_id = payload.get("integration_id")
+        if replace_mode == "replace" and not credentials:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Replace mode requires a new credential payload.")
         try:
             if integration_id:
                 integration = service.update_integration(
@@ -1188,7 +1410,12 @@ def create_app() -> FastAPI:
                     settings_json=body.get("settings") if isinstance(body.get("settings"), dict) else None,
                 )
             if credentials:
-                service.save_credentials(runtime.context, integration_id=integration.id, secret_payload=credentials)
+                service.save_credentials(
+                    runtime.context,
+                    integration_id=integration.id,
+                    secret_payload=credentials,
+                    replace_mode=replace_mode,
+                )
             setup = service.integration_setup_payload(runtime.context, integration_id=integration.id)
         except (PlatformCoreError, TenantContextError, IntegrityError) as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
@@ -1197,6 +1424,8 @@ def create_app() -> FastAPI:
                 "integration": _serialize_integration(integration),
                 "setup": {
                     "masked_credentials": setup["masked_credentials"],
+                    "credential_version": setup["credential_version"],
+                    "credential_last_rotated_at": _serialize_datetime(setup["credential_last_rotated_at"]),
                     "latest_jobs": [_serialize_sync_job(item) for item in setup["latest_jobs"]],
                 },
             }
@@ -1223,6 +1452,85 @@ def create_app() -> FastAPI:
         except (PlatformCoreError, TenantContextError) as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
         return JSONResponse(result)
+
+    @app.post("/admin/{account_slug}/members/save")
+    async def admin_save_member(
+        request: Request,
+        account_slug: str,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        actor_email = _require_admin_email(request)
+        payload = await request.json()
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
+        _require_account_manager(runtime)
+        body = _parse_admin_payload(payload, "member")
+        membership_id = payload.get("membership_id")
+        role_code = str(body.get("role_code") or "").strip()
+        status_code = str(body.get("status") or "active").strip()
+        membership_service = MembershipService(session)
+        user_service = UserService(session)
+        try:
+            if membership_id:
+                membership = membership_service.get_membership(runtime.account, int(membership_id))
+                submitted_email = str(body.get("email") or "").strip().lower()
+                if submitted_email and submitted_email != membership.user.email:
+                    raise PlatformCoreError("Existing membership email cannot be changed. Remove and add a new member instead.")
+                full_name = str(body.get("full_name") or membership.user.full_name or membership.user.email).strip()
+                membership.user.full_name = full_name or membership.user.email
+                membership = membership_service.update_membership(
+                    runtime.account,
+                    membership.id,
+                    role_code=role_code or None,
+                    status=status_code or None,
+                )
+            else:
+                email = str(body.get("email") or "").strip().lower()
+                full_name = str(body.get("full_name") or email).strip()
+                if not email or not role_code:
+                    raise PlatformCoreError("Email and role are required for new membership.")
+                user, _ = user_service.ensure_user(email, full_name or email)
+                membership, _ = membership_service.ensure_membership(
+                    runtime.account,
+                    user,
+                    role_code,
+                    status=status_code or "active",
+                )
+            session.flush()
+        except (PlatformCoreError, IntegrityError) as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        return JSONResponse({"membership": _serialize_membership(membership)})
+
+    @app.post("/admin/{account_slug}/members/{membership_id}/disable")
+    async def admin_disable_member(
+        request: Request,
+        account_slug: str,
+        membership_id: int,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        actor_email = _require_admin_email(request)
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
+        _require_account_manager(runtime)
+        try:
+            membership = MembershipService(session).disable_membership(runtime.account, membership_id)
+        except PlatformCoreError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        return JSONResponse({"membership": _serialize_membership(membership)})
+
+    @app.post("/admin/{account_slug}/members/{membership_id}/remove")
+    async def admin_remove_member(
+        request: Request,
+        account_slug: str,
+        membership_id: int,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        actor_email = _require_admin_email(request)
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
+        _require_account_manager(runtime)
+        try:
+            MembershipService(session).remove_membership(runtime.account, membership_id)
+        except PlatformCoreError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        return JSONResponse({"removed": True, "membership_id": membership_id})
 
     @app.post("/admin/{account_slug}/goals/save")
     async def admin_save_goal(
@@ -1302,6 +1610,53 @@ def _serialize_datetime(value: datetime | None) -> str | None:
     if value.tzinfo is None:
         value = value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc).isoformat()
+
+
+def _serialize_account(account: Account) -> dict[str, object]:
+    return {
+        "id": account.id,
+        "slug": account.slug,
+        "name": account.name,
+        "status": account.status,
+        "default_timezone": account.default_timezone,
+        "default_currency": account.default_currency,
+        "created_at": _serialize_datetime(account.created_at),
+        "updated_at": _serialize_datetime(account.updated_at),
+    }
+
+
+def _serialize_membership(membership: AccountUser) -> dict[str, object]:
+    return {
+        "id": membership.id,
+        "account_id": membership.account_id,
+        "user_id": membership.user_id,
+        "role_code": membership.role.code if membership.role is not None else None,
+        "role_name": membership.role.name if membership.role is not None else None,
+        "status": membership.status,
+        "joined_at": _serialize_datetime(membership.joined_at),
+        "user": {
+            "id": membership.user.id,
+            "email": membership.user.email,
+            "full_name": membership.user.full_name,
+            "status": membership.user.status,
+        },
+    }
+
+
+def _serialize_onboarding(onboarding: dict[str, object]) -> dict[str, object]:
+    last_success = onboarding["last_success"]
+    return {
+        "account": _serialize_account(onboarding["account"]),
+        "status": onboarding["status"],
+        "completed_steps": onboarding["completed_steps"],
+        "total_steps": onboarding["total_steps"],
+        "next_step": onboarding["next_step"],
+        "owners_count": onboarding["owners_count"],
+        "admins_count": onboarding["admins_count"],
+        "goals_count": onboarding["goals_count"],
+        "last_success": _serialize_datetime(last_success.finished_at if last_success is not None else None),
+        "steps": list(onboarding["steps"]),
+    }
 
 
 def _serialize_task(task) -> dict[str, object]:

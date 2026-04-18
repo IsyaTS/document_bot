@@ -1,0 +1,191 @@
+{% extends "admin/base.html" %}
+{% block content %}
+<div class="topbar">
+  <div>
+    <h2>Members</h2>
+    <p class="subtle">Account-scoped memberships, effective roles and access lifecycle for {{ runtime.account.name }}.</p>
+  </div>
+  <div class="chips">
+    <span class="chip">{{ memberships|length }} memberships</span>
+    <span class="chip">Role-aware access</span>
+  </div>
+</div>
+
+<section class="grid cols-2">
+  <article class="card">
+    <div class="actions" style="justify-content: space-between;">
+      <div>
+        <h3>{{ "Edit Membership" if selected_membership else "Add Member" }}</h3>
+        <p class="subtle">Owner/admin only. Disable for temporary removal, remove for full access removal.</p>
+      </div>
+      {% if selected_membership %}
+      <a class="pill-link" href="/admin/{{ runtime.account.slug }}/members">new member</a>
+      {% endif %}
+    </div>
+    <div class="form-grid two" style="margin-top: 14px;">
+      <label>
+        Email
+        <input id="member-email" value="{{ selected_membership.user.email if selected_membership else '' }}" {% if selected_membership %}disabled{% endif %}>
+      </label>
+      <label>
+        Full name
+        <input id="member-full-name" value="{{ selected_membership.user.full_name if selected_membership else '' }}">
+      </label>
+      <label>
+        Role
+        <select id="member-role">
+          {% for role in roles %}
+          <option value="{{ role.code }}" {{ 'selected' if selected_membership and selected_membership.role.code == role.code else '' }}>{{ role.code }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>
+        Status
+        <select id="member-status">
+          {% for status_code in ["active", "disabled"] %}
+          <option value="{{ status_code }}" {{ 'selected' if selected_membership and selected_membership.status == status_code else ('selected' if not selected_membership and status_code == 'active' else '') }}>{{ status_code }}</option>
+          {% endfor %}
+        </select>
+      </label>
+    </div>
+    <div class="actions" style="margin-top: 16px;">
+      <button type="button" id="save-member">{{ "Update member" if selected_membership else "Add member" }}</button>
+      <span class="subtle" id="member-save-status"></span>
+    </div>
+  </article>
+
+  <article class="card">
+    <h3>Onboarding Snapshot</h3>
+    <div class="stack">
+      <div class="inline-card">
+        <div class="actions" style="justify-content: space-between;">
+          <strong>Progress</strong>
+          <span class="badge {{ 'good' if onboarding.status == 'complete' else 'warn' }}">{{ onboarding.completed_steps }}/{{ onboarding.total_steps }}</span>
+        </div>
+        <p class="subtle">Next step: {{ onboarding.next_step }}</p>
+      </div>
+      <div class="actions">
+        <a class="pill-link" href="/admin/{{ runtime.account.slug }}/goals">Goals</a>
+        <a class="pill-link" href="/admin/{{ runtime.account.slug }}/integrations">Integrations</a>
+        <a class="pill-link" href="/admin/{{ runtime.account.slug }}/dashboard">Dashboard</a>
+      </div>
+    </div>
+  </article>
+</section>
+
+<section class="card" style="margin-top: 16px;">
+  <h3>Memberships</h3>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Member</th>
+          <th>Effective role</th>
+          <th>Status</th>
+          <th>Joined</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for membership in memberships %}
+        <tr>
+          <td>
+            <strong>{{ membership.user.full_name or membership.user.email }}</strong>
+            <div class="status-line">{{ membership.user.email }}</div>
+          </td>
+          <td><span class="badge">{{ membership.role.code }}</span></td>
+          <td><span class="badge {{ 'good' if membership.status == 'active' else 'warn' }}">{{ membership.status }}</span></td>
+          <td>{{ membership.joined_at or '—' }}</td>
+          <td>
+            <div class="actions">
+              <a class="pill-link" href="/admin/{{ runtime.account.slug }}/members?membership_id={{ membership.id }}">Edit</a>
+              {% if membership.status == 'active' %}
+              <button type="button" class="secondary disable-member" data-membership-id="{{ membership.id }}">Disable</button>
+              {% endif %}
+              <button type="button" class="ghost remove-member" data-membership-id="{{ membership.id }}">Remove</button>
+            </div>
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="5" class="empty">No memberships configured.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<script>
+  const currentMembershipId = {{ selected_membership.id if selected_membership else 'null' }};
+
+  document.getElementById("save-member").addEventListener("click", async () => {
+    const statusNode = document.getElementById("member-save-status");
+    statusNode.textContent = "Saving...";
+    const payload = {
+      membership_id: currentMembershipId,
+      member: {
+        email: document.getElementById("member-email").value.trim().toLowerCase(),
+        full_name: document.getElementById("member-full-name").value.trim(),
+        role_code: document.getElementById("member-role").value,
+        status: document.getElementById("member-status").value,
+      },
+    };
+    try {
+      const response = await fetch(`/admin/{{ runtime.account.slug }}/members/save`, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(payload),
+      });
+      if (!response.ok) {
+        throw new Error(await response.text());
+      }
+      const body = await response.json();
+      statusNode.textContent = `Saved member #${body.membership.id}`;
+      window.location.href = `/admin/{{ runtime.account.slug }}/members?membership_id=${body.membership.id}`;
+    } catch (error) {
+      statusNode.textContent = "";
+      alert(`Member save failed: ${error}`);
+    }
+  });
+
+  for (const button of document.querySelectorAll(".disable-member")) {
+    button.addEventListener("click", async () => {
+      button.disabled = true;
+      try {
+        const response = await fetch(`/admin/{{ runtime.account.slug }}/members/${button.dataset.membershipId}/disable`, {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({}),
+        });
+        if (!response.ok) {
+          throw new Error(await response.text());
+        }
+        window.location.reload();
+      } catch (error) {
+        button.disabled = false;
+        alert(`Disable failed: ${error}`);
+      }
+    });
+  }
+
+  for (const button of document.querySelectorAll(".remove-member")) {
+    button.addEventListener("click", async () => {
+      if (!window.confirm("Remove this member access from the account?")) return;
+      button.disabled = true;
+      try {
+        const response = await fetch(`/admin/{{ runtime.account.slug }}/members/${button.dataset.membershipId}/remove`, {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({}),
+        });
+        if (!response.ok) {
+          throw new Error(await response.text());
+        }
+        window.location.href = `/admin/{{ runtime.account.slug }}/members`;
+      } catch (error) {
+        button.disabled = false;
+        alert(`Remove failed: ${error}`);
+      }
+    });
+  }
+</script>
+{% endblock %}

@@ -1,0 +1,181 @@
+{% extends "admin/base.html" %}
+{% block content %}
+<div class="topbar">
+  <div>
+    <h2>Accounts</h2>
+    <p class="subtle">Create a new company account, assign owner/admin and track onboarding completion without direct DB work.</p>
+  </div>
+  <div class="chips">
+    <span class="chip">{{ account_rows|length }} accessible accounts</span>
+    <span class="chip">Owner/admin only</span>
+  </div>
+</div>
+
+<section class="grid cols-2">
+  <article class="card">
+    <h3>Create Account</h3>
+    <div class="form-grid two">
+      <label>
+        Account slug
+        <input id="account-slug" placeholder="orion">
+      </label>
+      <label>
+        Account name
+        <input id="account-name" placeholder="Orion">
+      </label>
+      <label>
+        Default timezone
+        <input id="account-timezone" value="Etc/UTC">
+      </label>
+      <label>
+        Owner email
+        <input id="owner-email" placeholder="owner@orion.local">
+      </label>
+      <label>
+        Owner full name
+        <input id="owner-full-name" placeholder="Owner Orion">
+      </label>
+      <label>
+        Initial admin email
+        <input id="admin-email" placeholder="ops@platform.local">
+      </label>
+      <label>
+        Initial admin full name
+        <input id="admin-full-name" placeholder="Platform Ops">
+      </label>
+    </div>
+    <div class="actions" style="margin-top: 16px;">
+      <button type="button" id="create-account">Create account</button>
+      <span class="subtle" id="create-account-status"></span>
+    </div>
+  </article>
+
+  <article class="card">
+    <div class="actions" style="justify-content: space-between;">
+      <div>
+        <h3>Onboarding Status</h3>
+        <p class="subtle">Visibility for the currently selected account rollout.</p>
+      </div>
+      {% if selected_onboarding %}
+      <span class="badge {{ 'good' if selected_onboarding.status == 'complete' else 'warn' }}">{{ selected_onboarding.status }}</span>
+      {% endif %}
+    </div>
+    {% if selected_onboarding %}
+    <div class="stack">
+      <div class="inline-card">
+        <div>
+          <strong>{{ selected_onboarding.account.name }}</strong>
+          <div class="status-line">{{ selected_onboarding.completed_steps }} / {{ selected_onboarding.total_steps }} steps complete</div>
+        </div>
+        <div class="chips">
+          <span class="chip">owners {{ selected_onboarding.owners_count }}</span>
+          <span class="chip">admins {{ selected_onboarding.admins_count }}</span>
+          <span class="chip">goals {{ selected_onboarding.goals_count }}</span>
+        </div>
+      </div>
+      <div class="stack">
+        {% for step in selected_onboarding.steps %}
+        <div class="inline-card">
+          <div class="actions" style="justify-content: space-between;">
+            <strong>{{ step.label }}</strong>
+            <span class="badge {{ 'good' if step.done else 'warn' }}">{{ 'done' if step.done else 'pending' }}</span>
+          </div>
+        </div>
+        {% endfor %}
+      </div>
+      <div class="actions">
+        <a class="pill-link" href="/admin/switch-account/{{ selected_onboarding.account.slug }}?next=/admin/{{ selected_onboarding.account.slug }}/members">members</a>
+        <a class="pill-link" href="/admin/switch-account/{{ selected_onboarding.account.slug }}?next=/admin/{{ selected_onboarding.account.slug }}/goals">goals</a>
+        <a class="pill-link" href="/admin/switch-account/{{ selected_onboarding.account.slug }}?next=/admin/{{ selected_onboarding.account.slug }}/integrations">integrations</a>
+        <a class="pill-link" href="/admin/switch-account/{{ selected_onboarding.account.slug }}?next=/admin/{{ selected_onboarding.account.slug }}/dashboard">dashboard</a>
+      </div>
+      <p class="subtle">Next step: {{ selected_onboarding.next_step }}</p>
+    </div>
+    {% else %}
+    <p class="empty">Choose or create an account to see onboarding progress.</p>
+    {% endif %}
+  </article>
+</section>
+
+<section class="card" style="margin-top: 16px;">
+  <h3>Accessible Accounts</h3>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Account</th>
+          <th>Your role</th>
+          <th>Onboarding</th>
+          <th>Next step</th>
+          <th>Last successful sync</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in account_rows %}
+        <tr>
+          <td>
+            <strong>{{ row.account.name }}</strong>
+            <div class="status-line">{{ row.account.slug }} · {{ row.account.default_timezone }}</div>
+          </td>
+          <td><span class="badge">{{ row.role.code }}</span></td>
+          <td>
+            <span class="badge {{ 'good' if row.onboarding.status == 'complete' else 'warn' }}">{{ row.onboarding.completed_steps }}/{{ row.onboarding.total_steps }}</span>
+          </td>
+          <td>{{ row.onboarding.next_step }}</td>
+          <td>{{ row.onboarding.last_success.finished_at if row.onboarding.last_success else '—' }}</td>
+          <td>
+            <div class="actions">
+              <a class="pill-link" href="/admin/accounts?selected={{ row.account.slug }}">Status</a>
+              <a class="pill-link" href="/admin/switch-account/{{ row.account.slug }}?next=/admin/{{ row.account.slug }}/members">Members</a>
+              <a class="pill-link" href="/admin/switch-account/{{ row.account.slug }}?next=/admin/{{ row.account.slug }}/integrations">Setup</a>
+              <a class="pill-link" href="/admin/switch-account/{{ row.account.slug }}?next=/admin/{{ row.account.slug }}/dashboard">Open</a>
+            </div>
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="6" class="empty">Нет доступных accounts.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<script>
+  document.getElementById("create-account").addEventListener("click", async () => {
+    const statusNode = document.getElementById("create-account-status");
+    statusNode.textContent = "Creating...";
+    const payload = {
+      account: {
+        slug: document.getElementById("account-slug").value.trim().toLowerCase(),
+        name: document.getElementById("account-name").value.trim(),
+        default_timezone: document.getElementById("account-timezone").value.trim() || "Etc/UTC",
+      },
+      owner: {
+        email: document.getElementById("owner-email").value.trim().toLowerCase(),
+        full_name: document.getElementById("owner-full-name").value.trim(),
+      },
+      admin: {
+        email: document.getElementById("admin-email").value.trim().toLowerCase(),
+        full_name: document.getElementById("admin-full-name").value.trim(),
+      },
+    };
+    try {
+      const response = await fetch("/admin/accounts/create", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(payload),
+      });
+      if (!response.ok) {
+        throw new Error(await response.text());
+      }
+      const body = await response.json();
+      statusNode.textContent = `Created ${body.account.slug}`;
+      window.location.href = `/admin/accounts?selected=${body.account.slug}`;
+    } catch (error) {
+      statusNode.textContent = "";
+      alert(`Account create failed: ${error}`);
+    }
+  });
+</script>
+{% endblock %}

@@ -51,7 +51,7 @@
       <label>
         Status
         <select id="integration-status">
-          {% for status_code in ["active", "disabled"] %}
+          {% for status_code in ["active", "disabled", "archived"] %}
           <option value="{{ status_code }}" {{ 'selected' if selected_setup and selected_setup.integration.status == status_code else ('selected' if not selected_setup and status_code == 'active' else '') }}>{{ status_code }}</option>
           {% endfor %}
         </select>
@@ -140,22 +140,34 @@
     <section class="card soft-card" style="margin-top: 16px; padding: 14px;">
       <h4>Stored Credentials</h4>
       {% if selected_setup.masked_credentials %}
+      <div class="chips" style="margin-bottom: 10px;">
+        <span class="chip">version {{ selected_setup.credential_version }}</span>
+        <span class="chip">last rotated {{ selected_setup.credential_last_rotated_at or "—" }}</span>
+      </div>
       <div class="chips">
         {% for key, value in selected_setup.masked_credentials.items() %}
         <span class="chip">{{ key }}: {{ value }}</span>
         {% endfor %}
       </div>
-      <p class="subtle" style="margin-top: 10px;">Raw secrets are never shown after save. Leave fields blank to keep existing values.</p>
+      <p class="subtle" style="margin-top: 10px;">Raw secrets are never shown after save. Use merge to rotate selected fields or replace to clear old secrets and store only the new payload.</p>
       {% else %}
       <p class="empty">Credentials not configured yet.</p>
       {% endif %}
     </section>
     {% endif %}
 
+    <label style="margin-top: 16px;">
+      Credential update mode
+      <select id="credential-replace-mode">
+        <option value="merge">merge provided fields</option>
+        <option value="replace">clear + replace with provided fields</option>
+      </select>
+    </label>
+
     <div class="actions" style="margin-top: 16px;">
       <button type="button" id="save-integration">{{ "Save setup" if selected_setup else "Create integration" }}</button>
       <button type="button" class="secondary" id="test-connection" {% if not selected_setup %}disabled{% endif %}>Test connection</button>
-      <button type="button" class="ghost" id="first-sync" {% if not selected_setup %}disabled{% endif %}>First sync</button>
+      <button type="button" class="ghost" id="first-sync" {% if not selected_setup or selected_setup.integration.status == 'archived' %}disabled{% endif %}>First sync</button>
       <span class="subtle" id="integration-status-line"></span>
     </div>
   </article>
@@ -191,7 +203,18 @@
             <td>
               <div class="actions">
                 <a class="pill-link" href="/admin/{{ runtime.account.slug }}/integrations?integration_id={{ integration.id }}">Edit setup</a>
+                {% if integration.status != 'archived' %}
                 <button type="button" class="run-sync secondary" data-integration-id="{{ integration.id }}">Run sync</button>
+                {% endif %}
+                {% if integration.status != 'active' %}
+                <button type="button" class="set-status ghost" data-integration-id="{{ integration.id }}" data-status="active">Enable</button>
+                {% endif %}
+                {% if integration.status == 'active' %}
+                <button type="button" class="set-status ghost" data-integration-id="{{ integration.id }}" data-status="disabled">Disable</button>
+                {% endif %}
+                {% if integration.status != 'archived' %}
+                <button type="button" class="set-status ghost" data-integration-id="{{ integration.id }}" data-status="archived">Archive</button>
+                {% endif %}
               </div>
             </td>
           </tr>
@@ -310,6 +333,7 @@
           integration_id: currentIntegrationId,
           integration: integrationPayload(),
           credentials: collectProviderCredentials(),
+          replace_mode: document.getElementById("credential-replace-mode").value,
         }),
       });
       if (!response.ok) {
@@ -358,6 +382,26 @@
 
   for (const button of document.querySelectorAll(".run-sync")) {
     button.addEventListener("click", async () => runSync(button.dataset.integrationId, button));
+  }
+
+  for (const button of document.querySelectorAll(".set-status")) {
+    button.addEventListener("click", async () => {
+      button.disabled = true;
+      try {
+        const response = await fetch(`/admin/{{ runtime.account.slug }}/integrations/${button.dataset.integrationId}/status`, {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({status: button.dataset.status}),
+        });
+        if (!response.ok) {
+          throw new Error(await response.text());
+        }
+        window.location.reload();
+      } catch (error) {
+        button.disabled = false;
+        alert(`Status update failed: ${error}`);
+      }
+    });
   }
 </script>
 {% endblock %}

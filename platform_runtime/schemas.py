@@ -66,7 +66,7 @@ class IntegrationCreateRequest(BaseModel):
     provider_name: Literal["avito", "moysklad", "generic_bank"]
     display_name: str = Field(..., min_length=3, max_length=255)
     external_ref: str | None = Field(default=None, max_length=128)
-    status: Literal["active", "disabled"] = "active"
+    status: Literal["active", "disabled", "archived"] = "active"
     connection_mode: Literal["polling", "manual"] = "polling"
     sync_mode: Literal["manual", "scheduled"] = "manual"
     settings: dict[str, object] = Field(default_factory=dict)
@@ -75,7 +75,7 @@ class IntegrationCreateRequest(BaseModel):
 class IntegrationUpdateRequest(BaseModel):
     display_name: str | None = Field(default=None, min_length=3, max_length=255)
     external_ref: str | None = Field(default=None, max_length=128)
-    status: Literal["active", "disabled"] | None = None
+    status: Literal["active", "disabled", "archived"] | None = None
     connection_mode: Literal["polling", "manual"] | None = None
     sync_mode: Literal["manual", "scheduled"] | None = None
     settings: dict[str, object] | None = None
@@ -83,6 +83,7 @@ class IntegrationUpdateRequest(BaseModel):
 
 class CredentialSaveRequest(BaseModel):
     credential_type: str = Field(default="primary", min_length=1, max_length=64)
+    replace_mode: Literal["merge", "replace"] = "merge"
     credentials: dict[str, object] = Field(default_factory=dict)
 
 
