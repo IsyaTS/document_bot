@@ -1,39 +1,125 @@
-# Hermes 7-Day Pilot Checklist
+# Hermes 7-Day Pilot Execution
 
-## Morning Check
+Цель pilot: 7 дней подряд эксплуатировать текущий Hermes runtime как реальный operator loop, не расширяя систему и не рефакторя архитектуру.
 
-1. Confirm stack is healthy:
-   - `docker compose ps`
+## Daily Command Set
+
+Использовать только эти команды:
+
+1. health
    - `curl http://127.0.0.1:${PLATFORM_PUBLIC_API_PORT:-18000}/health`
-2. Run smoke check:
+2. verify runtime DB
+   - `bash -lc 'set -a; source .env; set +a; ./.venv/bin/python scripts/verify_runtime_db.py'`
+3. smoke runtime
    - `bash -lc 'set -a; source .env; set +a; ./.venv/bin/python scripts/smoke_runtime.py'`
-3. Open Hermes dashboard and look at:
-   - advertising CPL
-   - incoming leads
-   - lost leads
-   - first response SLA breaches
-   - active alerts
-4. Confirm worker moved at least one tick in logs:
-   - `docker compose logs --since=30m worker`
-
-## Evening Check
-
-1. Confirm all sync jobs are not stuck in `running` or repeated `retry`.
-2. Confirm critical alerts are either acknowledged in operations or still correctly open.
-3. Create backup:
+4. ops report
+   - `bash -lc 'set -a; source .env; set +a; ./.venv/bin/python scripts/hermes_ops_report.py'`
+5. backup
    - `./scripts/backup_runtime.sh`
-4. Save one-line ops note:
-   - whether leads were answered
-   - whether CPL spike was understood
-   - whether any sync failure needs action next morning
 
-## Mandatory Metrics
+## Daily Focus Metrics
 
-- `advertising.cpl`
 - `advertising.spend`
+- `advertising.cpl`
 - `leads_sales.incoming_leads`
 - `leads_sales.lost_leads`
 - `leads_sales.first_response_sla_breaches`
+
+## Day 1
+
+- morning:
+  - run `health`
+  - run `verify_runtime_db`
+  - run `smoke_runtime`
+  - record baseline numbers in `HERMES_PILOT_ISSUES.md`
+- midday:
+  - run `hermes_ops_report`
+  - check if `hermes-avito-main` latest sync is fresh enough
+  - note first obvious false positives
+- evening:
+  - run `hermes_ops_report`
+  - run `backup_runtime`
+  - record whether baseline signals were useful or noisy
+
+## Day 2
+
+- morning:
+  - run `health`
+  - run `verify_runtime_db`
+  - compare top numbers vs Day 1
+- midday:
+  - run `hermes_ops_report`
+  - inspect critical alerts and overdue tasks
+  - note whether alert wording/SLA is clear enough for action
+- evening:
+  - run `backup_runtime`
+  - write false positives and real useful signals
+
+## Day 3
+
+- morning:
+  - run `health`
+  - run `smoke_runtime`
+  - confirm dashboard freshness still matches operator reality
+- midday:
+  - run `hermes_ops_report`
+  - focus on sync status and stale-data risk
+- evening:
+  - run `backup_runtime`
+  - log any sync drift, retries or unexplained data gaps
+
+## Day 4
+
+- morning:
+  - run `health`
+  - run `verify_runtime_db`
+  - re-check top metrics and critical alerts
+- midday:
+  - run `hermes_ops_report`
+  - focus on alert noise vs true positives
+- evening:
+  - run `backup_runtime`
+  - write down any threshold tuning candidates
+
+## Day 5
+
+- morning:
+  - run `health`
+  - run `smoke_runtime`
+  - check same-day tasks and overdue tasks
+- midday:
+  - run `hermes_ops_report`
+  - focus on whether tasks are operationally actionable
+- evening:
+  - run `backup_runtime`
+  - record any task/alert disconnects
+
+## Day 6
+
+- morning:
+  - run `health`
+  - run `verify_runtime_db`
+  - compare current signals with earlier days
+- midday:
+  - run `hermes_ops_report`
+  - focus on repeated issues and unresolved noise
+- evening:
+  - run `backup_runtime`
+  - summarize what still feels unstable
+
+## Day 7
+
+- morning:
+  - run `health`
+  - run `smoke_runtime`
+  - confirm the system is still usable without manual rescue
+- midday:
+  - run `hermes_ops_report`
+  - prepare weekly pilot review from actual notes
+- evening:
+  - run `backup_runtime`
+  - close `HERMES_PILOT_ISSUES.md`
+  - fill `HERMES_WEEKLY_REVIEW_TEMPLATE.md`
 
 ## Success Criteria
 
@@ -51,28 +137,17 @@
 - daily backup skipped
 - operator cannot explain why a critical alert remained open
 
-## Manual Record If Automation Misses Something
+## Allowed Changes During Pilot
 
-- provider outage / strange upstream response
-- phone response happened but lead state was not updated
-- ad spend anomaly noticed outside current sync window
-- stock/cash issue noticed operationally before platform reflected it
+- tiny bug fixes
+- threshold tuning
+- runbook corrections
+- alert policy corrections
 
-## Critical Alerts
+## Not Allowed During Pilot
 
-- `lead.no_first_response`
-  - critical when count > 0 for fresh inbound leads during working hours
-- `marketing.cpl_above_threshold`
-  - critical when high CPL persists for the current day and spend is still active
-- `leads.lost_above_threshold`
-  - critical when daily lost leads exceed threshold and reasons are not explained
-- repeated sync failures
-  - critical when the same integration remains in `retry` or `failed` after operator attention
-
-## Escalation Triggers During Pilot
-
-- API health endpoint fails
-- worker does not progress for more than 30 minutes during business hours
-- backup is not created by end of day
-- Hermes dashboard stops showing advertising/leads widgets with current-day values
-- PostgreSQL migration verification or smoke check fails after update
+- new architecture
+- new providers
+- Obsidian
+- heavy UI
+- framework refactor

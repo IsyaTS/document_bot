@@ -49,6 +49,7 @@
 - daily checklist: [HERMES_DAILY_OPERATIONS.md](/opt/aidar/document_bot/docs/HERMES_DAILY_OPERATIONS.md)
 - alert ownership/SLA matrix: [HERMES_ALERT_POLICY.md](/opt/aidar/document_bot/docs/HERMES_ALERT_POLICY.md)
 - pilot checklist: [HERMES_7_DAY_PILOT.md](/opt/aidar/document_bot/docs/HERMES_7_DAY_PILOT.md)
+- pilot issues log: [HERMES_PILOT_ISSUES.md](/opt/aidar/document_bot/docs/HERMES_PILOT_ISSUES.md)
 - weekly review template: [HERMES_WEEKLY_REVIEW_TEMPLATE.md](/opt/aidar/document_bot/docs/HERMES_WEEKLY_REVIEW_TEMPLATE.md)
 
 ## Backup

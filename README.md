@@ -228,6 +228,7 @@ PLATFORM_DATABASE_URL=sqlite+pysqlite:////opt/aidar/document_bot/data/platform.s
 - `docker-compose.yml`
 - [docs/HERMES_RUNBOOK.md](/opt/aidar/document_bot/docs/HERMES_RUNBOOK.md)
 - [docs/HERMES_7_DAY_PILOT.md](/opt/aidar/document_bot/docs/HERMES_7_DAY_PILOT.md)
+- [docs/HERMES_PILOT_ISSUES.md](/opt/aidar/document_bot/docs/HERMES_PILOT_ISSUES.md)
 - [docs/HERMES_DAILY_OPERATIONS.md](/opt/aidar/document_bot/docs/HERMES_DAILY_OPERATIONS.md)
 - [docs/HERMES_ALERT_POLICY.md](/opt/aidar/document_bot/docs/HERMES_ALERT_POLICY.md)
 - [docs/HERMES_WEEKLY_REVIEW_TEMPLATE.md](/opt/aidar/document_bot/docs/HERMES_WEEKLY_REVIEW_TEMPLATE.md)

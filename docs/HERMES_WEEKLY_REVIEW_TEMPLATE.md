@@ -15,17 +15,35 @@
 - First response SLA breaches:
 - Open critical alerts at end of week:
 
-## What Improved
+## What Worked
 
 - Which metric improved?
-- What action likely caused the improvement?
-- Should the change become standard process?
+- Which operator flow actually helped?
+- Which alerts/tasks were genuinely actionable?
+
+## What Was Noise
+
+- Which alerts were false positives?
+- Which signals created work without useful action?
+- Which dashboard numbers were not decision-useful?
 
 ## What Broke
 
 - Which alerts repeated?
 - Which sync/integration issues occurred?
 - Which tasks remained overdue?
+
+## What Needs Threshold Tuning
+
+- Which alert thresholds are too sensitive?
+- Which alert thresholds are too weak?
+- Which rule timing/SLA values should be adjusted?
+
+## What Needs Real Code Fix
+
+- Which bug affected daily use?
+- Which data issue could not be solved operationally?
+- Which fix is required before the next stage?
 
 ## Lead Quality Review
 
@@ -51,7 +69,13 @@
 - Upstream provider oddities:
 - Human process issues:
 
-## Decisions for Next Week
+## Stable Enough For Next Stage?
+
+- Yes / No:
+- Why:
+- Main residual risks:
+
+## Decisions For Next Week
 
 1. 
 2. 
