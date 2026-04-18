@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -11,9 +12,10 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from platform_core.models import AccountUser, Employee, Goal, GoalTarget, User
+from platform_core.models import Account, AccountUser, Employee, Goal, GoalTarget, User
 from platform_core.exceptions import PlatformCoreError, TenantContextError
 from platform_core.services import ExecutiveDashboardService, GOAL_METRIC_DEFINITIONS, GoalService
 from platform_core.services.runtime import (
@@ -27,11 +29,15 @@ from platform_core.services.runtime import (
 from platform_core.settings import load_platform_settings
 from platform_runtime.deps import get_db_session, get_runtime_context
 from platform_runtime.schemas import (
+    CredentialSaveRequest,
     GoalCreateRequest,
     GoalUpdateRequest,
+    IntegrationCreateRequest,
+    IntegrationUpdateRequest,
     RuleRunRequest,
     SchedulerRunRequest,
     SyncJobCreateRequest,
+    TestConnectionRequest,
 )
 
 
@@ -64,6 +70,96 @@ def create_app() -> FastAPI:
 
     def admin_query_string(actor_email: str) -> str:
         return urlencode({"actor_email": actor_email})
+
+    def _admin_page_path(page: str) -> str:
+        return {
+            "dashboard": "dashboard",
+            "integrations": "integrations",
+            "alerts_tasks": "alerts-tasks",
+            "ops_sync": "ops-sync",
+            "goals": "goals",
+        }.get(page, "dashboard")
+
+    def _accessible_accounts(session: Session, actor_email: str) -> list[Account]:
+        return session.execute(
+            select(Account)
+            .join(AccountUser, AccountUser.account_id == Account.id)
+            .join(User, User.id == AccountUser.user_id)
+            .where(User.email == actor_email, AccountUser.status == "active")
+            .order_by(Account.name.asc(), Account.slug.asc())
+        ).scalars().all()
+
+    def _provider_catalog() -> list[dict[str, object]]:
+        return [
+            {
+                "key": "ads:avito",
+                "provider_kind": "ads",
+                "provider_name": "avito",
+                "label": "Avito",
+                "description": "Avito ads + leads sync with token-based credentials.",
+                "fields": [
+                    {"key": "access_token", "label": "Access token", "kind": "secret", "required": True},
+                    {"key": "account_external_id", "label": "Account external id", "kind": "text", "required": True},
+                    {"key": "base_url", "label": "Base URL", "kind": "text"},
+                    {"key": "timeout_seconds", "label": "Timeout seconds", "kind": "number"},
+                    {"key": "max_retries", "label": "Max retries", "kind": "number"},
+                    {"key": "backoff_seconds", "label": "Backoff seconds", "kind": "number"},
+                    {"key": "campaigns_params", "label": "Campaign params JSON", "kind": "json"},
+                    {"key": "metrics_params", "label": "Metrics params JSON", "kind": "json"},
+                    {"key": "leads_params", "label": "Leads params JSON", "kind": "json"},
+                    {"key": "lead_sources", "label": "Lead sources JSON", "kind": "json"},
+                    {"key": "fixture_payload", "label": "Fixture payload JSON", "kind": "json"},
+                ],
+            },
+            {
+                "key": "erp:moysklad",
+                "provider_kind": "erp",
+                "provider_name": "moysklad",
+                "label": "MoySklad",
+                "description": "MoySklad ERP sync for canonical business tables.",
+                "fields": [
+                    {"key": "login", "label": "Login", "kind": "text", "required": True},
+                    {"key": "password", "label": "Password", "kind": "secret", "required": True},
+                    {"key": "base_url", "label": "Base URL", "kind": "text"},
+                    {"key": "timeout_seconds", "label": "Timeout seconds", "kind": "number"},
+                    {"key": "fixture_payload", "label": "Fixture payload JSON", "kind": "json"},
+                ],
+            },
+            {
+                "key": "banking:generic_bank",
+                "provider_kind": "banking",
+                "provider_name": "generic_bank",
+                "label": "Generic Bank Feed",
+                "description": "Canonical bank feed path. Fixture payload is the primary local setup mode.",
+                "fields": [
+                    {"key": "fixture_payload", "label": "Fixture payload JSON", "kind": "json"},
+                    {"key": "base_url", "label": "Bank feed URL", "kind": "text"},
+                    {"key": "access_token", "label": "Access token", "kind": "secret"},
+                ],
+            },
+        ]
+
+    def _provider_spec(provider_kind: str, provider_name: str) -> dict[str, object] | None:
+        provider_key = f"{provider_kind}:{provider_name}"
+        for item in _provider_catalog():
+            if item["key"] == provider_key:
+                return item
+        return None
+
+    def _admin_context(
+        session: Session,
+        runtime: ResolvedRuntimeContext,
+        *,
+        page: str,
+    ) -> dict[str, object]:
+        actor_email = runtime.actor_user.email
+        return {
+            "runtime": runtime,
+            "page": page,
+            "page_path": _admin_page_path(page),
+            "page_query": admin_query_string(actor_email),
+            "accessible_accounts": _accessible_accounts(session, actor_email),
+        }
 
     def _goal_period_defaults(period_kind: str, runtime: ResolvedRuntimeContext) -> tuple[date, date]:
         try:
@@ -113,6 +209,103 @@ def create_app() -> FastAPI:
             return f"Last sync ended with status {job.status}."
         return None
 
+    def _goal_metric_alert_map() -> dict[str, list[str]]:
+        return {
+            "available_cash": ["bank.balance_below_safe_threshold"],
+            "low_stock_items": ["inventory.stock_below_threshold"],
+            "cpl": ["marketing.cpl_above_threshold"],
+            "lost_leads": ["leads.lost_above_threshold"],
+            "incoming_leads": ["leads.lost_above_threshold", "lead.no_first_response"],
+            "first_response_breaches": ["lead.no_first_response"],
+            "revenue": ["marketing.cpl_above_threshold", "leads.lost_above_threshold"],
+            "net_profit": ["marketing.cpl_above_threshold", "bank.balance_below_safe_threshold"],
+        }
+
+    def _goal_metric_links(account_slug: str, actor_email: str, metric_code: str) -> dict[str, str]:
+        query = admin_query_string(actor_email)
+        severity = "critical"
+        priority = "high"
+        if metric_code == "cpl":
+            severity = "warning"
+        return {
+            "alerts": f"/admin/{account_slug}/alerts-tasks?{query}&severity={severity}",
+            "tasks": f"/admin/{account_slug}/alerts-tasks?{query}&priority={priority}",
+            "ops": f"/admin/{account_slug}/ops-sync?{query}",
+        }
+
+    def _goal_blocker_rows(
+        *,
+        account_slug: str,
+        actor_email: str,
+        metrics: list[dict[str, object]],
+        open_alerts: list[object],
+        open_tasks: list[object],
+        top_problems: list[dict[str, object]],
+        attention_zones: list[dict[str, object]],
+    ) -> list[dict[str, object]]:
+        blockers: list[dict[str, object]] = []
+        alert_map = _goal_metric_alert_map()
+        tasks_by_id = {getattr(item, "id", None): item for item in open_tasks}
+        for metric in metrics:
+            if metric["status"] == "on_track":
+                continue
+            metric_code = str(metric["metric_code"])
+            related_codes = alert_map.get(metric_code, [])
+            related_alerts = [item for item in open_alerts if item.code in related_codes][:3]
+            related_problems = [item for item in top_problems if item["code"] in related_codes][:3]
+            problem_task_ids = [item["task_id"] for item in related_problems if item.get("task_id") is not None]
+            related_tasks = [tasks_by_id[item_id] for item_id in problem_task_ids if item_id in tasks_by_id][:3]
+            if not related_tasks:
+                related_tasks = [
+                    item for item in open_tasks
+                    if item.priority in {"critical", "high"}
+                ][:3]
+            related_actions = [
+                item for item in attention_zones
+                if item.get("action_type") == "task" and item.get("task_id") in problem_task_ids
+            ][:3]
+            if not related_actions:
+                related_actions = attention_zones[:3]
+            blockers.append(
+                {
+                    "metric": metric,
+                    "alert_codes": related_codes,
+                    "related_alerts": related_alerts,
+                    "related_tasks": related_tasks,
+                    "related_problems": related_problems,
+                    "attention_actions": related_actions,
+                    "links": _goal_metric_links(account_slug, actor_email, metric_code),
+                }
+            )
+        return blockers
+
+    def _enrich_goal_snapshot(
+        *,
+        account_slug: str,
+        actor_email: str,
+        snapshot: dict[str, object],
+        open_alerts: list[object],
+        open_tasks: list[object],
+        top_problems: list[dict[str, object]],
+        attention_zones: list[dict[str, object]],
+    ) -> dict[str, object]:
+        enriched = dict(snapshot)
+        enriched["blockers"] = _goal_blocker_rows(
+            account_slug=account_slug,
+            actor_email=actor_email,
+            metrics=list(snapshot["metrics"]),
+            open_alerts=open_alerts,
+            open_tasks=open_tasks,
+            top_problems=top_problems,
+            attention_zones=attention_zones,
+        )
+        return enriched
+
+    def _parse_admin_payload(request_payload: dict[str, object], key: str) -> dict[str, object]:
+        value = request_payload.get(key) or {}
+        if not isinstance(value, dict):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"{key} must be an object.")
+        return value
 
     @app.get("/health")
     def health(session: Session = Depends(get_db_session)) -> dict[str, object]:
@@ -224,6 +417,113 @@ def create_app() -> FastAPI:
         ensure_permission(runtime, "integrations.manage")
         return [_serialize_integration(item) for item in RuntimeIntegrationService(session).list_integrations(runtime.context)]
 
+    @app.post("/api/integrations")
+    def create_integration_api(
+        body: IntegrationCreateRequest,
+        session: Session = Depends(get_db_session),
+        runtime: ResolvedRuntimeContext = Depends(get_runtime_context),
+    ) -> dict[str, object]:
+        ensure_permission(runtime, "integrations.manage")
+        service = RuntimeIntegrationService(session)
+        try:
+            integration = service.create_integration(
+                runtime.context,
+                provider_kind=body.provider_kind,
+                provider_name=body.provider_name,
+                display_name=body.display_name,
+                external_ref=body.external_ref,
+                status=body.status,
+                connection_mode=body.connection_mode,
+                sync_mode=body.sync_mode,
+                settings_json=body.settings,
+            )
+        except (PlatformCoreError, IntegrityError) as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        return {"integration": _serialize_integration(integration)}
+
+    @app.patch("/api/integrations/{integration_id}")
+    def update_integration_api(
+        integration_id: int,
+        body: IntegrationUpdateRequest,
+        session: Session = Depends(get_db_session),
+        runtime: ResolvedRuntimeContext = Depends(get_runtime_context),
+    ) -> dict[str, object]:
+        ensure_permission(runtime, "integrations.manage")
+        service = RuntimeIntegrationService(session)
+        try:
+            integration = service.update_integration(
+                runtime.context,
+                integration_id=integration_id,
+                display_name=body.display_name,
+                external_ref=body.external_ref,
+                status=body.status,
+                connection_mode=body.connection_mode,
+                sync_mode=body.sync_mode,
+                settings_json=body.settings,
+            )
+        except (TenantContextError, PlatformCoreError, IntegrityError) as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        return {"integration": _serialize_integration(integration)}
+
+    @app.get("/api/integrations/{integration_id}/setup")
+    def integration_setup_api(
+        integration_id: int,
+        session: Session = Depends(get_db_session),
+        runtime: ResolvedRuntimeContext = Depends(get_runtime_context),
+    ) -> dict[str, object]:
+        ensure_permission(runtime, "integrations.manage")
+        service = RuntimeIntegrationService(session)
+        try:
+            payload = service.integration_setup_payload(runtime.context, integration_id=integration_id)
+        except TenantContextError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        return {
+            "integration": _serialize_integration(payload["integration"]),
+            "masked_credentials": payload["masked_credentials"],
+            "latest_jobs": [_serialize_sync_job(item) for item in payload["latest_jobs"]],
+        }
+
+    @app.post("/api/integrations/{integration_id}/credentials")
+    def save_credentials_api(
+        integration_id: int,
+        body: CredentialSaveRequest,
+        session: Session = Depends(get_db_session),
+        runtime: ResolvedRuntimeContext = Depends(get_runtime_context),
+    ) -> dict[str, object]:
+        ensure_permission(runtime, "integrations.manage")
+        service = RuntimeIntegrationService(session)
+        try:
+            credential = service.save_credentials(
+                runtime.context,
+                integration_id=integration_id,
+                secret_payload=body.credentials,
+                credential_type=body.credential_type,
+            )
+            payload = service.integration_setup_payload(runtime.context, integration_id=integration_id)
+        except (TenantContextError, PlatformCoreError, IntegrityError) as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        return {
+            "credential_version": credential.version,
+            "masked_credentials": payload["masked_credentials"],
+        }
+
+    @app.post("/api/integrations/{integration_id}/test-connection")
+    def test_connection_api(
+        integration_id: int,
+        body: TestConnectionRequest,
+        session: Session = Depends(get_db_session),
+        runtime: ResolvedRuntimeContext = Depends(get_runtime_context),
+    ) -> dict[str, object]:
+        ensure_permission(runtime, "integrations.manage")
+        service = RuntimeIntegrationService(session)
+        try:
+            return service.test_connection(
+                runtime.context,
+                integration_id=integration_id,
+                override_payload=body.credentials,
+            )
+        except (TenantContextError, PlatformCoreError) as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
     @app.post("/api/integrations/{integration_id}/sync")
     def enqueue_integration_sync(
@@ -471,22 +771,34 @@ def create_app() -> FastAPI:
         dashboard = ExecutiveDashboardService(session).get_dashboard(runtime.context, "today")
         widgets = {item["widget_key"]: item["payload"] for item in dashboard["widgets"]}
         goals = GoalService(session).get_dashboard_goal_snapshot(runtime.context)
+        automation = RuntimeAutomationService(session)
         alerts = [
             item for item in RuntimeAutomationService(session).list_alerts(runtime.context)
             if item.status == "open"
         ][:8]
-        tasks = RuntimeAutomationService(session).list_tasks(runtime.context)
+        open_alerts = [item for item in automation.list_alerts(runtime.context) if item.status == "open"]
+        tasks = automation.list_tasks(runtime.context)
         overdue_tasks = [item for item in tasks if item.status == "open" and item.due_at is not None and item.due_at <= datetime.now(timezone.utc)][:8]
+        goal_snapshots = [
+            _enrich_goal_snapshot(
+                account_slug=account_slug,
+                actor_email=actor_email,
+                snapshot=item,
+                open_alerts=open_alerts,
+                open_tasks=[task for task in tasks if task.status == "open"],
+                top_problems=widgets.get("owner_panel", {}).get("top_problems", []),
+                attention_zones=widgets.get("owner_panel", {}).get("attention_zones", []),
+            )
+            for item in goals
+        ]
         return templates.TemplateResponse(
             request,
             "admin/dashboard.html",
             {
-                "runtime": runtime,
-                "page": "dashboard",
-                "page_query": admin_query_string(actor_email),
+                **_admin_context(session, runtime, page="dashboard"),
                 "dashboard": dashboard,
                 "widgets": widgets,
-                "goal_snapshots": goals,
+                "goal_snapshots": goal_snapshots,
                 "critical_alerts": alerts,
                 "overdue_tasks": overdue_tasks,
             },
@@ -497,25 +809,39 @@ def create_app() -> FastAPI:
         request: Request,
         account_slug: str,
         actor_email: str = Query(...),
+        integration_id: int | None = Query(default=None),
+        provider: str | None = Query(default=None),
         session: Session = Depends(get_db_session),
     ) -> HTMLResponse:
         runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
         ensure_permission(runtime, "integrations.manage")
-        integrations = RuntimeIntegrationService(session).list_integrations(runtime.context)
+        service = RuntimeIntegrationService(session)
+        integrations = service.list_integrations(runtime.context)
         sync_status = {
             item["integration"].id: item
             for item in AdminQueryService(session).integration_sync_status(runtime.account.id)
         }
+        selected_setup = None
+        selected_provider_key = provider or "ads:avito"
+        if integration_id is not None:
+            try:
+                selected_setup = service.integration_setup_payload(runtime.context, integration_id=integration_id)
+            except TenantContextError as exc:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+            selected_provider_key = f"{selected_setup['integration'].provider_kind}:{selected_setup['integration'].provider_name}"
+        provider_catalog = _provider_catalog()
         return templates.TemplateResponse(
             request,
             "admin/integrations.html",
             {
-                "runtime": runtime,
-                "page": "integrations",
-                "page_query": admin_query_string(actor_email),
+                **_admin_context(session, runtime, page="integrations"),
                 "integrations": integrations,
                 "sync_status": sync_status,
                 "human_sync_error": _human_sync_error,
+                "provider_catalog": provider_catalog,
+                "selected_provider_key": selected_provider_key,
+                "selected_setup": selected_setup,
+                "selected_provider_spec": next((item for item in provider_catalog if item["key"] == selected_provider_key), provider_catalog[0]),
             },
         )
 
@@ -554,9 +880,7 @@ def create_app() -> FastAPI:
             request,
             "admin/alerts_tasks.html",
             {
-                "runtime": runtime,
-                "page": "alerts_tasks",
-                "page_query": admin_query_string(actor_email),
+                **_admin_context(session, runtime, page="alerts_tasks"),
                 "alerts": alerts,
                 "tasks": tasks,
                 "overdue_tasks": overdue_tasks,
@@ -585,9 +909,7 @@ def create_app() -> FastAPI:
             request,
             "admin/ops_sync.html",
             {
-                "runtime": runtime,
-                "page": "ops_sync",
-                "page_query": admin_query_string(actor_email),
+                **_admin_context(session, runtime, page="ops_sync"),
                 "ops": ops,
                 "human_sync_error": _human_sync_error,
             },
@@ -620,15 +942,30 @@ def create_app() -> FastAPI:
             .order_by(User.full_name.asc(), User.email.asc())
         ).scalars().all()
         period_start, period_end = _goal_period_defaults("month", runtime)
+        dashboard = ExecutiveDashboardService(session).get_dashboard(runtime.context, "today")
+        widgets = {item["widget_key"]: item["payload"] for item in dashboard["widgets"]}
+        automation = RuntimeAutomationService(session)
+        open_alerts = [item for item in automation.list_alerts(runtime.context) if item.status == "open"]
+        open_tasks = [item for item in automation.list_tasks(runtime.context) if item.status == "open"]
+        selected_goal_enriched = None
+        if selected_goal_payload is not None:
+            selected_goal_enriched = dict(selected_goal_payload)
+            selected_goal_enriched["blockers"] = _goal_blocker_rows(
+                account_slug=account_slug,
+                actor_email=actor_email,
+                metrics=list(selected_goal_payload["metrics"]),
+                open_alerts=open_alerts,
+                open_tasks=open_tasks,
+                top_problems=widgets.get("owner_panel", {}).get("top_problems", []),
+                attention_zones=widgets.get("owner_panel", {}).get("attention_zones", []),
+            )
         return templates.TemplateResponse(
             request,
             "admin/goals.html",
             {
-                "runtime": runtime,
-                "page": "goals",
-                "page_query": admin_query_string(actor_email),
+                **_admin_context(session, runtime, page="goals"),
                 "goals": goals,
-                "selected_goal": selected_goal_payload,
+                "selected_goal": selected_goal_enriched,
                 "selected_targets_by_code": selected_targets_by_code,
                 "metric_definitions": list(GOAL_METRIC_DEFINITIONS.values()),
                 "owners": owners,
@@ -668,6 +1005,85 @@ def create_app() -> FastAPI:
                 "execution": _serialize_job_execution(execution),
             }
         )
+
+    @app.post("/admin/{account_slug}/integrations/save")
+    async def admin_save_integration(
+        request: Request,
+        account_slug: str,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        payload = await request.json()
+        actor_email = str(payload.get("actor_email") or "").strip()
+        if not actor_email:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="actor_email is required.")
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
+        ensure_permission(runtime, "integrations.manage")
+        body = _parse_admin_payload(payload, "integration")
+        credentials = _parse_admin_payload(payload, "credentials")
+        service = RuntimeIntegrationService(session)
+        integration_id = payload.get("integration_id")
+        try:
+            if integration_id:
+                integration = service.update_integration(
+                    runtime.context,
+                    integration_id=int(integration_id),
+                    display_name=str(body.get("display_name") or "").strip() or None,
+                    external_ref=body.get("external_ref"),
+                    status=str(body.get("status") or "active"),
+                    connection_mode=str(body.get("connection_mode") or "polling"),
+                    sync_mode=str(body.get("sync_mode") or "manual"),
+                    settings_json=body.get("settings") if isinstance(body.get("settings"), dict) else None,
+                )
+            else:
+                integration = service.create_integration(
+                    runtime.context,
+                    provider_kind=str(body.get("provider_kind") or "").strip(),
+                    provider_name=str(body.get("provider_name") or "").strip(),
+                    display_name=str(body.get("display_name") or "").strip(),
+                    external_ref=body.get("external_ref"),
+                    status=str(body.get("status") or "active"),
+                    connection_mode=str(body.get("connection_mode") or "polling"),
+                    sync_mode=str(body.get("sync_mode") or "manual"),
+                    settings_json=body.get("settings") if isinstance(body.get("settings"), dict) else None,
+                )
+            if credentials:
+                service.save_credentials(runtime.context, integration_id=integration.id, secret_payload=credentials)
+            setup = service.integration_setup_payload(runtime.context, integration_id=integration.id)
+        except (PlatformCoreError, TenantContextError, IntegrityError) as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        return JSONResponse(
+            {
+                "integration": _serialize_integration(integration),
+                "setup": {
+                    "masked_credentials": setup["masked_credentials"],
+                    "latest_jobs": [_serialize_sync_job(item) for item in setup["latest_jobs"]],
+                },
+            }
+        )
+
+    @app.post("/admin/{account_slug}/integrations/{integration_id}/test")
+    async def admin_test_integration(
+        request: Request,
+        account_slug: str,
+        integration_id: int,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        payload = await request.json()
+        actor_email = str(payload.get("actor_email") or "").strip()
+        if not actor_email:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="actor_email is required.")
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
+        ensure_permission(runtime, "integrations.manage")
+        credentials = _parse_admin_payload(payload, "credentials")
+        try:
+            result = RuntimeIntegrationService(session).test_connection(
+                runtime.context,
+                integration_id=integration_id,
+                override_payload=credentials,
+            )
+        except (PlatformCoreError, TenantContextError) as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        return JSONResponse(result)
 
     @app.post("/admin/{account_slug}/goals/save")
     async def admin_save_goal(
@@ -810,6 +1226,7 @@ def _serialize_integration(integration) -> dict[str, object]:
         "sync_mode": integration.sync_mode,
         "connection_mode": integration.connection_mode,
         "last_sync_at": _serialize_datetime(integration.last_sync_at),
+        "settings": integration.settings_json,
     }
 
 

@@ -3,71 +3,364 @@
 <div class="topbar">
   <div>
     <h2>Integrations</h2>
-    <p class="subtle">Статус подключений, последние sync results и ручной запуск sync без прямой работы с БД.</p>
+    <p class="subtle">Setup, credentials, connection test и первый sync без прямой работы с БД.</p>
+  </div>
+  <div class="chips">
+    <span class="chip">{{ integrations|length }} integrations</span>
+    <span class="chip">Account-scoped setup</span>
   </div>
 </div>
 
-<section class="card">
-  <div class="table-wrap">
-    <table>
-      <thead>
-        <tr>
-          <th>Name</th>
-          <th>Provider</th>
-          <th>Status</th>
-          <th>Last sync</th>
-          <th>Last success</th>
-          <th>Last error</th>
-          <th></th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for integration in integrations %}
-        {% set sync = sync_status.get(integration.id) %}
-        <tr>
-          <td>
-            <strong>{{ integration.display_name }}</strong>
-            <div class="status-line">{{ integration.external_ref or "no external ref" }}</div>
-          </td>
-          <td>{{ integration.provider_name }}</td>
-          <td><span class="badge {{ 'good' if integration.status == 'active' else 'warn' }}">{{ integration.status }}</span></td>
-          <td>{{ integration.last_sync_at or "—" }}</td>
-          <td>{{ sync.latest_success.finished_at if sync and sync.latest_success else "—" }}</td>
-          <td>{{ human_sync_error(sync.latest_failure) if sync else "—" }}</td>
-          <td>
-            <button type="button" class="run-sync" data-integration-id="{{ integration.id }}">Run sync</button>
-          </td>
-        </tr>
+<section class="grid cols-2 integrations-layout">
+  <article class="card">
+    <div class="actions" style="justify-content: space-between;">
+      <div>
+        <h3>{{ "Edit Integration" if selected_setup else "Create Integration" }}</h3>
+        <p class="subtle">General setup, provider credentials и safe replace semantics.</p>
+      </div>
+      {% if selected_setup %}
+      <a class="pill-link" href="/admin/{{ runtime.account.slug }}/integrations?{{ page_query }}">new integration</a>
+      {% endif %}
+    </div>
+
+    <div class="form-grid two" style="margin-top: 14px;">
+      <label>
+        Provider
+        <select id="provider-select" {% if selected_setup %}disabled{% endif %}>
+          {% for provider in provider_catalog %}
+          <option
+            value="{{ provider.key }}"
+            {{ 'selected' if selected_provider_key == provider.key else '' }}
+          >
+            {{ provider.label }}
+          </option>
+          {% endfor %}
+        </select>
+        {% if selected_setup %}
+        <span class="status-line">Provider cannot be changed after integration creation.</span>
+        {% endif %}
+      </label>
+      <label>
+        Display name
+        <input id="integration-display-name" value="{{ selected_setup.integration.display_name if selected_setup else '' }}">
+      </label>
+      <label>
+        External ref
+        <input id="integration-external-ref" value="{{ selected_setup.integration.external_ref if selected_setup and selected_setup.integration.external_ref else '' }}">
+      </label>
+      <label>
+        Status
+        <select id="integration-status">
+          {% for status_code in ["active", "disabled"] %}
+          <option value="{{ status_code }}" {{ 'selected' if selected_setup and selected_setup.integration.status == status_code else ('selected' if not selected_setup and status_code == 'active' else '') }}>{{ status_code }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>
+        Connection mode
+        <select id="integration-connection-mode">
+          {% for mode in ["polling", "manual"] %}
+          <option value="{{ mode }}" {{ 'selected' if selected_setup and selected_setup.integration.connection_mode == mode else ('selected' if not selected_setup and mode == 'polling' else '') }}>{{ mode }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>
+        Sync mode
+        <select id="integration-sync-mode">
+          {% for mode in ["manual", "scheduled"] %}
+          <option value="{{ mode }}" {{ 'selected' if selected_setup and selected_setup.integration.sync_mode == mode else ('selected' if not selected_setup and mode == 'manual' else '') }}>{{ mode }}</option>
+          {% endfor %}
+        </select>
+      </label>
+    </div>
+
+    <div class="provider-sections" style="margin-top: 18px;">
+      {% for provider in provider_catalog %}
+      {% set provider_setup = selected_setup if selected_setup and (selected_setup.integration.provider_kind ~ ':' ~ selected_setup.integration.provider_name) == provider.key else none %}
+      {% set masked_credentials = provider_setup.masked_credentials if provider_setup else {} %}
+      <section
+        class="provider-fields {{ 'active' if selected_provider_key == provider.key else '' }}"
+        data-provider-key="{{ provider.key }}"
+      >
+        <div class="card soft-card" style="padding: 14px;">
+          <div class="actions" style="justify-content: space-between;">
+            <div>
+              <h4>{{ provider.label }}</h4>
+              <p class="subtle">{{ provider.description }}</p>
+            </div>
+            <span class="badge">{{ provider.provider_kind }}</span>
+          </div>
+          <div class="form-grid two" style="margin-top: 14px;">
+            {% for field in provider.fields %}
+            {% set masked_value = masked_credentials.get(field.key) %}
+            <label>
+              {{ field.label }}
+              {% if field.kind == "json" %}
+              <textarea
+                class="provider-input"
+                data-provider-key="{{ provider.key }}"
+                data-field-key="{{ field.key }}"
+                data-field-kind="{{ field.kind }}"
+                placeholder="{{ 'stored: ' ~ masked_value if masked_value else '' }}"
+              ></textarea>
+              {% elif field.kind == "secret" %}
+              <input
+                type="password"
+                class="provider-input"
+                data-provider-key="{{ provider.key }}"
+                data-field-key="{{ field.key }}"
+                data-field-kind="{{ field.kind }}"
+                placeholder="{{ 'stored: ' ~ masked_value if masked_value else '' }}"
+              >
+              {% else %}
+              <input
+                {% if field.kind == "number" %}type="number" step="0.01"{% endif %}
+                class="provider-input"
+                data-provider-key="{{ provider.key }}"
+                data-field-key="{{ field.key }}"
+                data-field-kind="{{ field.kind }}"
+                value="{{ masked_value if masked_value and field.kind != 'secret' and field.kind != 'json' else '' }}"
+                placeholder="{{ 'stored: ' ~ masked_value if masked_value and field.kind != 'number' else '' }}"
+              >
+              {% endif %}
+              {% if field.required %}
+              <span class="status-line">required for live mode</span>
+              {% else %}
+              <span class="status-line">optional / replace only when filled</span>
+              {% endif %}
+            </label>
+            {% endfor %}
+          </div>
+        </div>
+      </section>
+      {% endfor %}
+    </div>
+
+    {% if selected_setup %}
+    <section class="card soft-card" style="margin-top: 16px; padding: 14px;">
+      <h4>Stored Credentials</h4>
+      {% if selected_setup.masked_credentials %}
+      <div class="chips">
+        {% for key, value in selected_setup.masked_credentials.items() %}
+        <span class="chip">{{ key }}: {{ value }}</span>
         {% endfor %}
-      </tbody>
-    </table>
-  </div>
+      </div>
+      <p class="subtle" style="margin-top: 10px;">Raw secrets are never shown after save. Leave fields blank to keep existing values.</p>
+      {% else %}
+      <p class="empty">Credentials not configured yet.</p>
+      {% endif %}
+    </section>
+    {% endif %}
+
+    <div class="actions" style="margin-top: 16px;">
+      <button type="button" id="save-integration">{{ "Save setup" if selected_setup else "Create integration" }}</button>
+      <button type="button" class="secondary" id="test-connection" {% if not selected_setup %}disabled{% endif %}>Test connection</button>
+      <button type="button" class="ghost" id="first-sync" {% if not selected_setup %}disabled{% endif %}>First sync</button>
+      <span class="subtle" id="integration-status-line"></span>
+    </div>
+  </article>
+
+  <article class="card">
+    <h3>Existing Integrations</h3>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Provider</th>
+            <th>Status</th>
+            <th>Last sync</th>
+            <th>Last success</th>
+            <th>Last error</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for integration in integrations %}
+          {% set sync = sync_status.get(integration.id) %}
+          <tr>
+            <td>
+              <strong>{{ integration.display_name }}</strong>
+              <div class="status-line">{{ integration.external_ref or "no external ref" }}</div>
+            </td>
+            <td>{{ integration.provider_name }}</td>
+            <td><span class="badge {{ 'good' if integration.status == 'active' else 'warn' }}">{{ integration.status }}</span></td>
+            <td>{{ integration.last_sync_at or "—" }}</td>
+            <td>{{ sync.latest_success.finished_at if sync and sync.latest_success else "—" }}</td>
+            <td>{{ human_sync_error(sync.latest_failure) if sync else "—" }}</td>
+            <td>
+              <div class="actions">
+                <a class="pill-link" href="/admin/{{ runtime.account.slug }}/integrations?{{ page_query }}&integration_id={{ integration.id }}">Edit setup</a>
+                <button type="button" class="run-sync secondary" data-integration-id="{{ integration.id }}">Run sync</button>
+              </div>
+            </td>
+          </tr>
+          {% else %}
+          <tr><td colspan="7" class="empty">Integrations пока не созданы.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    {% if selected_setup %}
+    <section class="card soft-card" style="margin-top: 16px; padding: 14px;">
+      <h4>Latest Setup Activity</h4>
+      <div class="stack">
+        {% for job in selected_setup.latest_jobs %}
+        <div class="inline-card">
+          <div>
+            <strong>Job #{{ job.id }}</strong>
+            <div class="status-line">{{ job.job_type }} · {{ job.started_at or job.scheduled_at or "queued" }}</div>
+          </div>
+          <span class="badge {{ 'good' if job.status == 'completed' else 'warn' if job.status in ['pending', 'running'] else 'bad' }}">{{ job.status }}</span>
+        </div>
+        {% else %}
+        <p class="empty">No sync jobs yet for this integration.</p>
+        {% endfor %}
+      </div>
+    </section>
+    {% endif %}
+  </article>
 </section>
 
 <script>
   const actorEmail = {{ runtime.actor_user.email|tojson }};
-  for (const button of document.querySelectorAll(".run-sync")) {
-    button.addEventListener("click", async () => {
-      button.disabled = true;
-      button.textContent = "Running...";
-      const integrationId = button.dataset.integrationId;
-      try {
-        const response = await fetch(`/admin/{{ runtime.account.slug }}/integrations/${integrationId}/sync`, {
-          method: "POST",
-          headers: {"Content-Type": "application/json"},
-          body: JSON.stringify({actor_email: actorEmail}),
-        });
-        if (!response.ok) {
-          const error = await response.text();
-          throw new Error(error);
-        }
-        window.location.reload();
-      } catch (error) {
-        alert(`Sync failed: ${error}`);
-        button.disabled = false;
-        button.textContent = "Run sync";
+  let currentIntegrationId = {{ selected_setup.integration.id if selected_setup else 'null' }};
+
+  function activeProviderKey() {
+    return document.getElementById("provider-select").value;
+  }
+
+  function updateProviderSections() {
+    const key = activeProviderKey();
+    for (const section of document.querySelectorAll(".provider-fields")) {
+      section.classList.toggle("active", section.dataset.providerKey === key);
+    }
+  }
+
+  function collectProviderCredentials() {
+    const key = activeProviderKey();
+    const payload = {};
+    for (const input of document.querySelectorAll(`.provider-input[data-provider-key="${key}"]`)) {
+      const fieldKey = input.dataset.fieldKey;
+      const fieldKind = input.dataset.fieldKind;
+      const rawValue = input.value.trim();
+      if (!rawValue) continue;
+      if (fieldKind === "number") {
+        payload[fieldKey] = Number(rawValue);
+        continue;
       }
-    });
+      if (fieldKind === "json") {
+        try {
+          payload[fieldKey] = JSON.parse(rawValue);
+        } catch (error) {
+          throw new Error(`Invalid JSON for ${fieldKey}`);
+        }
+        continue;
+      }
+      payload[fieldKey] = rawValue;
+    }
+    return payload;
+  }
+
+  function integrationPayload() {
+    const [providerKind, providerName] = activeProviderKey().split(":");
+    return {
+      provider_kind: providerKind,
+      provider_name: providerName,
+      display_name: document.getElementById("integration-display-name").value.trim(),
+      external_ref: document.getElementById("integration-external-ref").value.trim() || null,
+      status: document.getElementById("integration-status").value,
+      connection_mode: document.getElementById("integration-connection-mode").value,
+      sync_mode: document.getElementById("integration-sync-mode").value,
+      settings: {},
+    };
+  }
+
+  async function runSync(integrationId, button) {
+    button.disabled = true;
+    button.textContent = "Running...";
+    try {
+      const response = await fetch(`/admin/{{ runtime.account.slug }}/integrations/${integrationId}/sync`, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({actor_email: actorEmail}),
+      });
+      if (!response.ok) {
+        throw new Error(await response.text());
+      }
+      window.location.reload();
+    } catch (error) {
+      alert(`Sync failed: ${error}`);
+      button.disabled = false;
+      button.textContent = "Run sync";
+    }
+  }
+
+  document.getElementById("provider-select").addEventListener("change", updateProviderSections);
+  updateProviderSections();
+
+  document.getElementById("save-integration").addEventListener("click", async () => {
+    const statusNode = document.getElementById("integration-status-line");
+    statusNode.textContent = "Saving setup...";
+    try {
+      const response = await fetch(`/admin/{{ runtime.account.slug }}/integrations/save`, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+          actor_email: actorEmail,
+          integration_id: currentIntegrationId,
+          integration: integrationPayload(),
+          credentials: collectProviderCredentials(),
+        }),
+      });
+      if (!response.ok) {
+        throw new Error(await response.text());
+      }
+      const body = await response.json();
+      statusNode.textContent = `Saved integration #${body.integration.id}`;
+      window.location.href = `/admin/{{ runtime.account.slug }}/integrations?{{ page_query }}&integration_id=${body.integration.id}`;
+    } catch (error) {
+      statusNode.textContent = "";
+      alert(`Save failed: ${error}`);
+    }
+  });
+
+  document.getElementById("test-connection").addEventListener("click", async () => {
+    if (!currentIntegrationId) return;
+    const statusNode = document.getElementById("integration-status-line");
+    statusNode.textContent = "Testing connection...";
+    try {
+      const response = await fetch(`/admin/{{ runtime.account.slug }}/integrations/${currentIntegrationId}/test`, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+          actor_email: actorEmail,
+          credentials: collectProviderCredentials(),
+        }),
+      });
+      if (!response.ok) {
+        throw new Error(await response.text());
+      }
+      const body = await response.json();
+      if (body.connected) {
+        statusNode.textContent = `Connected: ${body.provider}`;
+      } else {
+        statusNode.textContent = `Connection failed: ${body.message || body.error_code}`;
+      }
+    } catch (error) {
+      statusNode.textContent = "";
+      alert(`Connection test failed: ${error}`);
+    }
+  });
+
+  document.getElementById("first-sync").addEventListener("click", async (event) => {
+    if (!currentIntegrationId) return;
+    await runSync(currentIntegrationId, event.currentTarget);
+  });
+
+  for (const button of document.querySelectorAll(".run-sync")) {
+    button.addEventListener("click", async () => runSync(button.dataset.integrationId, button));
   }
 </script>
 {% endblock %}

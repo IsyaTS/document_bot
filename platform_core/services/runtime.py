@@ -250,6 +250,192 @@ class RuntimeIntegrationService:
             select(Integration).where(Integration.account_id == context.account_id).order_by(Integration.id.asc())
         ).scalars().all()
 
+    def create_integration(
+        self,
+        context: TenantContext,
+        *,
+        provider_kind: str,
+        provider_name: str,
+        display_name: str,
+        external_ref: str | None = None,
+        status: str = "active",
+        connection_mode: str = "polling",
+        sync_mode: str = "manual",
+        settings_json: dict[str, object] | None = None,
+    ) -> Integration:
+        require_account_id(context)
+        adapter = self._registry.get(provider_kind, provider_name)
+        if adapter is None:
+            raise PlatformCoreError(f"Unsupported provider: {provider_kind}:{provider_name}.")
+        integration = Integration(
+            account_id=context.account_id,
+            provider_kind=provider_kind,
+            provider_name=provider_name,
+            external_ref=external_ref.strip() if isinstance(external_ref, str) and external_ref.strip() else None,
+            display_name=display_name.strip(),
+            status=status,
+            connection_mode=connection_mode,
+            sync_mode=sync_mode,
+            settings_json=settings_json or {},
+        )
+        self.session.add(integration)
+        self.session.flush()
+        self._audit.log(
+            context,
+            "runtime.integrations.create",
+            "integration",
+            str(integration.id),
+            details={"provider_kind": provider_kind, "provider_name": provider_name, "display_name": display_name},
+        )
+        return integration
+
+    def update_integration(
+        self,
+        context: TenantContext,
+        *,
+        integration_id: int,
+        display_name: str | None = None,
+        external_ref: str | None = None,
+        status: str | None = None,
+        connection_mode: str | None = None,
+        sync_mode: str | None = None,
+        settings_json: dict[str, object] | None = None,
+    ) -> Integration:
+        integration = self._get_integration(context.account_id, integration_id)
+        if display_name is not None:
+            integration.display_name = display_name.strip()
+        if external_ref is not None:
+            integration.external_ref = external_ref.strip() or None
+        if status is not None:
+            integration.status = status
+        if connection_mode is not None:
+            integration.connection_mode = connection_mode
+        if sync_mode is not None:
+            integration.sync_mode = sync_mode
+        if settings_json is not None:
+            integration.settings_json = settings_json
+        self.session.flush()
+        self._audit.log(
+            context,
+            "runtime.integrations.update",
+            "integration",
+            str(integration.id),
+            details={"status": integration.status, "sync_mode": integration.sync_mode},
+        )
+        return integration
+
+    def save_credentials(
+        self,
+        context: TenantContext,
+        *,
+        integration_id: int,
+        secret_payload: dict[str, object],
+        credential_type: str = "primary",
+    ) -> IntegrationCredential:
+        integration = self._get_integration(context.account_id, integration_id)
+        existing = self._active_credential(integration.id)
+        merged = self._merge_credentials(
+            self._crypto.decrypt_mapping(existing.secret_ciphertext) if existing is not None else {},
+            secret_payload,
+        )
+        if not merged:
+            raise PlatformCoreError("Credential payload is empty after merge.")
+        ciphertext, fingerprint = self._crypto.encrypt_mapping(merged)
+        if existing is not None:
+            existing.status = "rotated"
+        next_version = (existing.version + 1) if existing is not None else 1
+        credential = IntegrationCredential(
+            account_id=context.account_id,
+            integration_id=integration.id,
+            credential_type=credential_type,
+            status="active",
+            version=next_version,
+            secret_ciphertext=ciphertext,
+            secret_fingerprint=fingerprint,
+            metadata_json={"masked_keys": sorted(merged.keys())},
+            last_rotated_at=datetime.now(timezone.utc),
+        )
+        self.session.add(credential)
+        self.session.flush()
+        self._audit.log(
+            context,
+            "runtime.integrations.credentials.save",
+            "integration",
+            str(integration.id),
+            details={"credential_type": credential_type, "version": credential.version},
+        )
+        return credential
+
+    def test_connection(
+        self,
+        context: TenantContext,
+        *,
+        integration_id: int,
+        override_payload: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        integration = self._get_integration(context.account_id, integration_id)
+        credentials = self._load_credentials(integration)
+        if override_payload:
+            credentials = self._merge_credentials(credentials, override_payload)
+        if not credentials:
+            raise PlatformCoreError("Credentials are not configured for this integration.")
+        adapter = self._registry.get(integration.provider_kind, integration.provider_name)
+        if adapter is None:
+            raise PlatformCoreError(
+                f"Provider adapter is not registered for {integration.provider_kind}:{integration.provider_name}."
+            )
+        try:
+            if integration.provider_kind == "banking":
+                if hasattr(adapter, "connect_account"):
+                    result = adapter.connect_account(credentials)  # type: ignore[attr-defined]
+                    return {"connected": True, "provider": integration.provider_name, "details": result}
+                accounts = adapter.fetch_accounts(credentials)  # type: ignore[attr-defined]
+                return {"connected": True, "provider": integration.provider_name, "details": {"accounts_found": len(accounts)}}
+            if integration.provider_kind == "ads":
+                if hasattr(adapter, "connect_account"):
+                    result = adapter.connect_account(credentials)  # type: ignore[attr-defined]
+                    return {"connected": True, "provider": integration.provider_name, "details": result}
+                campaigns, _ = adapter.fetch_campaigns(credentials)  # type: ignore[attr-defined]
+                return {
+                    "connected": True,
+                    "provider": integration.provider_name,
+                    "details": {"campaigns_sampled": len(campaigns)},
+                }
+            if integration.provider_kind == "erp":
+                if hasattr(adapter, "connect_account"):
+                    result = adapter.connect_account(credentials)  # type: ignore[attr-defined]
+                    return {"connected": True, "provider": integration.provider_name, "details": result}
+                products, _ = adapter.fetch_products(credentials)  # type: ignore[attr-defined]
+                return {
+                    "connected": True,
+                    "provider": integration.provider_name,
+                    "details": {"products_sampled": len(products)},
+                }
+        except Exception as exc:
+            return {
+                "connected": False,
+                "provider": integration.provider_name,
+                "error_code": exc.__class__.__name__,
+                "message": str(exc),
+            }
+        return {"connected": True, "provider": integration.provider_name, "details": {"mode": "noop"}}
+
+    def integration_setup_payload(self, context: TenantContext, *, integration_id: int) -> dict[str, object]:
+        integration = self._get_integration(context.account_id, integration_id)
+        credential = self._active_credential(integration.id)
+        masked_credentials = self._masked_credential_summary(credential)
+        latest_jobs = self.session.execute(
+            select(SyncJob)
+            .where(SyncJob.account_id == context.account_id, SyncJob.integration_id == integration.id)
+            .order_by(SyncJob.id.desc())
+            .limit(5)
+        ).scalars().all()
+        return {
+            "integration": integration,
+            "masked_credentials": masked_credentials,
+            "latest_jobs": latest_jobs,
+        }
+
     def enqueue_sync_job(
         self,
         context: TenantContext,
@@ -831,16 +1017,55 @@ class RuntimeIntegrationService:
         return result.astimezone(timezone.utc)
 
     def _load_credentials(self, integration: Integration) -> dict[str, object]:
-        credential = self.session.execute(
-            select(IntegrationCredential).where(
-                IntegrationCredential.account_id == integration.account_id,
-                IntegrationCredential.integration_id == integration.id,
-                IntegrationCredential.status == "active",
-            ).order_by(IntegrationCredential.version.desc())
-        ).scalars().first()
+        credential = self._active_credential(integration.id, integration.account_id)
         if credential is None:
             return {}
         return self._crypto.decrypt_mapping(credential.secret_ciphertext)
+
+    def _active_credential(self, integration_id: int, account_id: int | None = None) -> IntegrationCredential | None:
+        filters = [IntegrationCredential.integration_id == integration_id, IntegrationCredential.status == "active"]
+        if account_id is not None:
+            filters.append(IntegrationCredential.account_id == account_id)
+        return self.session.execute(
+            select(IntegrationCredential)
+            .where(*filters)
+            .order_by(IntegrationCredential.version.desc())
+        ).scalars().first()
+
+    def _merge_credentials(self, existing: dict[str, object], updates: dict[str, object]) -> dict[str, object]:
+        merged = dict(existing)
+        for key, value in updates.items():
+            if value is None:
+                continue
+            if isinstance(value, str):
+                normalized = value.strip()
+                if normalized == "":
+                    continue
+                merged[key] = normalized
+                continue
+            merged[key] = value
+        return merged
+
+    def _masked_credential_summary(self, credential: IntegrationCredential | None) -> dict[str, str]:
+        if credential is None:
+            return {}
+        payload = self._crypto.decrypt_mapping(credential.secret_ciphertext)
+        summary: dict[str, str] = {}
+        for key, value in payload.items():
+            if value is None:
+                continue
+            if isinstance(value, dict):
+                summary[key] = "configured"
+                continue
+            text = str(value)
+            if key.endswith("token") or "password" in key or "secret" in key:
+                suffix = text[-4:] if len(text) >= 4 else "****"
+                summary[key] = f"••••{suffix}"
+            elif key == "fixture_payload":
+                summary[key] = "configured"
+            else:
+                summary[key] = text
+        return summary
 
     def _get_integration(self, account_id: int, integration_id: int) -> Integration:
         integration = self.session.execute(

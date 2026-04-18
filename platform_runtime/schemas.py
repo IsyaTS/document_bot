@@ -59,3 +59,32 @@ class GoalUpdateRequest(BaseModel):
     is_primary: bool | None = None
     status: Literal["draft", "active", "archived"] | None = None
     targets: list[GoalTargetPayload] | None = None
+
+
+class IntegrationCreateRequest(BaseModel):
+    provider_kind: Literal["ads", "erp", "banking"]
+    provider_name: Literal["avito", "moysklad", "generic_bank"]
+    display_name: str = Field(..., min_length=3, max_length=255)
+    external_ref: str | None = Field(default=None, max_length=128)
+    status: Literal["active", "disabled"] = "active"
+    connection_mode: Literal["polling", "manual"] = "polling"
+    sync_mode: Literal["manual", "scheduled"] = "manual"
+    settings: dict[str, object] = Field(default_factory=dict)
+
+
+class IntegrationUpdateRequest(BaseModel):
+    display_name: str | None = Field(default=None, min_length=3, max_length=255)
+    external_ref: str | None = Field(default=None, max_length=128)
+    status: Literal["active", "disabled"] | None = None
+    connection_mode: Literal["polling", "manual"] | None = None
+    sync_mode: Literal["manual", "scheduled"] | None = None
+    settings: dict[str, object] | None = None
+
+
+class CredentialSaveRequest(BaseModel):
+    credential_type: str = Field(default="primary", min_length=1, max_length=64)
+    credentials: dict[str, object] = Field(default_factory=dict)
+
+
+class TestConnectionRequest(BaseModel):
+    credentials: dict[str, object] = Field(default_factory=dict)

@@ -18,6 +18,21 @@
         <p class="meta">{{ runtime.account.name }} · {{ runtime.account.slug }}</p>
         <p class="meta">{{ runtime.actor_user.full_name or runtime.actor_user.email }}</p>
       </div>
+      {% if accessible_accounts %}
+      <div class="account-switcher">
+        <p class="meta">Accounts</p>
+        <div class="switch-list">
+          {% for account in accessible_accounts %}
+          <a
+            class="switch-link {{ 'active' if account.slug == runtime.account.slug else '' }}"
+            href="/admin/{{ account.slug }}/{{ page_path }}?{{ page_query }}"
+          >
+            {{ account.name }}
+          </a>
+          {% endfor %}
+        </div>
+      </div>
+      {% endif %}
       <nav class="nav">
         <a class="{{ 'active' if page == 'dashboard' else '' }}" href="/admin/{{ runtime.account.slug }}/dashboard?{{ page_query }}">Dashboard</a>
         <a class="{{ 'active' if page == 'integrations' else '' }}" href="/admin/{{ runtime.account.slug }}/integrations?{{ page_query }}">Integrations</a>

@@ -61,6 +61,42 @@
               </tbody>
             </table>
           </div>
+          {% if snapshot.blockers %}
+          <div class="stack" style="margin-top: 14px;">
+            <h4>What Blocks Goal Achievement</h4>
+            {% for blocker in snapshot.blockers %}
+            <div class="inline-card">
+              <div class="stack" style="gap: 8px;">
+                <div class="actions" style="justify-content: space-between;">
+                  <strong>{{ blocker.metric.label }}</strong>
+                  <span class="badge {{ 'warn' if blocker.metric.status == 'warning' else 'bad' }}">{{ blocker.metric.status }}</span>
+                </div>
+                <p class="subtle">Delta {{ blocker.metric.delta }} · target {{ blocker.metric.target }} · actual {{ blocker.metric.actual }}</p>
+                <div class="chips">
+                  <a class="pill-link" href="{{ blocker.links.alerts }}">alerts {{ blocker.related_alerts|length }}</a>
+                  <a class="pill-link" href="{{ blocker.links.tasks }}">tasks {{ blocker.related_tasks|length }}</a>
+                  <a class="pill-link" href="{{ blocker.links.ops }}">ops view</a>
+                </div>
+                {% if blocker.related_problems %}
+                <div class="stack" style="gap: 6px;">
+                  {% for item in blocker.related_problems %}
+                  <div class="status-line">{{ item.code }} · {{ item.title }}</div>
+                  {% endfor %}
+                </div>
+                {% endif %}
+                {% if blocker.attention_actions %}
+                <div class="stack" style="gap: 6px;">
+                  <strong class="subtle">Owner attention actions</strong>
+                  {% for action in blocker.attention_actions %}
+                  <div class="status-line">{{ action.title }}{% if action.priority %} · {{ action.priority }}{% endif %}</div>
+                  {% endfor %}
+                </div>
+                {% endif %}
+              </div>
+            </div>
+            {% endfor %}
+          </div>
+          {% endif %}
         </div>
         {% endfor %}
       </div>

@@ -150,6 +150,23 @@ class AvitoAdsProviderAdapter(AdsProvider):
     # campaigns_params, metrics_params, leads_params.
     # Fixture mode additionally supports: fixture_payload, lead_sources.
 
+    def connect_account(self, credentials: dict[str, object]) -> dict[str, object]:
+        if credentials.get("fixture_payload"):
+            return {
+                "provider_name": self.provider_name,
+                "mode": "fixture",
+                "connected": True,
+                "account_ref": self._account_ref(credentials) if credentials.get("account_external_id") else None,
+            }
+        campaigns, _ = self.fetch_campaigns(credentials)
+        return {
+            "provider_name": self.provider_name,
+            "mode": "live",
+            "connected": True,
+            "account_ref": self._account_ref(credentials),
+            "campaigns_sampled": len(campaigns),
+        }
+
     def _cursor_token(self, cursor: SyncCursor | None, key: str) -> str | None:
         if cursor is None:
             return None
@@ -720,6 +737,21 @@ class AvitoAdsProviderAdapter(AdsProvider):
 
 class MoySkladERPProviderAdapter(ERPProvider):
     provider_name = "moysklad"
+
+    def connect_account(self, credentials: dict[str, object]) -> dict[str, object]:
+        if credentials.get("fixture_payload"):
+            return {
+                "provider_name": self.provider_name,
+                "mode": "fixture",
+                "connected": True,
+            }
+        products, _ = self.fetch_products(credentials)
+        return {
+            "provider_name": self.provider_name,
+            "mode": "live",
+            "connected": True,
+            "products_sampled": len(products),
+        }
 
     def fetch_products(self, credentials: dict[str, object], cursor=None):
         del cursor

@@ -101,7 +101,10 @@
 
 {% if selected_goal %}
 <section class="card" style="margin-top: 16px;">
-  <h3>Plan vs Fact</h3>
+  <div class="actions" style="justify-content: space-between;">
+    <h3>Plan vs Fact</h3>
+    <span class="badge {{ 'good' if selected_goal.summary.status == 'on_track' else 'warn' if selected_goal.summary.status == 'warning' else 'bad' }}">{{ selected_goal.summary.status }}</span>
+  </div>
   <div class="table-wrap">
     <table>
       <thead><tr><th>Metric</th><th>Target</th><th>Actual</th><th>Delta</th><th>Status</th></tr></thead>
@@ -118,6 +121,42 @@
       </tbody>
     </table>
   </div>
+  {% if selected_goal.blockers %}
+  <div class="stack" style="margin-top: 16px;">
+    <h4>Owner Workflows</h4>
+    {% for blocker in selected_goal.blockers %}
+    <div class="inline-card">
+      <div class="stack" style="gap: 8px;">
+        <div class="actions" style="justify-content: space-between;">
+          <strong>{{ blocker.metric.label }}</strong>
+          <span class="badge {{ 'warn' if blocker.metric.status == 'warning' else 'bad' }}">{{ blocker.metric.status }}</span>
+        </div>
+        <p class="subtle">Current deviation: {{ blocker.metric.delta }}</p>
+        <div class="chips">
+          <a class="pill-link" href="{{ blocker.links.alerts }}">related alerts</a>
+          <a class="pill-link" href="{{ blocker.links.tasks }}">open tasks</a>
+          <a class="pill-link" href="{{ blocker.links.ops }}">ops health</a>
+        </div>
+        {% if blocker.related_alerts %}
+        <div class="stack" style="gap: 6px;">
+          {% for item in blocker.related_alerts %}
+          <div class="status-line">{{ item.code }} · {{ item.title }}</div>
+          {% endfor %}
+        </div>
+        {% endif %}
+        {% if blocker.attention_actions %}
+        <div class="stack" style="gap: 6px;">
+          <strong class="subtle">What owner should look at now</strong>
+          {% for action in blocker.attention_actions %}
+          <div class="status-line">{{ action.title }}{% if action.priority %} · {{ action.priority }}{% endif %}</div>
+          {% endfor %}
+        </div>
+        {% endif %}
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+  {% endif %}
 </section>
 {% endif %}
 
