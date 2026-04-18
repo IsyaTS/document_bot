@@ -17,7 +17,7 @@ from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from platform_core.models import Account, AccountUser, Employee, Goal, GoalTarget, Role, User
+from platform_core.models import Account, AccountUser, Alert, Employee, Goal, GoalTarget, Role, Task, TaskEvent, User
 from platform_core.exceptions import AuthorizationError, PlatformCoreError, TenantContextError
 from platform_core.services import AuditLogService, ExecutiveDashboardService, GOAL_METRIC_DEFINITIONS, GoalService
 from platform_core.services.accounts import AccountService, MembershipService, UserService
@@ -266,6 +266,11 @@ def create_app() -> FastAPI:
         if _is_manager_role(runtime.role_code):
             return
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Owner or admin role is required.")
+
+    def _require_account_owner(runtime: ResolvedRuntimeContext) -> None:
+        if _is_owner_role(runtime.role_code):
+            return
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Owner role is required.")
 
     def _accessible_accounts_with_memberships(session: Session, actor_email: str) -> list[dict[str, object]]:
         rows = session.execute(
@@ -674,6 +679,92 @@ def create_app() -> FastAPI:
             "goal_rows": flattened_goal_rows[:10],
             "top_attention_items": top_attention_items,
         }
+
+    def _portfolio_brief(portfolio: dict[str, object]) -> dict[str, object]:
+        highest_risk_accounts = [
+            {
+                "account_slug": item["account"].slug,
+                "account_name": item["account"].name,
+                "health_status": item["health_status"],
+                "risk_score": item["risk_score"],
+                "goals_at_risk_count": item["goals_at_risk_count"],
+                "critical_alerts_count": item["critical_alerts_count"],
+                "overdue_tasks_count": item["overdue_tasks_count"],
+                "sync_health": item["sync_health"]["status"],
+            }
+            for item in portfolio["highest_risk_accounts"]
+        ]
+        critical_alerts = [
+            {
+                "account_slug": item["account"].slug,
+                "account_name": item["account"].name,
+                "code": item["alert"].code,
+                "title": item["alert"].title,
+                "last_detected_at": _serialize_datetime(item["alert"].last_detected_at),
+            }
+            for item in portfolio["active_critical_alerts"]
+        ]
+        failed_sync = [
+            {
+                "account_slug": item["account"].slug,
+                "account_name": item["account"].name,
+                "job_id": item["job"].id,
+                "provider_name": item["job"].provider_name,
+                "status": item["job"].status,
+                "error": _human_sync_error(item["job"]),
+            }
+            for item in portfolio["failed_sync_jobs"]
+        ]
+        goals_at_risk = [
+            {
+                "account_slug": item["account"].slug,
+                "account_name": item["account"].name,
+                "goal_id": item["goal"].id,
+                "goal_title": item["goal"].title,
+                "status": item["summary"]["status"],
+                "critical_count": item["summary"]["critical_count"],
+                "warning_count": item["summary"]["warning_count"],
+            }
+            for item in portfolio["goal_rows"]
+        ]
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "headline": {
+                "accounts_count": portfolio["accounts_count"],
+                "accounts_needing_action": portfolio["accounts_needing_action"],
+                "critical_accounts": portfolio["critical_accounts"],
+                "critical_alerts_total": portfolio["critical_alerts_total"],
+                "overdue_tasks_total": portfolio["overdue_tasks_total"],
+                "broken_sync_accounts": portfolio["broken_sync_accounts"],
+            },
+            "daily_brief": highest_risk_accounts,
+            "critical_alerts_digest": critical_alerts,
+            "failed_sync_digest": failed_sync,
+            "goals_at_risk_digest": goals_at_risk,
+            "top_attention_items": [
+                {
+                    "account_slug": item["account"].slug,
+                    "account_name": item["account"].name,
+                    "type": item["item"]["type"],
+                    "title": item["item"]["title"],
+                    "status": item["item"]["status"],
+                    "context": item["item"]["context"],
+                    "href": item["item"]["href"],
+                }
+                for item in portfolio["top_attention_items"]
+            ],
+        }
+
+    def _portfolio_account_runtime(
+        request: Request,
+        session: Session,
+        *,
+        account_slug: str,
+    ) -> ResolvedRuntimeContext:
+        actor = _require_admin_user(request, session)
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor.email)
+        _require_account_owner(runtime)
+        return runtime
 
     def _membership_rows(account: Account, session: Session) -> list[AccountUser]:
         return MembershipService(session).list_memberships(account)
@@ -1636,6 +1727,7 @@ def create_app() -> FastAPI:
         portfolio_rows = [_portfolio_account_row(session, actor_email, item["account"]) for item in owner_rows]
         portfolio_rows.sort(key=lambda item: (-int(item["risk_score"]), item["account"].name.lower()))
         portfolio = _portfolio_summary(portfolio_rows)
+        brief = _portfolio_brief(portfolio)
         return templates.TemplateResponse(
             request,
             "admin/portfolio.html",
@@ -1649,9 +1741,24 @@ def create_app() -> FastAPI:
                 "can_view_portfolio": True,
                 "portfolio_rows": portfolio_rows,
                 "portfolio": portfolio,
+                "brief": brief,
                 "human_sync_error": _human_sync_error,
             },
         )
+
+    @app.get("/admin/portfolio/brief")
+    def admin_portfolio_brief(
+        request: Request,
+        session: Session = Depends(get_db_session),
+    ) -> dict[str, object]:
+        actor = _require_admin_user(request, session)
+        actor_email = actor.email
+        _require_portfolio_owner(session, actor_email)
+        owner_rows = _owner_accounts_with_memberships(session, actor_email)
+        portfolio_rows = [_portfolio_account_row(session, actor_email, item["account"]) for item in owner_rows]
+        portfolio_rows.sort(key=lambda item: (-int(item["risk_score"]), item["account"].name.lower()))
+        portfolio = _portfolio_summary(portfolio_rows)
+        return _portfolio_brief(portfolio)
 
     @app.get("/admin/accounts", response_class=HTMLResponse)
     def admin_accounts_page(
@@ -2026,6 +2133,8 @@ def create_app() -> FastAPI:
         account_slug: str,
         severity: str | None = Query(default=None),
         priority: str | None = Query(default=None),
+        alert_code: str | None = Query(default=None),
+        overdue: bool = Query(default=False),
         session: Session = Depends(get_db_session),
     ) -> HTMLResponse:
         user = _current_session_user(session, request)
@@ -2042,8 +2151,15 @@ def create_app() -> FastAPI:
         tasks = [item for item in automation.list_tasks(runtime.context) if item.status == "open"]
         if severity:
             alerts = [item for item in alerts if item.severity == severity]
+        if alert_code:
+            alerts = [item for item in alerts if item.code == alert_code]
         if priority:
             tasks = [item for item in tasks if item.priority == priority]
+        if overdue:
+            tasks = [
+                item for item in tasks
+                if item.due_at is not None and item.due_at <= datetime.now(timezone.utc)
+            ]
         user_ids = {item.assigned_user_id for item in alerts if item.assigned_user_id is not None}
         user_ids.update(item.assignee_user_id for item in tasks if item.assignee_user_id is not None)
         employee_ids = {item.assignee_employee_id for item in tasks if item.assignee_employee_id is not None}
@@ -2066,6 +2182,8 @@ def create_app() -> FastAPI:
                 "overdue_tasks": overdue_tasks,
                 "severity_filter": severity,
                 "priority_filter": priority,
+                "alert_code_filter": alert_code,
+                "overdue_filter": overdue,
                 "users": users,
                 "employees": employees,
                 "alert_slas": _alert_sla_map(),
@@ -2076,6 +2194,7 @@ def create_app() -> FastAPI:
     def admin_ops_sync(
         request: Request,
         account_slug: str,
+        sync_state: str | None = Query(default=None),
         session: Session = Depends(get_db_session),
     ) -> HTMLResponse:
         user = _current_session_user(session, request)
@@ -2090,12 +2209,21 @@ def create_app() -> FastAPI:
         ensure_permission(runtime, "tasks.read")
         ensure_permission(runtime, "alerts.read")
         ops = AdminQueryService(session).ops_summary(runtime.account.id)
+        if sync_state:
+            filtered_rows = []
+            for item in ops["integration_sync_status"]:
+                status_code = _portfolio_sync_health([item])["status"]
+                if sync_state == status_code:
+                    filtered_rows.append(item)
+            ops = dict(ops)
+            ops["integration_sync_status"] = filtered_rows
         return templates.TemplateResponse(
             request,
             "admin/ops_sync.html",
             {
                 **_admin_context(request, session, runtime, page="ops_sync"),
                 "ops": ops,
+                "sync_state_filter": sync_state,
                 "human_sync_error": _human_sync_error,
             },
         )
@@ -2105,6 +2233,7 @@ def create_app() -> FastAPI:
         request: Request,
         account_slug: str,
         goal_id: int | None = Query(default=None),
+        risk_only: bool = Query(default=False),
         session: Session = Depends(get_db_session),
     ) -> HTMLResponse:
         user = _current_session_user(session, request)
@@ -2117,6 +2246,17 @@ def create_app() -> FastAPI:
         ensure_permission(runtime, "dashboard.read")
         service = GoalService(session)
         goals = service.list_goals(runtime.context)
+        goal_summaries: dict[int, dict[str, object]] = {}
+        if risk_only:
+            risky_goals = []
+            for goal in goals:
+                metrics_payload = service.get_goal_metrics(runtime.context, goal.id)
+                goal_summaries[goal.id] = metrics_payload["summary"]
+                if metrics_payload["summary"]["status"] != "on_track":
+                    risky_goals.append(goal)
+            goals = risky_goals
+            if goal_id is None and goals:
+                goal_id = goals[0].id
         try:
             selected_goal_payload = service.get_goal_metrics(runtime.context, goal_id) if goal_id is not None else None
         except TenantContextError as exc:
@@ -2159,6 +2299,8 @@ def create_app() -> FastAPI:
                 "selected_targets_by_code": selected_targets_by_code,
                 "metric_definitions": list(GOAL_METRIC_DEFINITIONS.values()),
                 "owners": owners,
+                "goal_summaries": goal_summaries,
+                "risk_only": risk_only,
                 "default_period_start": period_start.isoformat(),
                 "default_period_end": period_end.isoformat(),
             },
@@ -2193,6 +2335,118 @@ def create_app() -> FastAPI:
                 "execution": _serialize_job_execution(execution),
             }
         )
+
+    @app.post("/admin/portfolio/accounts/{account_slug}/sync")
+    async def admin_portfolio_sync_account(
+        request: Request,
+        account_slug: str,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        payload = await request.json()
+        runtime = _portfolio_account_runtime(request, session, account_slug=account_slug)
+        ensure_permission(runtime, "integrations.manage")
+        integration_id = payload.get("integration_id")
+        execute_now = bool(payload.get("execute_now", True))
+        service = RuntimeIntegrationService(session)
+        integrations = [item for item in service.list_integrations(runtime.context) if item.status == "active"]
+        if integration_id is not None:
+            integrations = [item for item in integrations if item.id == int(integration_id)]
+        if not integrations:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No active integrations available for sync.")
+        results: list[dict[str, object]] = []
+        for integration in integrations:
+            idempotency_key = f"portfolio-sync:{runtime.account.slug}:{integration.id}:{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')}"
+            job, created = service.enqueue_sync_job(
+                runtime.context,
+                integration_id=integration.id,
+                job_type="full_sync",
+                trigger_mode="manual",
+                idempotency_key=idempotency_key,
+                scope_json={"source": "portfolio"},
+            )
+            execution = service.execute_job(job.id, owner=settings.worker_id, ttl_seconds=settings.runtime_lease_ttl_seconds) if execute_now else None
+            results.append(
+                {
+                    "integration_id": integration.id,
+                    "integration_ref": integration.external_ref or integration.display_name,
+                    "created": created,
+                    "job": _serialize_sync_job(job),
+                    "execution": _serialize_job_execution(execution) if execution is not None else None,
+                }
+            )
+        return JSONResponse({"account_slug": runtime.account.slug, "count": len(results), "results": results})
+
+    @app.post("/admin/portfolio/accounts/{account_slug}/alerts/{alert_id}/status")
+    async def admin_portfolio_alert_status(
+        request: Request,
+        account_slug: str,
+        alert_id: int,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        payload = await request.json()
+        runtime = _portfolio_account_runtime(request, session, account_slug=account_slug)
+        ensure_permission(runtime, "alerts.read")
+        next_status = str(payload.get("status") or "").strip()
+        if next_status not in {"open", "acknowledged", "dismissed"}:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported alert status.")
+        alert = session.execute(
+            select(Alert).where(Alert.account_id == runtime.account.id, Alert.id == alert_id)
+        ).scalar_one_or_none()
+        if alert is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Alert not found.")
+        alert.status = next_status
+        AuditLogService(session).log(
+            runtime.context,
+            "owner.alert.status",
+            "alert",
+            str(alert.id),
+            details={"status": next_status, "source": "portfolio"},
+        )
+        session.flush()
+        return JSONResponse({"alert": _serialize_alert(alert)})
+
+    @app.post("/admin/portfolio/accounts/{account_slug}/tasks/{task_id}/status")
+    async def admin_portfolio_task_status(
+        request: Request,
+        account_slug: str,
+        task_id: int,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        payload = await request.json()
+        runtime = _portfolio_account_runtime(request, session, account_slug=account_slug)
+        ensure_permission(runtime, "tasks.read")
+        next_status = str(payload.get("status") or "").strip()
+        if next_status not in {"open", "done"}:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported task status.")
+        task = session.execute(
+            select(Task).where(Task.account_id == runtime.account.id, Task.id == task_id)
+        ).scalar_one_or_none()
+        if task is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found.")
+        task.status = next_status
+        task.completed_at = datetime.now(timezone.utc) if next_status == "done" else None
+        session.add(
+            TaskEvent(
+                account_id=runtime.account.id,
+                task_id=task.id,
+                actor_user_id=runtime.actor_user.id,
+                event_type="task.updated_by_owner",
+                event_at=datetime.now(timezone.utc),
+                payload_json={"status": next_status, "source": "portfolio"},
+            )
+        )
+        AuditLogService(session).log(
+            runtime.context,
+            "owner.task.status",
+            "task",
+            str(task.id),
+            details={"status": next_status, "source": "portfolio"},
+        )
+        session.flush()
+        return JSONResponse({"task": _serialize_task(task)})
 
     @app.post("/admin/{account_slug}/integrations/{integration_id}/status")
     async def admin_update_integration_status(

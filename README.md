@@ -340,6 +340,26 @@ Current portfolio behavior:
   - critical goal deviations
   - alert/task pressure
 
+Current owner action behavior:
+
+- portfolio drilldown links go directly to:
+  - account dashboard
+  - filtered critical alerts
+  - filtered overdue tasks
+  - filtered broken sync view
+  - goal deviations view
+- owner-only portfolio actions:
+  - `POST /admin/portfolio/accounts/{account_slug}/sync`
+  - `POST /admin/portfolio/accounts/{account_slug}/alerts/{alert_id}/status`
+  - `POST /admin/portfolio/accounts/{account_slug}/tasks/{task_id}/status`
+- generated portfolio brief endpoint:
+  - `GET /admin/portfolio/brief`
+- portfolio brief includes:
+  - daily brief
+  - critical alerts digest
+  - failed sync digest
+  - goals at risk digest
+
 Current account onboarding and lifecycle behavior:
 
 - create a new account from `/admin/accounts`

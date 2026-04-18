@@ -9,6 +9,7 @@
     {% if can_manage_goals %}
     <a class="pill-link" href="/admin/{{ runtime.account.slug }}/goals">new goal</a>
     {% endif %}
+    <a class="pill-link" href="/admin/{{ runtime.account.slug }}/goals?risk_only=1">goal deviations</a>
   </div>
 </div>
 
@@ -93,14 +94,19 @@
       <a class="card" style="padding: 14px;" href="/admin/{{ runtime.account.slug }}/goals?goal_id={{ goal.id }}">
         <div class="actions" style="justify-content: space-between;">
           <strong>{{ goal.title }}</strong>
-          {% if selected_goal and selected_goal.goal.id == goal.id %}
-          <span class="badge good">selected</span>
-          {% endif %}
+          <div class="actions">
+            {% if goal_summaries.get(goal.id) %}
+            <span class="badge {{ 'good' if goal_summaries[goal.id].status == 'on_track' else 'warn' if goal_summaries[goal.id].status == 'warning' else 'bad' }}">{{ goal_summaries[goal.id].status }}</span>
+            {% endif %}
+            {% if selected_goal and selected_goal.goal.id == goal.id %}
+            <span class="badge good">selected</span>
+            {% endif %}
+          </div>
         </div>
         <p class="subtle">{{ goal.period_kind }} · {{ goal.period_start }} — {{ goal.period_end }} · {{ goal.status }}</p>
       </a>
       {% else %}
-      <p class="empty">Goals пока не созданы.</p>
+      <p class="empty">{{ 'No goal deviations for the current filter.' if risk_only else 'Goals пока не созданы.' }}</p>
       {% endfor %}
     </div>
   </article>

@@ -8,8 +8,25 @@
   <div class="chips">
     <span class="chip">{{ portfolio.accounts_count }} owner accounts</span>
     <span class="chip">{{ portfolio.accounts_needing_action }} need action today</span>
+    <a class="pill-link" href="/admin/portfolio/brief">brief endpoint</a>
   </div>
 </div>
+
+<section class="card hero" style="margin-bottom: 16px;">
+  <div class="actions" style="justify-content: space-between;">
+    <div>
+      <h3>Owner Brief</h3>
+      <p class="subtle">Daily brief, critical alerts digest, failed sync digest and goals at risk digest.</p>
+    </div>
+    <span class="chip">generated {{ brief.generated_at }}</span>
+  </div>
+  <div class="grid cols-4">
+    <div class="metric"><span class="subtle">Critical accounts</span><span class="value">{{ brief.headline.critical_accounts }}</span></div>
+    <div class="metric"><span class="subtle">Broken sync</span><span class="value">{{ brief.headline.broken_sync_accounts }}</span></div>
+    <div class="metric"><span class="subtle">Critical alerts</span><span class="value">{{ brief.headline.critical_alerts_total }}</span></div>
+    <div class="metric"><span class="subtle">Overdue tasks</span><span class="value">{{ brief.headline.overdue_tasks_total }}</span></div>
+  </div>
+</section>
 
 <section class="grid cols-4">
   <article class="card metric"><span class="subtle">Available cash</span><span class="value">{{ portfolio.available_cash_total }}</span></article>
@@ -42,9 +59,15 @@
             <td>{{ row.risk_score }}</td>
             <td>{{ row.goals_at_risk_count }}</td>
             <td><span class="badge {{ 'good' if row.sync_health.status == 'healthy' else 'warn' if row.sync_health.status == 'warning' else 'bad' }}">{{ row.sync_health.status }}</span></td>
+            <td>
+              <div class="actions">
+                <button type="button" class="ghost portfolio-run-sync" data-account-slug="{{ row.account.slug }}">run sync</button>
+                <a class="pill-link" href="/admin/switch-account/{{ row.account.slug }}?next=/admin/{{ row.account.slug }}/dashboard">open</a>
+              </div>
+            </td>
           </tr>
           {% else %}
-          <tr><td colspan="5" class="empty">No owner accounts in portfolio.</td></tr>
+          <tr><td colspan="6" class="empty">No owner accounts in portfolio.</td></tr>
           {% endfor %}
         </tbody>
       </table>
@@ -72,6 +95,11 @@
         <div class="stack" style="gap: 6px; margin-top: 8px;">
           {% for blocker in item.blockers[:2] %}
           <div class="status-line">{{ blocker.metric.label }} · {{ blocker.metric.status }} · delta {{ blocker.metric.delta }}</div>
+          <div class="actions">
+            <a class="pill-link" href="{{ blocker.links.alerts }}">alerts</a>
+            <a class="pill-link" href="{{ blocker.links.tasks }}">tasks</a>
+            <a class="pill-link" href="/admin/switch-account/{{ item.account.slug }}?next=/admin/{{ item.account.slug }}/goals?goal_id={{ item.goal.id }}">goal</a>
+          </div>
           {% endfor %}
         </div>
         {% endif %}
@@ -98,9 +126,20 @@
           <span class="chip">stale {{ row.sync_health.stale_count }}</span>
           <span class="chip">failed jobs {{ row.failed_sync_jobs_count }}</span>
         </div>
+        {% if row.sync_health.broken_rows or row.sync_health.stale_rows %}
+        <div class="stack" style="gap: 6px; margin-top: 8px;">
+          {% for item in row.sync_health.broken_rows[:2] %}
+          <div class="status-line">{{ item.integration.external_ref or item.integration.display_name }} · broken</div>
+          {% endfor %}
+          {% for item in row.sync_health.stale_rows[:2] %}
+          <div class="status-line">{{ item.integration.external_ref or item.integration.display_name }} · stale</div>
+          {% endfor %}
+        </div>
+        {% endif %}
         <div class="actions" style="margin-top: 10px;">
-          <a class="pill-link" href="/admin/switch-account/{{ row.account.slug }}?next=/admin/{{ row.account.slug }}/ops-sync">ops</a>
+          <a class="pill-link" href="/admin/switch-account/{{ row.account.slug }}?next=/admin/{{ row.account.slug }}/ops-sync?sync_state=critical">broken sync</a>
           <a class="pill-link" href="/admin/switch-account/{{ row.account.slug }}?next=/admin/{{ row.account.slug }}/integrations">integrations</a>
+          <button type="button" class="ghost portfolio-run-sync" data-account-slug="{{ row.account.slug }}">run sync</button>
         </div>
       </div>
       {% else %}
@@ -124,7 +163,8 @@
           <span class="chip">goals at risk {{ row.goals_at_risk_count }}</span>
         </div>
         <div class="actions" style="margin-top: 10px;">
-          <a class="pill-link" href="/admin/switch-account/{{ row.account.slug }}?next=/admin/{{ row.account.slug }}/alerts-tasks">alerts/tasks</a>
+          <a class="pill-link" href="/admin/switch-account/{{ row.account.slug }}?next=/admin/{{ row.account.slug }}/alerts-tasks?severity=critical">critical alerts</a>
+          <a class="pill-link" href="/admin/switch-account/{{ row.account.slug }}?next=/admin/{{ row.account.slug }}/alerts-tasks?overdue=1">overdue tasks</a>
           <a class="pill-link" href="/admin/switch-account/{{ row.account.slug }}?next=/admin/{{ row.account.slug }}/dashboard">dashboard</a>
         </div>
       </div>
@@ -148,6 +188,7 @@
         <div class="status-line">{{ entry.item.type }} · {{ entry.item.context }}</div>
         <div class="actions" style="margin-top: 8px;">
           <a class="pill-link" href="{{ entry.item.href }}">open</a>
+          <a class="pill-link" href="/admin/switch-account/{{ entry.account.slug }}?next=/admin/{{ entry.account.slug }}/dashboard">dashboard</a>
         </div>
       </div>
       {% else %}
@@ -216,8 +257,11 @@
           <td>
             <div class="actions">
               <a class="pill-link" href="/admin/switch-account/{{ row.account.slug }}?next=/admin/{{ row.account.slug }}/dashboard">dashboard</a>
-              <a class="pill-link" href="/admin/switch-account/{{ row.account.slug }}?next=/admin/{{ row.account.slug }}/goals">goals</a>
-              <a class="pill-link" href="/admin/switch-account/{{ row.account.slug }}?next=/admin/{{ row.account.slug }}/ops-sync">ops</a>
+              <a class="pill-link" href="/admin/switch-account/{{ row.account.slug }}?next=/admin/{{ row.account.slug }}/alerts-tasks?severity=critical">alerts</a>
+              <a class="pill-link" href="/admin/switch-account/{{ row.account.slug }}?next=/admin/{{ row.account.slug }}/alerts-tasks?overdue=1">tasks</a>
+              <a class="pill-link" href="/admin/switch-account/{{ row.account.slug }}?next=/admin/{{ row.account.slug }}/ops-sync?sync_state=critical">sync</a>
+              <a class="pill-link" href="/admin/switch-account/{{ row.account.slug }}?next=/admin/{{ row.account.slug }}/goals?risk_only=1">goal deviations</a>
+              <button type="button" class="ghost portfolio-run-sync" data-account-slug="{{ row.account.slug }}">run sync</button>
             </div>
           </td>
         </tr>
@@ -235,8 +279,14 @@
     <div class="stack">
       {% for item in portfolio.failed_sync_jobs %}
       <div class="inline-card">
-        <strong>{{ item.account.name }} · #{{ item.job.id }}</strong>
+        <div class="actions" style="justify-content: space-between;">
+          <strong>{{ item.account.name }} · #{{ item.job.id }}</strong>
+          <button type="button" class="ghost portfolio-run-sync" data-account-slug="{{ item.account.slug }}">run sync</button>
+        </div>
         <div class="status-line">{{ item.job.provider_name }} · {{ human_sync_error(item.job) or item.job.status }}</div>
+        <div class="actions" style="margin-top: 8px;">
+          <a class="pill-link" href="/admin/switch-account/{{ item.account.slug }}?next=/admin/{{ item.account.slug }}/ops-sync?sync_state=critical">open sync</a>
+        </div>
       </div>
       {% else %}
       <p class="empty">No recent failed sync jobs.</p>
@@ -249,8 +299,17 @@
     <div class="stack">
       {% for item in portfolio.active_critical_alerts %}
       <div class="inline-card">
-        <strong>{{ item.account.name }} · {{ item.alert.title }}</strong>
+        <div class="actions" style="justify-content: space-between;">
+          <strong>{{ item.account.name }} · {{ item.alert.title }}</strong>
+          <div class="actions">
+            <button type="button" class="ghost portfolio-alert-action" data-account-slug="{{ item.account.slug }}" data-alert-id="{{ item.alert.id }}" data-status="acknowledged">ack</button>
+            <button type="button" class="ghost portfolio-alert-action" data-account-slug="{{ item.account.slug }}" data-alert-id="{{ item.alert.id }}" data-status="dismissed">dismiss</button>
+          </div>
+        </div>
         <div class="status-line">{{ item.alert.code }} · {{ item.alert.last_detected_at }}</div>
+        <div class="actions" style="margin-top: 8px;">
+          <a class="pill-link" href="/admin/switch-account/{{ item.account.slug }}?next=/admin/{{ item.account.slug }}/alerts-tasks?severity=critical&alert_code={{ item.alert.code }}">open alert</a>
+        </div>
       </div>
       {% else %}
       <p class="empty">No active critical alerts.</p>
@@ -263,8 +322,17 @@
     <div class="stack">
       {% for item in portfolio.overdue_tasks %}
       <div class="inline-card">
-        <strong>{{ item.account.name }} · {{ item.task.title }}</strong>
+        <div class="actions" style="justify-content: space-between;">
+          <strong>{{ item.account.name }} · {{ item.task.title }}</strong>
+          <div class="actions">
+            <button type="button" class="ghost portfolio-task-action" data-account-slug="{{ item.account.slug }}" data-task-id="{{ item.task.id }}" data-status="done">mark done</button>
+            <button type="button" class="ghost portfolio-task-action" data-account-slug="{{ item.account.slug }}" data-task-id="{{ item.task.id }}" data-status="open">reopen</button>
+          </div>
+        </div>
         <div class="status-line">{{ item.task.priority }} · due {{ item.task.due_at }}</div>
+        <div class="actions" style="margin-top: 8px;">
+          <a class="pill-link" href="/admin/switch-account/{{ item.account.slug }}?next=/admin/{{ item.account.slug }}/alerts-tasks?overdue=1">open task list</a>
+        </div>
       </div>
       {% else %}
       <p class="empty">No overdue tasks.</p>
@@ -272,4 +340,57 @@
     </div>
   </article>
 </section>
+
+<script>
+  async function runPortfolioSync(accountSlug) {
+    const response = await adminFetch(`/admin/portfolio/accounts/${accountSlug}/sync`, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({execute_now: true}),
+    });
+    if (!response.ok) {
+      alert(`Sync failed: ${await response.text()}`);
+      return;
+    }
+    const body = await response.json();
+    alert(`Sync queued/executed for ${body.account_slug}: ${body.count} integration(s)`);
+    window.location.reload();
+  }
+
+  for (const button of document.querySelectorAll(".portfolio-run-sync")) {
+    button.addEventListener("click", async () => {
+      await runPortfolioSync(button.dataset.accountSlug);
+    });
+  }
+
+  for (const button of document.querySelectorAll(".portfolio-alert-action")) {
+    button.addEventListener("click", async () => {
+      const response = await adminFetch(`/admin/portfolio/accounts/${button.dataset.accountSlug}/alerts/${button.dataset.alertId}/status`, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({status: button.dataset.status}),
+      });
+      if (!response.ok) {
+        alert(`Alert action failed: ${await response.text()}`);
+        return;
+      }
+      window.location.reload();
+    });
+  }
+
+  for (const button of document.querySelectorAll(".portfolio-task-action")) {
+    button.addEventListener("click", async () => {
+      const response = await adminFetch(`/admin/portfolio/accounts/${button.dataset.accountSlug}/tasks/${button.dataset.taskId}/status`, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({status: button.dataset.status}),
+      });
+      if (!response.ok) {
+        alert(`Task action failed: ${await response.text()}`);
+        return;
+      }
+      window.location.reload();
+    });
+  }
+</script>
 {% endblock %}

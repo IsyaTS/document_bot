@@ -7,6 +7,21 @@
   </div>
 </div>
 
+<form class="card filters" method="get">
+  <label>
+    Sync state
+    <select name="sync_state">
+      <option value="">all</option>
+      <option value="critical" {{ 'selected' if sync_state_filter == 'critical' else '' }}>critical</option>
+      <option value="warning" {{ 'selected' if sync_state_filter == 'warning' else '' }}>warning</option>
+      <option value="healthy" {{ 'selected' if sync_state_filter == 'healthy' else '' }}>healthy</option>
+    </select>
+  </label>
+  <div class="actions" style="align-items: end;">
+    <button type="submit">Apply filter</button>
+  </div>
+</form>
+
 <section class="grid cols-4">
   <article class="card metric"><span class="subtle">Failed sync jobs</span><span class="value">{{ ops.recent_failed_sync_jobs|length }}</span></article>
   <article class="card metric"><span class="subtle">Failed rule runs</span><span class="value">{{ ops.recent_failed_rule_runs|length }}</span></article>

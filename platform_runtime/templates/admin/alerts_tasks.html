@@ -27,6 +27,14 @@
       <option value="low" {{ 'selected' if priority_filter == 'low' else '' }}>low</option>
     </select>
   </label>
+  <label>
+    Alert code
+    <input name="alert_code" value="{{ alert_code_filter or '' }}" placeholder="lead.no_first_response">
+  </label>
+  <label style="align-content: end;">
+    <span class="subtle">Overdue tasks only</span>
+    <input name="overdue" type="checkbox" value="1" style="width:auto;" {{ 'checked' if overdue_filter else '' }}>
+  </label>
   <div class="actions" style="align-items: end;">
     <button type="submit">Apply filter</button>
   </div>
