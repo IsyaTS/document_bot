@@ -269,6 +269,7 @@ Main pages:
 - `/admin/login`
 - `/admin`
 - `/admin/accounts`
+- `/admin/users`
 - `/admin/{account_slug}/dashboard`
 - `/admin/{account_slug}/members`
 - `/admin/{account_slug}/integrations`
@@ -278,16 +279,41 @@ Main pages:
 
 Current access flow:
 
-- login with existing user email + `PLATFORM_ADMIN_ACCESS_CODE`
+- login with existing user email + password
 - session cookie `hermes_admin_session`
 - account chooser for users with more than one active membership
 - explicit account switch in the sidebar
-- logout via `/admin/logout`
+- logout via CSRF-protected `POST /admin/logout`
+- bootstrap path for initial password / recovery:
+  - `POST /admin/bootstrap-access`
+  - one-time password claim page `/admin/password/claim?token=...`
+
+Current auth hardening:
+
+- password hashing is stored on the `users` table
+- failed password attempts increment per user
+- temporary lockout after repeated failures
+- session auth version is checked against the user record, so password changes and user disable actions invalidate older sessions
+- login, failed login, bootstrap reset issue, password claim and logout are audit-logged per accessible account membership
+
+Current CSRF coverage:
+
+- authenticated admin state-changing routes are protected by session CSRF token checks
+- admin forms use hidden `csrf_token`
+- admin JS actions send `X-CSRF-Token`
+- covered flows include:
+  - account create
+  - user create/invite/reset/status
+  - membership save/disable/remove
+  - integration save/test/status/sync
+  - goal save
+  - logout
 
 Current UI access behavior:
 
 - `owner` / `admin`: full dashboard, integrations, ops and goal management
 - `owner` / `admin`: account onboarding page and membership management UI
+- `owner` / `admin`: global user lifecycle page with invite, reset and disable flows
 - `viewer`: dashboard + goals read-only + alerts/tasks visibility, but no integrations or ops management
 - server-side permission checks remain enforced even if a restricted URL is opened directly
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import secrets
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -17,9 +18,10 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from platform_core.models import Account, AccountUser, Employee, Goal, GoalTarget, Role, User
-from platform_core.exceptions import PlatformCoreError, TenantContextError
-from platform_core.services import ExecutiveDashboardService, GOAL_METRIC_DEFINITIONS, GoalService
+from platform_core.exceptions import AuthorizationError, PlatformCoreError, TenantContextError
+from platform_core.services import AuditLogService, ExecutiveDashboardService, GOAL_METRIC_DEFINITIONS, GoalService
 from platform_core.services.accounts import AccountService, MembershipService, UserService
+from platform_core.services.user_security import UserSecurityService
 from platform_core.services.runtime import (
     AdminQueryService,
     ResolvedRuntimeContext,
@@ -68,14 +70,17 @@ def create_app() -> FastAPI:
         account_slug: str,
         actor_email: str,
     ) -> ResolvedRuntimeContext:
-        return RuntimeContextService(session).resolve(
-            account_id=None,
-            account_slug=account_slug,
-            actor_user_id=None,
-            actor_email=actor_email,
-            source="admin-ui",
-            request_id=request.headers.get("x-request-id"),
-        )
+        try:
+            return RuntimeContextService(session).resolve(
+                account_id=None,
+                account_slug=account_slug,
+                actor_user_id=None,
+                actor_email=actor_email,
+                source="admin-ui",
+                request_id=request.headers.get("x-request-id"),
+            )
+        except AuthorizationError as exc:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
 
     def _session_actor_email(request: Request) -> str | None:
         value = request.session.get("admin_actor_email")
@@ -91,6 +96,103 @@ def create_app() -> FastAPI:
         value = value.strip()
         return value or None
 
+    def _session_auth_version(request: Request) -> int | None:
+        value = request.session.get("admin_auth_version")
+        if isinstance(value, int):
+            return value
+        return None
+
+    def _session_csrf_token(request: Request) -> str | None:
+        value = request.session.get("admin_csrf_token")
+        if not isinstance(value, str):
+            return None
+        value = value.strip()
+        return value or None
+
+    def _ensure_session_csrf_token(request: Request) -> str:
+        token = _session_csrf_token(request)
+        if token:
+            return token
+        token = secrets.token_urlsafe(24)
+        request.session["admin_csrf_token"] = token
+        return token
+
+    def _request_csrf_token(request: Request) -> str | None:
+        header = request.headers.get("x-csrf-token")
+        if header:
+            header = header.strip()
+            if header:
+                return header
+        form_value = request.query_params.get("csrf_token")
+        if form_value:
+            return form_value.strip()
+        return None
+
+    async def _request_form_csrf_token(request: Request) -> str | None:
+        payload = parse_qs((await request.body()).decode("utf-8"), keep_blank_values=True)
+        value = str((payload.get("csrf_token") or [""])[0]).strip()
+        return value or None
+
+    async def _require_csrf(request: Request) -> None:
+        expected = _ensure_session_csrf_token(request)
+        supplied = _request_csrf_token(request)
+        if supplied is None and request.headers.get("content-type", "").startswith("application/x-www-form-urlencoded"):
+            supplied = await _request_form_csrf_token(request)
+        if supplied != expected:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="CSRF token mismatch.")
+
+    def _current_session_user(session: Session, request: Request) -> User | None:
+        actor_email = _session_actor_email(request)
+        if actor_email is None:
+            return None
+        user = UserSecurityService(session).get_by_email(actor_email)
+        if user is None:
+            return None
+        session_auth_version = _session_auth_version(request)
+        if session_auth_version is None:
+            return None
+        if int(user.auth_version or 1) != int(session_auth_version):
+            return None
+        if user.status != "active":
+            return None
+        return user
+
+    def _actor_membership_accounts(session: Session, actor_email: str) -> list[AccountUser]:
+        return session.execute(
+            select(AccountUser)
+            .join(User, User.id == AccountUser.user_id)
+            .where(User.email == actor_email, AccountUser.status == "active")
+            .order_by(AccountUser.account_id.asc(), AccountUser.id.asc())
+        ).scalars().all()
+
+    def _audit_admin_access(
+        session: Session,
+        *,
+        actor_email: str,
+        action: str,
+        details: dict[str, object] | None = None,
+    ) -> None:
+        memberships = _actor_membership_accounts(session, actor_email)
+        user = UserSecurityService(session).get_by_email(actor_email)
+        actor_user_id = user.id if user is not None else None
+        audit = AuditLogService(session)
+        for membership in memberships:
+            context = RuntimeContextService(session).resolve(
+                account_id=membership.account_id,
+                account_slug=None,
+                actor_user_id=actor_user_id,
+                actor_email=actor_email,
+                source="admin-auth",
+                request_id=None,
+            ).context
+            audit.log(
+                context,
+                action,
+                "user",
+                str(actor_user_id or actor_email),
+                details=details,
+            )
+
     def _login_redirect(next_path: str | None = None) -> RedirectResponse:
         suffix = ""
         if next_path:
@@ -100,6 +202,7 @@ def create_app() -> FastAPI:
     def _admin_page_path(page: str) -> str:
         return {
             "accounts": "accounts",
+            "users": "users",
             "dashboard": "dashboard",
             "integrations": "integrations",
             "alerts_tasks": "alerts-tasks",
@@ -148,11 +251,58 @@ def create_app() -> FastAPI:
             for account, membership, role in rows
         ]
 
+    def _accessible_account_ids(session: Session, actor_email: str) -> list[int]:
+        return [item.id for item in _accessible_accounts(session, actor_email)]
+
+    def _accessible_users_with_memberships(session: Session, actor_email: str) -> list[dict[str, object]]:
+        account_ids = _accessible_account_ids(session, actor_email)
+        if not account_ids:
+            return []
+        users = session.execute(
+            select(User)
+            .join(AccountUser, AccountUser.user_id == User.id)
+            .where(AccountUser.account_id.in_(account_ids))
+            .order_by(User.email.asc())
+            .distinct()
+        ).scalars().all()
+        rows: list[dict[str, object]] = []
+        for user in users:
+            memberships = session.execute(
+                select(AccountUser)
+                .join(Role, Role.id == AccountUser.role_id)
+                .where(AccountUser.user_id == user.id, AccountUser.account_id.in_(account_ids))
+                .order_by(AccountUser.account_id.asc(), AccountUser.id.asc())
+            ).scalars().all()
+            rows.append({"user": user, "memberships": memberships})
+        return rows
+
+    def _assert_user_visible_to_actor(session: Session, actor_email: str, user_id: int) -> User:
+        account_ids = _accessible_account_ids(session, actor_email)
+        user = session.execute(
+            select(User)
+            .join(AccountUser, AccountUser.user_id == User.id)
+            .where(User.id == user_id, AccountUser.account_id.in_(account_ids))
+        ).scalars().first()
+        if user is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found in accessible accounts.")
+        return user
+
     def _require_admin_email(request: Request) -> str:
         actor_email = _session_actor_email(request)
         if actor_email is None:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Admin session is required.")
         return actor_email
+
+    def _require_admin_user(request: Request, session: Session) -> User:
+        actor_email = _require_admin_email(request)
+        user = _current_session_user(session, request)
+        if user is None:
+            request.session.clear()
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Admin session is invalid or expired.")
+        if user.email != actor_email:
+            request.session.clear()
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Admin session is invalid or expired.")
+        return user
 
     def _admin_nav_items(runtime: ResolvedRuntimeContext) -> list[dict[str, str]]:
         permissions = runtime.permissions
@@ -228,6 +378,7 @@ def create_app() -> FastAPI:
         return None
 
     def _admin_context(
+        request: Request,
         session: Session,
         runtime: ResolvedRuntimeContext,
         *,
@@ -245,6 +396,8 @@ def create_app() -> FastAPI:
             "can_view_ops": "*" in runtime.permissions or {"integrations.manage", "rules.manage", "tasks.read", "alerts.read"}.issubset(runtime.permissions),
             "can_manage_members": _is_manager_role(runtime.role_code),
             "can_manage_accounts_global": _actor_can_manage_accounts(session, actor_email),
+            "can_manage_users_global": _actor_can_manage_accounts(session, actor_email),
+            "csrf_token": _ensure_session_csrf_token(request),
         }
 
     def _membership_rows(account: Account, session: Session) -> list[AccountUser]:
@@ -885,14 +1038,26 @@ def create_app() -> FastAPI:
     @app.get("/admin/login", response_class=HTMLResponse)
     def admin_login_page(
         request: Request,
+        session: Session = Depends(get_db_session),
         next: str | None = Query(default=None),
+        reset: bool = Query(default=False),
     ) -> HTMLResponse:
-        if _session_actor_email(request):
+        if _current_session_user(session, request) is not None:
             return RedirectResponse(url=next or "/admin", status_code=status.HTTP_302_FOUND)
+        csrf_token = _ensure_session_csrf_token(request)
         return templates.TemplateResponse(
             request,
             "admin/access.html",
-            {"next_path": next, "error_message": None, "prefill_email": ""},
+            {
+                "next_path": next,
+                "error_message": None,
+                "prefill_email": "",
+                "bootstrap_error": None,
+                "bootstrap_email": "",
+                "bootstrap_claim_url": None,
+                "csrf_token": csrf_token,
+                "reset_notice": reset,
+            },
         )
 
     @app.post("/admin/login", response_class=HTMLResponse)
@@ -900,22 +1065,45 @@ def create_app() -> FastAPI:
         request: Request,
         session: Session = Depends(get_db_session),
     ):
+        await _require_csrf(request)
         payload = parse_qs((await request.body()).decode("utf-8"), keep_blank_values=True)
         email = str((payload.get("email") or [""])[0]).strip().lower()
-        access_code = str((payload.get("access_code") or [""])[0]).strip()
+        password = str((payload.get("password") or [""])[0]).strip()
         next_path = str((payload.get("next") or [""])[0]).strip() or None
-        if not email or not access_code:
+        csrf_token = _ensure_session_csrf_token(request)
+        if not email or not password:
             return templates.TemplateResponse(
                 request,
                 "admin/access.html",
-                {"next_path": next_path, "error_message": "Email and access code are required.", "prefill_email": email},
+                {
+                    "next_path": next_path,
+                    "error_message": "Email and password are required.",
+                    "prefill_email": email,
+                    "bootstrap_error": None,
+                    "bootstrap_email": "",
+                    "bootstrap_claim_url": None,
+                    "csrf_token": csrf_token,
+                    "reset_notice": False,
+                },
                 status_code=status.HTTP_400_BAD_REQUEST,
             )
-        if access_code != settings.admin_access_code:
+        auth = UserSecurityService(session).authenticate(email, password)
+        if not auth.ok or auth.user is None:
+            if auth.user is not None:
+                _audit_admin_access(session, actor_email=email, action="admin.auth.login_failed", details={"reason": auth.reason})
             return templates.TemplateResponse(
                 request,
                 "admin/access.html",
-                {"next_path": next_path, "error_message": "Invalid access code.", "prefill_email": email},
+                {
+                    "next_path": next_path,
+                    "error_message": auth.reason,
+                    "prefill_email": email,
+                    "bootstrap_error": None,
+                    "bootstrap_email": "",
+                    "bootstrap_claim_url": None,
+                    "csrf_token": csrf_token,
+                    "reset_notice": False,
+                },
                 status_code=status.HTTP_401_UNAUTHORIZED,
             )
         memberships = _accessible_accounts(session, email)
@@ -923,17 +1111,193 @@ def create_app() -> FastAPI:
             return templates.TemplateResponse(
                 request,
                 "admin/access.html",
-                {"next_path": next_path, "error_message": "No active account memberships found for this email.", "prefill_email": email},
+                {
+                    "next_path": next_path,
+                    "error_message": "No active account memberships found for this email.",
+                    "prefill_email": email,
+                    "bootstrap_error": None,
+                    "bootstrap_email": "",
+                    "bootstrap_claim_url": None,
+                    "csrf_token": csrf_token,
+                    "reset_notice": False,
+                },
                 status_code=status.HTTP_403_FORBIDDEN,
             )
-        request.session["admin_actor_email"] = email
         current_account = _session_account_slug(request)
+        request.session.clear()
+        request.session["admin_actor_email"] = email
+        request.session["admin_auth_version"] = int(auth.user.auth_version or 1)
         allowed_slugs = {item.slug for item in memberships}
         request.session["admin_account_slug"] = current_account if current_account in allowed_slugs else memberships[0].slug
+        request.session["admin_csrf_token"] = secrets.token_urlsafe(24)
+        _audit_admin_access(session, actor_email=email, action="admin.auth.login", details={"mode": "password"})
         return RedirectResponse(url=next_path or "/admin", status_code=status.HTTP_302_FOUND)
 
-    @app.get("/admin/logout")
-    def admin_logout(request: Request) -> RedirectResponse:
+    @app.post("/admin/bootstrap-access", response_class=HTMLResponse)
+    async def admin_bootstrap_access(
+        request: Request,
+        session: Session = Depends(get_db_session),
+    ) -> HTMLResponse:
+        await _require_csrf(request)
+        payload = parse_qs((await request.body()).decode("utf-8"), keep_blank_values=True)
+        email = str((payload.get("bootstrap_email") or [""])[0]).strip().lower()
+        access_code = str((payload.get("access_code") or [""])[0]).strip()
+        next_path = str((payload.get("next") or [""])[0]).strip() or None
+        csrf_token = _ensure_session_csrf_token(request)
+        if not email or not access_code:
+            return templates.TemplateResponse(
+                request,
+                "admin/access.html",
+                {
+                    "next_path": next_path,
+                    "error_message": None,
+                    "prefill_email": "",
+                    "bootstrap_error": "Email and bootstrap access code are required.",
+                    "bootstrap_email": email,
+                    "bootstrap_claim_url": None,
+                    "csrf_token": csrf_token,
+                    "reset_notice": False,
+                },
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+        if access_code != settings.admin_access_code:
+            return templates.TemplateResponse(
+                request,
+                "admin/access.html",
+                {
+                    "next_path": next_path,
+                    "error_message": None,
+                    "prefill_email": "",
+                    "bootstrap_error": "Invalid bootstrap access code.",
+                    "bootstrap_email": email,
+                    "bootstrap_claim_url": None,
+                    "csrf_token": csrf_token,
+                    "reset_notice": False,
+                },
+                status_code=status.HTTP_401_UNAUTHORIZED,
+            )
+        user = UserSecurityService(session).get_by_email(email)
+        if user is None or user.status == "disabled":
+            return templates.TemplateResponse(
+                request,
+                "admin/access.html",
+                {
+                    "next_path": next_path,
+                    "error_message": None,
+                    "prefill_email": "",
+                    "bootstrap_error": "User not found or disabled.",
+                    "bootstrap_email": email,
+                    "bootstrap_claim_url": None,
+                    "csrf_token": csrf_token,
+                    "reset_notice": False,
+                },
+                status_code=status.HTTP_404_NOT_FOUND,
+            )
+        memberships = _accessible_accounts(session, email)
+        if not memberships:
+            return templates.TemplateResponse(
+                request,
+                "admin/access.html",
+                {
+                    "next_path": next_path,
+                    "error_message": None,
+                    "prefill_email": "",
+                    "bootstrap_error": "No active account memberships found for this email.",
+                    "bootstrap_email": email,
+                    "bootstrap_claim_url": None,
+                    "csrf_token": csrf_token,
+                    "reset_notice": False,
+                },
+                status_code=status.HTTP_403_FORBIDDEN,
+            )
+        token = UserSecurityService(session).issue_password_reset(user)
+        claim_url = f"/admin/password/claim?token={token}"
+        _audit_admin_access(session, actor_email=email, action="admin.auth.bootstrap_reset_issued", details={"mode": "access_code"})
+        return templates.TemplateResponse(
+            request,
+            "admin/access.html",
+            {
+                "next_path": next_path,
+                "error_message": None,
+                "prefill_email": "",
+                "bootstrap_error": None,
+                "bootstrap_email": email,
+                "bootstrap_claim_url": claim_url,
+                "csrf_token": csrf_token,
+                "reset_notice": False,
+            },
+        )
+
+    @app.get("/admin/password/claim", response_class=HTMLResponse)
+    def admin_password_claim_page(
+        request: Request,
+        token: str = Query(..., min_length=20),
+        session: Session = Depends(get_db_session),
+    ) -> HTMLResponse:
+        csrf_token = _ensure_session_csrf_token(request)
+        try:
+            user, token_type = UserSecurityService(session).token_claim_preview(token)
+            error_message = None
+        except AuthorizationError as exc:
+            user = None
+            token_type = None
+            error_message = str(exc)
+        return templates.TemplateResponse(
+            request,
+            "admin/password_claim.html",
+            {
+                "csrf_token": csrf_token,
+                "token": token,
+                "user": user,
+                "token_type": token_type,
+                "error_message": error_message,
+            },
+            status_code=status.HTTP_200_OK if error_message is None else status.HTTP_400_BAD_REQUEST,
+        )
+
+    @app.post("/admin/password/claim", response_class=HTMLResponse)
+    async def admin_password_claim_submit(
+        request: Request,
+        session: Session = Depends(get_db_session),
+    ) -> HTMLResponse:
+        await _require_csrf(request)
+        payload = parse_qs((await request.body()).decode("utf-8"), keep_blank_values=True)
+        token = str((payload.get("token") or [""])[0]).strip()
+        password = str((payload.get("password") or [""])[0]).strip()
+        password_confirm = str((payload.get("password_confirm") or [""])[0]).strip()
+        csrf_token = _ensure_session_csrf_token(request)
+        if not token or not password:
+            return templates.TemplateResponse(
+                request,
+                "admin/password_claim.html",
+                {"csrf_token": csrf_token, "token": token, "user": None, "token_type": None, "error_message": "Token and password are required."},
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+        if password != password_confirm:
+            return templates.TemplateResponse(
+                request,
+                "admin/password_claim.html",
+                {"csrf_token": csrf_token, "token": token, "user": None, "token_type": None, "error_message": "Password confirmation does not match."},
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            user = UserSecurityService(session).claim_password(token, password)
+        except (AuthorizationError, PlatformCoreError) as exc:
+            return templates.TemplateResponse(
+                request,
+                "admin/password_claim.html",
+                {"csrf_token": csrf_token, "token": token, "user": None, "token_type": None, "error_message": str(exc)},
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+        _audit_admin_access(session, actor_email=user.email, action="admin.auth.password_claim", details={"mode": "token"})
+        return RedirectResponse(url="/admin/login?reset=1", status_code=status.HTTP_302_FOUND)
+
+    @app.post("/admin/logout")
+    async def admin_logout(request: Request, session: Session = Depends(get_db_session)) -> RedirectResponse:
+        await _require_csrf(request)
+        actor_email = _session_actor_email(request)
+        if actor_email:
+            _audit_admin_access(session, actor_email=actor_email, action="admin.auth.logout", details={"mode": "session"})
         request.session.clear()
         return RedirectResponse(url="/admin/login", status_code=status.HTTP_302_FOUND)
 
@@ -943,9 +1307,11 @@ def create_app() -> FastAPI:
         choose: bool = Query(default=False),
         session: Session = Depends(get_db_session),
     ):
-        actor_email = _session_actor_email(request)
-        if actor_email is None:
+        user = _current_session_user(session, request)
+        if user is None:
+            request.session.clear()
             return _login_redirect("/admin")
+        actor_email = user.email
         accounts = _accessible_accounts(session, actor_email)
         if not accounts:
             request.session.clear()
@@ -959,7 +1325,7 @@ def create_app() -> FastAPI:
         return templates.TemplateResponse(
             request,
             "admin/account_select.html",
-            {"accounts": accounts, "actor_email": actor_email},
+            {"accounts": accounts, "actor_email": actor_email, "csrf_token": _ensure_session_csrf_token(request)},
         )
 
     @app.get("/admin/switch-account/{account_slug}")
@@ -969,9 +1335,11 @@ def create_app() -> FastAPI:
         next: str | None = Query(default=None),
         session: Session = Depends(get_db_session),
     ) -> RedirectResponse:
-        actor_email = _session_actor_email(request)
-        if actor_email is None:
+        user = _current_session_user(session, request)
+        if user is None:
+            request.session.clear()
             return _login_redirect(f"/admin/switch-account/{account_slug}")
+        actor_email = user.email
         allowed = {item.slug for item in _accessible_accounts(session, actor_email)}
         if account_slug not in allowed:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cross-account switch denied.")
@@ -984,9 +1352,11 @@ def create_app() -> FastAPI:
         selected: str | None = Query(default=None),
         session: Session = Depends(get_db_session),
     ) -> HTMLResponse:
-        actor_email = _session_actor_email(request)
-        if actor_email is None:
+        user = _current_session_user(session, request)
+        if user is None:
+            request.session.clear()
             return _login_redirect("/admin/accounts")
+        actor_email = user.email
         if not _actor_can_manage_accounts(session, actor_email):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Owner or admin access is required.")
         account_rows = _accessible_accounts_with_memberships(session, actor_email)
@@ -1007,6 +1377,9 @@ def create_app() -> FastAPI:
                 "page": "accounts",
                 "page_path": "accounts",
                 "actor_email": actor_email,
+                "can_manage_accounts_global": True,
+                "can_manage_users_global": True,
+                "csrf_token": _ensure_session_csrf_token(request),
             },
         )
 
@@ -1015,7 +1388,8 @@ def create_app() -> FastAPI:
         request: Request,
         session: Session = Depends(get_db_session),
     ) -> JSONResponse:
-        actor_email = _require_admin_email(request)
+        await _require_csrf(request)
+        actor_email = _require_admin_user(request, session).email
         if not _actor_can_manage_accounts(session, actor_email):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Owner or admin access is required.")
         payload = await request.json()
@@ -1056,15 +1430,166 @@ def create_app() -> FastAPI:
         onboarding = _account_onboarding_status(account, session)
         return JSONResponse({"account": _serialize_account(account), "onboarding": _serialize_onboarding(onboarding)})
 
+    @app.get("/admin/users", response_class=HTMLResponse)
+    def admin_users_page(
+        request: Request,
+        user_id: int | None = Query(default=None),
+        session: Session = Depends(get_db_session),
+    ) -> HTMLResponse:
+        user = _current_session_user(session, request)
+        if user is None:
+            request.session.clear()
+            return _login_redirect("/admin/users")
+        actor_email = user.email
+        if not _actor_can_manage_accounts(session, actor_email):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Owner or admin access is required.")
+        user_rows = _accessible_users_with_memberships(session, actor_email)
+        selected_user = None
+        if user_id is not None:
+            selected_user = next((row for row in user_rows if row["user"].id == user_id), None)
+            if selected_user is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found in accessible accounts.")
+        accounts = _accessible_accounts(session, actor_email)
+        roles = session.execute(select(Role).order_by(Role.id.asc())).scalars().all()
+        return templates.TemplateResponse(
+            request,
+            "admin/users.html",
+            {
+                "page": "users",
+                "page_path": "users",
+                "actor_email": actor_email,
+                "can_manage_accounts_global": True,
+                "can_manage_users_global": True,
+                "csrf_token": _ensure_session_csrf_token(request),
+                "user_rows": user_rows,
+                "selected_user": selected_user,
+                "accounts": accounts,
+                "roles": roles,
+            },
+        )
+
+    @app.post("/admin/users/save")
+    async def admin_save_user(
+        request: Request,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        actor = _require_admin_user(request, session)
+        actor_email = actor.email
+        if not _actor_can_manage_accounts(session, actor_email):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Owner or admin access is required.")
+        payload = await request.json()
+        body = _parse_admin_payload(payload, "user")
+        membership_body = payload.get("membership") or {}
+        if membership_body and not isinstance(membership_body, dict):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="membership must be an object.")
+        service = UserSecurityService(session)
+        membership_service = MembershipService(session)
+        account_service = AccountService(session)
+        accessible_account_slugs = {account.slug for account in _accessible_accounts(session, actor_email)}
+        user_id = payload.get("user_id")
+        try:
+            candidate_email = str(body.get("email") or "").strip().lower()
+            existing_user = service.get_by_email(candidate_email) if candidate_email else None
+            if user_id is None and existing_user is not None:
+                _assert_user_visible_to_actor(session, actor_email, existing_user.id)
+            target_user, _ = service.create_or_update_user(
+                email=candidate_email,
+                full_name=str(body.get("full_name") or "").strip(),
+                status=str(body.get("status") or "invited").strip(),
+                user_id=int(user_id) if user_id is not None else None,
+            )
+            membership_summary = None
+            account_slug = str(membership_body.get("account_slug") or "").strip()
+            role_code = str(membership_body.get("role_code") or "").strip()
+            if account_slug and role_code:
+                if account_slug not in accessible_account_slugs:
+                    raise PlatformCoreError("Cannot assign membership in an inaccessible account.")
+                account = account_service.get_by_slug(account_slug)
+                if account is None:
+                    raise PlatformCoreError("Initial account not found.")
+                membership, _ = membership_service.ensure_membership(account, target_user, role_code, status="active")
+                membership_summary = _serialize_membership(membership)
+            issue_invite = bool(payload.get("issue_invite"))
+            invite_link = None
+            if issue_invite:
+                token = service.issue_invite(target_user)
+                invite_link = f"/admin/password/claim?token={token}"
+            session.flush()
+        except (PlatformCoreError, IntegrityError) as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        return JSONResponse(
+            {
+                "user": _serialize_user(target_user),
+                "membership": membership_summary,
+                "invite_link": invite_link,
+            }
+        )
+
+    @app.post("/admin/users/{user_id}/invite")
+    async def admin_issue_invite(
+        request: Request,
+        user_id: int,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        actor_email = _require_admin_user(request, session).email
+        if not _actor_can_manage_accounts(session, actor_email):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Owner or admin access is required.")
+        service = UserSecurityService(session)
+        user = _assert_user_visible_to_actor(session, actor_email, user_id)
+        token = service.issue_invite(user)
+        return JSONResponse({"user": _serialize_user(user), "invite_link": f"/admin/password/claim?token={token}"})
+
+    @app.post("/admin/users/{user_id}/reset-password")
+    async def admin_issue_password_reset(
+        request: Request,
+        user_id: int,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        actor_email = _require_admin_user(request, session).email
+        if not _actor_can_manage_accounts(session, actor_email):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Owner or admin access is required.")
+        service = UserSecurityService(session)
+        try:
+            user = _assert_user_visible_to_actor(session, actor_email, user_id)
+            token = service.issue_password_reset(user)
+        except PlatformCoreError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        return JSONResponse({"user": _serialize_user(user), "reset_link": f"/admin/password/claim?token={token}"})
+
+    @app.post("/admin/users/{user_id}/status")
+    async def admin_set_user_status(
+        request: Request,
+        user_id: int,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        actor_email = _require_admin_user(request, session).email
+        if not _actor_can_manage_accounts(session, actor_email):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Owner or admin access is required.")
+        payload = await request.json()
+        next_status = str(payload.get("status") or "").strip()
+        service = UserSecurityService(session)
+        try:
+            user = _assert_user_visible_to_actor(session, actor_email, user_id)
+            service.set_user_status(user, next_status)
+        except PlatformCoreError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        return JSONResponse({"user": _serialize_user(user)})
+
     @app.get("/admin/{account_slug}/dashboard", response_class=HTMLResponse)
     def admin_dashboard(
         request: Request,
         account_slug: str,
         session: Session = Depends(get_db_session),
     ) -> HTMLResponse:
-        actor_email = _session_actor_email(request)
-        if actor_email is None:
+        user = _current_session_user(session, request)
+        if user is None:
+            request.session.clear()
             return _login_redirect(f"/admin/{account_slug}/dashboard")
+        actor_email = user.email
         runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
         request.session["admin_account_slug"] = runtime.account.slug
         ensure_permission(runtime, "dashboard.read")
@@ -1095,7 +1620,7 @@ def create_app() -> FastAPI:
             request,
             "admin/dashboard.html",
             {
-                **_admin_context(session, runtime, page="dashboard"),
+                **_admin_context(request, session, runtime, page="dashboard"),
                 "dashboard": dashboard,
                 "widgets": widgets,
                 "goal_snapshots": goal_snapshots,
@@ -1112,9 +1637,11 @@ def create_app() -> FastAPI:
         provider: str | None = Query(default=None),
         session: Session = Depends(get_db_session),
     ) -> HTMLResponse:
-        actor_email = _session_actor_email(request)
-        if actor_email is None:
+        user = _current_session_user(session, request)
+        if user is None:
+            request.session.clear()
             return _login_redirect(f"/admin/{account_slug}/integrations")
+        actor_email = user.email
         runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
         request.session["admin_account_slug"] = runtime.account.slug
         ensure_permission(runtime, "integrations.manage")
@@ -1137,7 +1664,7 @@ def create_app() -> FastAPI:
             request,
             "admin/integrations.html",
             {
-                **_admin_context(session, runtime, page="integrations"),
+                **_admin_context(request, session, runtime, page="integrations"),
                 "integrations": integrations,
                 "sync_status": sync_status,
                 "human_sync_error": _human_sync_error,
@@ -1155,9 +1682,11 @@ def create_app() -> FastAPI:
         membership_id: int | None = Query(default=None),
         session: Session = Depends(get_db_session),
     ) -> HTMLResponse:
-        actor_email = _session_actor_email(request)
-        if actor_email is None:
+        user = _current_session_user(session, request)
+        if user is None:
+            request.session.clear()
             return _login_redirect(f"/admin/{account_slug}/members")
+        actor_email = user.email
         runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
         request.session["admin_account_slug"] = runtime.account.slug
         _require_account_manager(runtime)
@@ -1174,7 +1703,7 @@ def create_app() -> FastAPI:
             request,
             "admin/members.html",
             {
-                **_admin_context(session, runtime, page="members"),
+                **_admin_context(request, session, runtime, page="members"),
                 "memberships": memberships,
                 "selected_membership": selected_membership,
                 "roles": roles,
@@ -1190,9 +1719,11 @@ def create_app() -> FastAPI:
         priority: str | None = Query(default=None),
         session: Session = Depends(get_db_session),
     ) -> HTMLResponse:
-        actor_email = _session_actor_email(request)
-        if actor_email is None:
+        user = _current_session_user(session, request)
+        if user is None:
+            request.session.clear()
             return _login_redirect(f"/admin/{account_slug}/alerts-tasks")
+        actor_email = user.email
         runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
         request.session["admin_account_slug"] = runtime.account.slug
         ensure_permission(runtime, "alerts.read")
@@ -1220,7 +1751,7 @@ def create_app() -> FastAPI:
             request,
             "admin/alerts_tasks.html",
             {
-                **_admin_context(session, runtime, page="alerts_tasks"),
+                **_admin_context(request, session, runtime, page="alerts_tasks"),
                 "alerts": alerts,
                 "tasks": tasks,
                 "overdue_tasks": overdue_tasks,
@@ -1238,9 +1769,11 @@ def create_app() -> FastAPI:
         account_slug: str,
         session: Session = Depends(get_db_session),
     ) -> HTMLResponse:
-        actor_email = _session_actor_email(request)
-        if actor_email is None:
+        user = _current_session_user(session, request)
+        if user is None:
+            request.session.clear()
             return _login_redirect(f"/admin/{account_slug}/ops-sync")
+        actor_email = user.email
         runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
         request.session["admin_account_slug"] = runtime.account.slug
         ensure_permission(runtime, "integrations.manage")
@@ -1252,7 +1785,7 @@ def create_app() -> FastAPI:
             request,
             "admin/ops_sync.html",
             {
-                **_admin_context(session, runtime, page="ops_sync"),
+                **_admin_context(request, session, runtime, page="ops_sync"),
                 "ops": ops,
                 "human_sync_error": _human_sync_error,
             },
@@ -1265,9 +1798,11 @@ def create_app() -> FastAPI:
         goal_id: int | None = Query(default=None),
         session: Session = Depends(get_db_session),
     ) -> HTMLResponse:
-        actor_email = _session_actor_email(request)
-        if actor_email is None:
+        user = _current_session_user(session, request)
+        if user is None:
+            request.session.clear()
             return _login_redirect(f"/admin/{account_slug}/goals")
+        actor_email = user.email
         runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
         request.session["admin_account_slug"] = runtime.account.slug
         ensure_permission(runtime, "dashboard.read")
@@ -1309,7 +1844,7 @@ def create_app() -> FastAPI:
             request,
             "admin/goals.html",
             {
-                **_admin_context(session, runtime, page="goals"),
+                **_admin_context(request, session, runtime, page="goals"),
                 "goals": goals,
                 "selected_goal": selected_goal_enriched,
                 "selected_targets_by_code": selected_targets_by_code,
@@ -1327,7 +1862,8 @@ def create_app() -> FastAPI:
         integration_id: int,
         session: Session = Depends(get_db_session),
     ) -> JSONResponse:
-        actor_email = _require_admin_email(request)
+        await _require_csrf(request)
+        actor_email = _require_admin_user(request, session).email
         runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
         ensure_permission(runtime, "integrations.manage")
         service = RuntimeIntegrationService(session)
@@ -1356,7 +1892,8 @@ def create_app() -> FastAPI:
         integration_id: int,
         session: Session = Depends(get_db_session),
     ) -> JSONResponse:
-        actor_email = _require_admin_email(request)
+        await _require_csrf(request)
+        actor_email = _require_admin_user(request, session).email
         payload = await request.json()
         next_status = str(payload.get("status") or "").strip()
         runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
@@ -1374,8 +1911,9 @@ def create_app() -> FastAPI:
         account_slug: str,
         session: Session = Depends(get_db_session),
     ) -> JSONResponse:
+        await _require_csrf(request)
         payload = await request.json()
-        actor_email = _require_admin_email(request)
+        actor_email = _require_admin_user(request, session).email
         runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
         ensure_permission(runtime, "integrations.manage")
         body = _parse_admin_payload(payload, "integration")
@@ -1438,8 +1976,9 @@ def create_app() -> FastAPI:
         integration_id: int,
         session: Session = Depends(get_db_session),
     ) -> JSONResponse:
+        await _require_csrf(request)
         payload = await request.json()
-        actor_email = _require_admin_email(request)
+        actor_email = _require_admin_user(request, session).email
         runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
         ensure_permission(runtime, "integrations.manage")
         credentials = _parse_admin_payload(payload, "credentials")
@@ -1459,7 +1998,8 @@ def create_app() -> FastAPI:
         account_slug: str,
         session: Session = Depends(get_db_session),
     ) -> JSONResponse:
-        actor_email = _require_admin_email(request)
+        await _require_csrf(request)
+        actor_email = _require_admin_user(request, session).email
         payload = await request.json()
         runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
         _require_account_manager(runtime)
@@ -1468,7 +2008,7 @@ def create_app() -> FastAPI:
         role_code = str(body.get("role_code") or "").strip()
         status_code = str(body.get("status") or "active").strip()
         membership_service = MembershipService(session)
-        user_service = UserService(session)
+        user_security = UserSecurityService(session)
         try:
             if membership_id:
                 membership = membership_service.get_membership(runtime.account, int(membership_id))
@@ -1488,7 +2028,11 @@ def create_app() -> FastAPI:
                 full_name = str(body.get("full_name") or email).strip()
                 if not email or not role_code:
                     raise PlatformCoreError("Email and role are required for new membership.")
-                user, _ = user_service.ensure_user(email, full_name or email)
+                user, _ = user_security.create_or_update_user(
+                    email=email,
+                    full_name=full_name or email,
+                    status="invited",
+                )
                 membership, _ = membership_service.ensure_membership(
                     runtime.account,
                     user,
@@ -1507,7 +2051,8 @@ def create_app() -> FastAPI:
         membership_id: int,
         session: Session = Depends(get_db_session),
     ) -> JSONResponse:
-        actor_email = _require_admin_email(request)
+        await _require_csrf(request)
+        actor_email = _require_admin_user(request, session).email
         runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
         _require_account_manager(runtime)
         try:
@@ -1523,7 +2068,8 @@ def create_app() -> FastAPI:
         membership_id: int,
         session: Session = Depends(get_db_session),
     ) -> JSONResponse:
-        actor_email = _require_admin_email(request)
+        await _require_csrf(request)
+        actor_email = _require_admin_user(request, session).email
         runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
         _require_account_manager(runtime)
         try:
@@ -1538,8 +2084,9 @@ def create_app() -> FastAPI:
         account_slug: str,
         session: Session = Depends(get_db_session),
     ) -> JSONResponse:
+        await _require_csrf(request)
         payload = await request.json()
-        actor_email = _require_admin_email(request)
+        actor_email = _require_admin_user(request, session).email
         runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
         ensure_permission(runtime, "rules.manage")
         body = payload.get("goal") or {}
@@ -1625,6 +2172,25 @@ def _serialize_account(account: Account) -> dict[str, object]:
     }
 
 
+def _serialize_user(user: User) -> dict[str, object]:
+    return {
+        "id": user.id,
+        "email": user.email,
+        "full_name": user.full_name,
+        "status": user.status,
+        "password_set_at": _serialize_datetime(user.password_set_at),
+        "last_login_at": _serialize_datetime(user.last_login_at),
+        "failed_login_attempts": int(user.failed_login_attempts or 0),
+        "locked_until": _serialize_datetime(user.locked_until),
+        "invite_sent_at": _serialize_datetime(user.invite_sent_at),
+        "invite_accepted_at": _serialize_datetime(user.invite_accepted_at),
+        "reset_requested_at": _serialize_datetime(user.reset_requested_at),
+        "auth_version": int(user.auth_version or 1),
+        "created_at": _serialize_datetime(user.created_at),
+        "updated_at": _serialize_datetime(user.updated_at),
+    }
+
+
 def _serialize_membership(membership: AccountUser) -> dict[str, object]:
     return {
         "id": membership.id,
@@ -1639,6 +2205,7 @@ def _serialize_membership(membership: AccountUser) -> dict[str, object]:
             "email": membership.user.email,
             "full_name": membership.user.full_name,
             "status": membership.user.status,
+            "password_set_at": _serialize_datetime(membership.user.password_set_at),
         },
     }
 

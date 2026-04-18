@@ -14,7 +14,10 @@
           <h2 style="margin: 0;">Choose Account</h2>
           <p class="subtle">{{ actor_email }}</p>
         </div>
-        <a class="switch-link" href="/admin/logout">Logout</a>
+        <form method="post" action="/admin/logout">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button type="submit" class="switch-link switch-button">Logout</button>
+        </form>
       </div>
       <div class="grid cols-2" style="margin-top: 18px;">
         {% for account in accounts %}

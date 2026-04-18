@@ -303,7 +303,7 @@
     button.disabled = true;
     button.textContent = "Running...";
     try {
-      const response = await fetch(`/admin/{{ runtime.account.slug }}/integrations/${integrationId}/sync`, {
+      const response = await adminFetch(`/admin/{{ runtime.account.slug }}/integrations/${integrationId}/sync`, {
         method: "POST",
         headers: {"Content-Type": "application/json"},
         body: JSON.stringify({}),
@@ -326,7 +326,7 @@
     const statusNode = document.getElementById("integration-status-line");
     statusNode.textContent = "Saving setup...";
     try {
-      const response = await fetch(`/admin/{{ runtime.account.slug }}/integrations/save`, {
+      const response = await adminFetch(`/admin/{{ runtime.account.slug }}/integrations/save`, {
         method: "POST",
         headers: {"Content-Type": "application/json"},
         body: JSON.stringify({
@@ -353,7 +353,7 @@
     const statusNode = document.getElementById("integration-status-line");
     statusNode.textContent = "Testing connection...";
     try {
-      const response = await fetch(`/admin/{{ runtime.account.slug }}/integrations/${currentIntegrationId}/test`, {
+      const response = await adminFetch(`/admin/{{ runtime.account.slug }}/integrations/${currentIntegrationId}/test`, {
         method: "POST",
         headers: {"Content-Type": "application/json"},
         body: JSON.stringify({
@@ -388,7 +388,7 @@
     button.addEventListener("click", async () => {
       button.disabled = true;
       try {
-        const response = await fetch(`/admin/{{ runtime.account.slug }}/integrations/${button.dataset.integrationId}/status`, {
+        const response = await adminFetch(`/admin/{{ runtime.account.slug }}/integrations/${button.dataset.integrationId}/status`, {
           method: "POST",
           headers: {"Content-Type": "application/json"},
           body: JSON.stringify({status: button.dataset.status}),

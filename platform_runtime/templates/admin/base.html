@@ -3,8 +3,21 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf-token" content="{{ csrf_token or '' }}">
   <title>{{ title or "Hermes Admin" }}</title>
   <link rel="stylesheet" href="{{ url_for('admin-static', path='admin.css') }}">
+  <script>
+    window.adminCsrfToken = document.querySelector('meta[name="csrf-token"]')?.content || "";
+    window.adminFetch = (url, options = {}) => {
+      const next = {...options};
+      const headers = new Headers(next.headers || {});
+      if (window.adminCsrfToken && !headers.has("X-CSRF-Token")) {
+        headers.set("X-CSRF-Token", window.adminCsrfToken);
+      }
+      next.headers = headers;
+      return fetch(url, next);
+    };
+  </script>
 </head>
 <body>
   <div class="shell">
@@ -38,26 +51,38 @@
         {% if can_manage_accounts_global %}
         <a class="{{ 'active' if page == 'accounts' else '' }}" href="/admin/accounts">Accounts</a>
         {% endif %}
+        {% if can_manage_users_global %}
+        <a class="{{ 'active' if page == 'users' else '' }}" href="/admin/users">Users</a>
+        {% endif %}
         {% for item in nav_items %}
         <a class="{{ 'active' if page == item.key else '' }}" href="/admin/{{ runtime.account.slug }}/{{ item.path }}">{{ item.label }}</a>
         {% endfor %}
       </nav>
       <div class="sidebar-actions">
         <a class="switch-link" href="/admin?choose=1">Choose account</a>
-        <a class="switch-link" href="/admin/logout">Logout</a>
+        <form method="post" action="/admin/logout">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button type="submit" class="switch-link switch-button">Logout</button>
+        </form>
       </div>
       {% endif %}
-      {% if page == 'accounts' %}
+      {% if page in ['accounts', 'users'] %}
       <div class="stack">
         <p class="meta">{{ actor_email }}</p>
-        <p class="meta">Global onboarding and account setup</p>
+        <p class="meta">{{ 'Global onboarding and account setup' if page == 'accounts' else 'Global user lifecycle and access management' }}</p>
       </div>
       <nav class="nav">
-        <a class="active" href="/admin/accounts">Accounts</a>
+        <a class="{{ 'active' if page == 'accounts' else '' }}" href="/admin/accounts">Accounts</a>
+        {% if can_manage_users_global %}
+        <a class="{{ 'active' if page == 'users' else '' }}" href="/admin/users">Users</a>
+        {% endif %}
       </nav>
       <div class="sidebar-actions">
         <a class="switch-link" href="/admin?choose=1">Choose account</a>
-        <a class="switch-link" href="/admin/logout">Logout</a>
+        <form method="post" action="/admin/logout">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button type="submit" class="switch-link switch-button">Logout</button>
+        </form>
       </div>
       {% endif %}
     </aside>

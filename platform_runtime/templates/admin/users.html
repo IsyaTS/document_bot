@@ -1,0 +1,255 @@
+{% extends "admin/base.html" %}
+{% block content %}
+<div class="topbar">
+  <div>
+    <h2>Users</h2>
+    <p class="subtle">Product-grade user lifecycle: invite, activate/deactivate, password reset and clear membership visibility.</p>
+  </div>
+  <div class="chips">
+    <span class="chip">{{ user_rows|length }} accessible users</span>
+    <span class="chip">Owner/admin only</span>
+  </div>
+</div>
+
+<section class="grid cols-2">
+  <article class="card">
+    <div class="actions" style="justify-content: space-between;">
+      <div>
+        <h3>{{ "Edit User" if selected_user else "Invite User" }}</h3>
+        <p class="subtle">Create a user, choose initial status and optionally attach the first account membership.</p>
+      </div>
+      {% if selected_user %}
+      <a class="pill-link" href="/admin/users">new user</a>
+      {% endif %}
+    </div>
+    <div class="form-grid two" style="margin-top: 14px;">
+      <label>
+        Email
+        <input id="user-email" value="{{ selected_user.user.email if selected_user else '' }}" {% if selected_user %}disabled{% endif %}>
+      </label>
+      <label>
+        Full name
+        <input id="user-full-name" value="{{ selected_user.user.full_name if selected_user else '' }}">
+      </label>
+      <label>
+        User status
+        <select id="user-status">
+          {% for status_code in ["invited", "active", "disabled"] %}
+          <option value="{{ status_code }}" {{ 'selected' if selected_user and selected_user.user.status == status_code else ('selected' if not selected_user and status_code == 'invited' else '') }}>{{ status_code }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>
+        Initial account
+        <select id="user-account">
+          <option value="">no new membership</option>
+          {% for account in accounts %}
+          <option value="{{ account.slug }}">{{ account.name }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>
+        Initial role
+        <select id="user-role">
+          <option value="">no new membership</option>
+          {% for role in roles %}
+          <option value="{{ role.code }}">{{ role.code }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label style="align-content: end;">
+        <span class="subtle">One-time password claim link</span>
+        <input id="user-issue-invite" type="checkbox" checked style="width:auto;">
+      </label>
+    </div>
+    <div class="actions" style="margin-top: 16px;">
+      <button type="button" id="save-user">{{ "Update user" if selected_user else "Create user" }}</button>
+      <span class="subtle" id="user-save-status"></span>
+    </div>
+    <div id="user-link-box" class="notice" style="display:none; margin-top: 14px;"></div>
+  </article>
+
+  <article class="card">
+    <h3>User Access Summary</h3>
+    {% if selected_user %}
+    <div class="stack">
+      <div class="inline-card">
+        <div class="actions" style="justify-content: space-between;">
+          <strong>{{ selected_user.user.full_name or selected_user.user.email }}</strong>
+          <span class="badge {{ 'good' if selected_user.user.status == 'active' else 'warn' if selected_user.user.status == 'invited' else 'bad' }}">{{ selected_user.user.status }}</span>
+        </div>
+        <p class="subtle">{{ selected_user.user.email }}</p>
+        <div class="chips">
+          <span class="chip">password set {{ selected_user.user.password_set_at or '—' }}</span>
+          <span class="chip">last login {{ selected_user.user.last_login_at or '—' }}</span>
+          <span class="chip">auth version {{ selected_user.user.auth_version or 1 }}</span>
+        </div>
+      </div>
+      <div class="stack">
+        {% for membership in selected_user.memberships %}
+        <div class="inline-card">
+          <strong>{{ membership.account.name }}</strong>
+          <div class="status-line">{{ membership.role.code }} · {{ membership.status }}</div>
+        </div>
+        {% else %}
+        <p class="empty">No accessible memberships.</p>
+        {% endfor %}
+      </div>
+      <div class="actions">
+        <button type="button" class="secondary user-invite" data-user-id="{{ selected_user.user.id }}">Issue invite</button>
+        <button type="button" class="secondary user-reset" data-user-id="{{ selected_user.user.id }}">Reset password</button>
+        {% if selected_user.user.status != 'active' %}
+        <button type="button" class="ghost user-status" data-user-id="{{ selected_user.user.id }}" data-status="active">Activate</button>
+        {% endif %}
+        {% if selected_user.user.status != 'disabled' %}
+        <button type="button" class="ghost user-status" data-user-id="{{ selected_user.user.id }}" data-status="disabled">Disable</button>
+        {% endif %}
+      </div>
+    </div>
+    {% else %}
+    <p class="empty">Select a user to see status, memberships and lifecycle actions.</p>
+    {% endif %}
+  </article>
+</section>
+
+<section class="card" style="margin-top: 16px;">
+  <h3>Users</h3>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>User</th>
+          <th>Status</th>
+          <th>Password</th>
+          <th>Memberships</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in user_rows %}
+        <tr>
+          <td>
+            <strong>{{ row.user.full_name or row.user.email }}</strong>
+            <div class="status-line">{{ row.user.email }}</div>
+          </td>
+          <td><span class="badge {{ 'good' if row.user.status == 'active' else 'warn' if row.user.status == 'invited' else 'bad' }}">{{ row.user.status }}</span></td>
+          <td>{{ row.user.password_set_at or "not set" }}</td>
+          <td>
+            <div class="stack" style="gap: 6px;">
+              {% for membership in row.memberships %}
+              <div class="status-line">{{ membership.account.slug }} · {{ membership.role.code }} · {{ membership.status }}</div>
+              {% else %}
+              <div class="status-line">no memberships</div>
+              {% endfor %}
+            </div>
+          </td>
+          <td>
+            <div class="actions">
+              <a class="pill-link" href="/admin/users?user_id={{ row.user.id }}">Open</a>
+              <a class="pill-link" href="/admin?choose=1">Switch account</a>
+            </div>
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="5" class="empty">No users visible in accessible accounts.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<script>
+  const currentUserId = {{ selected_user.user.id if selected_user else 'null' }};
+
+  function showLinkBox(label, link) {
+    const box = document.getElementById("user-link-box");
+    box.style.display = "block";
+    box.innerHTML = `${label}: <a class="pill-link" href="${link}">${link}</a>`;
+  }
+
+  document.getElementById("save-user").addEventListener("click", async () => {
+    const statusNode = document.getElementById("user-save-status");
+    statusNode.textContent = "Saving...";
+    try {
+      const response = await adminFetch("/admin/users/save", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+          user_id: currentUserId,
+          issue_invite: document.getElementById("user-issue-invite").checked,
+          user: {
+            email: document.getElementById("user-email").value.trim().toLowerCase(),
+            full_name: document.getElementById("user-full-name").value.trim(),
+            status: document.getElementById("user-status").value,
+          },
+          membership: {
+            account_slug: document.getElementById("user-account").value,
+            role_code: document.getElementById("user-role").value,
+          },
+        }),
+      });
+      if (!response.ok) {
+        throw new Error(await response.text());
+      }
+      const body = await response.json();
+      statusNode.textContent = `Saved user #${body.user.id}`;
+      if (body.invite_link) {
+        showLinkBox("Invite link", body.invite_link);
+      } else {
+        document.getElementById("user-link-box").style.display = "none";
+      }
+      window.location.href = `/admin/users?user_id=${body.user.id}`;
+    } catch (error) {
+      statusNode.textContent = "";
+      alert(`User save failed: ${error}`);
+    }
+  });
+
+  for (const button of document.querySelectorAll(".user-invite")) {
+    button.addEventListener("click", async () => {
+      const response = await adminFetch(`/admin/users/${button.dataset.userId}/invite`, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({}),
+      });
+      if (!response.ok) {
+        alert(`Invite failed: ${await response.text()}`);
+        return;
+      }
+      const body = await response.json();
+      showLinkBox("Invite link", body.invite_link);
+    });
+  }
+
+  for (const button of document.querySelectorAll(".user-reset")) {
+    button.addEventListener("click", async () => {
+      const response = await adminFetch(`/admin/users/${button.dataset.userId}/reset-password`, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({}),
+      });
+      if (!response.ok) {
+        alert(`Reset failed: ${await response.text()}`);
+        return;
+      }
+      const body = await response.json();
+      showLinkBox("Reset link", body.reset_link);
+    });
+  }
+
+  for (const button of document.querySelectorAll(".user-status")) {
+    button.addEventListener("click", async () => {
+      const response = await adminFetch(`/admin/users/${button.dataset.userId}/status`, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({status: button.dataset.status}),
+      });
+      if (!response.ok) {
+        alert(`Status update failed: ${await response.text()}`);
+        return;
+      }
+      window.location.reload();
+    });
+  }
+</script>
+{% endblock %}

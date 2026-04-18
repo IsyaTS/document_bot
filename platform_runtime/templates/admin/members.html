@@ -80,6 +80,7 @@
       <thead>
         <tr>
           <th>Member</th>
+          <th>User status</th>
           <th>Effective role</th>
           <th>Status</th>
           <th>Joined</th>
@@ -93,6 +94,7 @@
             <strong>{{ membership.user.full_name or membership.user.email }}</strong>
             <div class="status-line">{{ membership.user.email }}</div>
           </td>
+          <td><span class="badge {{ 'good' if membership.user.status == 'active' else 'warn' if membership.user.status == 'invited' else 'bad' }}">{{ membership.user.status }}</span></td>
           <td><span class="badge">{{ membership.role.code }}</span></td>
           <td><span class="badge {{ 'good' if membership.status == 'active' else 'warn' }}">{{ membership.status }}</span></td>
           <td>{{ membership.joined_at or '—' }}</td>
@@ -107,7 +109,7 @@
           </td>
         </tr>
         {% else %}
-        <tr><td colspan="5" class="empty">No memberships configured.</td></tr>
+        <tr><td colspan="6" class="empty">No memberships configured.</td></tr>
         {% endfor %}
       </tbody>
     </table>
@@ -130,7 +132,7 @@
       },
     };
     try {
-      const response = await fetch(`/admin/{{ runtime.account.slug }}/members/save`, {
+      const response = await adminFetch(`/admin/{{ runtime.account.slug }}/members/save`, {
         method: "POST",
         headers: {"Content-Type": "application/json"},
         body: JSON.stringify(payload),
@@ -151,7 +153,7 @@
     button.addEventListener("click", async () => {
       button.disabled = true;
       try {
-        const response = await fetch(`/admin/{{ runtime.account.slug }}/members/${button.dataset.membershipId}/disable`, {
+        const response = await adminFetch(`/admin/{{ runtime.account.slug }}/members/${button.dataset.membershipId}/disable`, {
           method: "POST",
           headers: {"Content-Type": "application/json"},
           body: JSON.stringify({}),
@@ -172,7 +174,7 @@
       if (!window.confirm("Remove this member access from the account?")) return;
       button.disabled = true;
       try {
-        const response = await fetch(`/admin/{{ runtime.account.slug }}/members/${button.dataset.membershipId}/remove`, {
+        const response = await adminFetch(`/admin/{{ runtime.account.slug }}/members/${button.dataset.membershipId}/remove`, {
           method: "POST",
           headers: {"Content-Type": "application/json"},
           body: JSON.stringify({}),

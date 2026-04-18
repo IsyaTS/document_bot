@@ -10,24 +10,57 @@
   <main class="content" style="max-width: 760px; margin: 0 auto; padding-top: 60px;">
     <section class="card hero">
       <h2 style="margin-top: 0;">Hermes Admin Login</h2>
-      <p class="subtle">Minimal internal session-based access for owner/operator use. Login uses your existing user email and one internal access code.</p>
+      <p class="subtle">Password-based admin access for owner/operator use. Internal bootstrap access code is only for issuing a one-time password claim link.</p>
+      {% if reset_notice %}
+      <div class="notice" style="margin-top: 16px;">Password updated. Login with your new password.</div>
+      {% endif %}
       {% if error_message %}
       <div class="notice bad" style="margin-top: 16px;">{{ error_message }}</div>
       {% endif %}
       <form class="stack" action="/admin/login" method="post" style="margin-top: 18px;">
         <input type="hidden" name="next" value="{{ next_path or '' }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <label>
           User email
           <input name="email" type="email" value="{{ prefill_email or '' }}" placeholder="owner@hermes.local" required>
         </label>
         <label>
-          Access code
-          <input name="access_code" type="password" required>
+          Password
+          <input name="password" type="password" required>
         </label>
         <div class="actions">
           <button type="submit">Login</button>
         </div>
       </form>
+
+      <section class="card soft-card" style="margin-top: 18px;">
+        <h3 style="margin-top: 0;">Need first password or reset?</h3>
+        <p class="subtle">Use the internal bootstrap access code to generate a one-time password claim link for an existing user.</p>
+        {% if bootstrap_error %}
+        <div class="notice bad" style="margin-top: 12px;">{{ bootstrap_error }}</div>
+        {% endif %}
+        {% if bootstrap_claim_url %}
+        <div class="notice" style="margin-top: 12px;">
+          One-time password claim link:
+          <a class="pill-link" href="{{ bootstrap_claim_url }}">{{ bootstrap_claim_url }}</a>
+        </div>
+        {% endif %}
+        <form class="stack" action="/admin/bootstrap-access" method="post" style="margin-top: 14px;">
+          <input type="hidden" name="next" value="{{ next_path or '' }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <label>
+            User email
+            <input name="bootstrap_email" type="email" value="{{ bootstrap_email or '' }}" placeholder="ops@platform.local" required>
+          </label>
+          <label>
+            Bootstrap access code
+            <input name="access_code" type="password" required>
+          </label>
+          <div class="actions">
+            <button type="submit" class="secondary">Generate claim link</button>
+          </div>
+        </form>
+      </section>
     </section>
   </main>
 </body>

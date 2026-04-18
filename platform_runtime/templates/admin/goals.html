@@ -197,7 +197,7 @@
     const statusNode = document.getElementById("goal-save-status");
     statusNode.textContent = "Saving...";
     try {
-      const response = await fetch(`/admin/{{ runtime.account.slug }}/goals/save`, {
+      const response = await adminFetch(`/admin/{{ runtime.account.slug }}/goals/save`, {
         method: "POST",
         headers: {"Content-Type": "application/json"},
         body: JSON.stringify(payload),
