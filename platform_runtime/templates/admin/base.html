@@ -62,6 +62,9 @@
         {% if can_view_platform %}
         <a class="{{ 'active' if page == 'platform' else '' }}" href="/admin/platform">Platform</a>
         {% endif %}
+        {% if can_view_super_admin %}
+        <a class="{{ 'active' if page == 'super_admin' else '' }}" href="/admin/super-admin">Super Admin</a>
+        {% endif %}
         {% if can_manage_users_global %}
         <a class="{{ 'active' if page == 'users' else '' }}" href="/admin/users">Users</a>
         {% endif %}
@@ -77,7 +80,7 @@
         </form>
       </div>
       {% endif %}
-      {% if page in ['portfolio', 'platform', 'accounts', 'users'] %}
+      {% if page in ['portfolio', 'platform', 'super_admin', 'accounts', 'users'] %}
       <div class="stack">
         <p class="meta">{{ actor_email }}</p>
         <p class="meta">
@@ -85,6 +88,8 @@
           Cross-account owner console
           {% elif page == 'platform' %}
           Runtime, environment and delivery visibility
+          {% elif page == 'super_admin' %}
+          Platform-level account lifecycle and feature control
           {% elif page == 'accounts' %}
           Global onboarding and account setup
           {% else %}
@@ -99,6 +104,9 @@
         <a class="{{ 'active' if page == 'accounts' else '' }}" href="/admin/accounts">Accounts</a>
         {% if can_view_platform %}
         <a class="{{ 'active' if page == 'platform' else '' }}" href="/admin/platform">Platform</a>
+        {% endif %}
+        {% if can_view_super_admin %}
+        <a class="{{ 'active' if page == 'super_admin' else '' }}" href="/admin/super-admin">Super Admin</a>
         {% endif %}
         {% if can_manage_users_global %}
         <a class="{{ 'active' if page == 'users' else '' }}" href="/admin/users">Users</a>

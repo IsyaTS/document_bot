@@ -265,6 +265,7 @@ Server-rendered admin app lives in `platform_runtime/app.py` and now includes:
   - `/admin/accounts`
   - `/admin/users`
   - `/admin/platform`
+  - `/admin/super-admin`
 - account-scoped pages:
   - `/admin/{account_slug}/dashboard`
   - `/admin/{account_slug}/brief`
@@ -317,6 +318,29 @@ Stage 8.0 adds:
   - cleaner active account context in sidebar
   - stronger empty-state hints
   - delivery links across dashboard, goals, integrations, alerts/tasks, ops, accounts and portfolio
+
+Stage 8.3 adds:
+
+- platform-level super-admin console:
+  - `GET /admin/super-admin`
+  - all accessible accounts with status, plan, readiness, sync health, owner/admin visibility, feature summary, soft-limit pressure and top issues
+- platform-level lifecycle and commercial control actions:
+  - disable / reactivate / archive account via status updates
+  - change plan type
+  - adjust soft limits
+  - toggle feature flags
+- minimal real feature enforcement:
+  - `portfolio_console`
+  - `owner_briefs`
+  - `goals_tracking`
+  - `integrations_setup`
+  - `ops_console`
+- clear blocked messages in handlers when a feature is outside plan, disabled for the account, or unavailable due to account status
+- platform audit events:
+  - `platform.account.status_changed`
+  - `platform.account.plan_changed`
+  - `platform.account.feature_flags_changed`
+  - `platform.account.soft_limits_changed`
 
 Stage 8.1 adds:
 

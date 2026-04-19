@@ -223,6 +223,7 @@ def create_app() -> FastAPI:
         return {
             "portfolio": "portfolio",
             "platform": "platform",
+            "super_admin": "super-admin",
             "accounts": "accounts",
             "users": "users",
             "brief": "brief",
@@ -279,7 +280,7 @@ def create_app() -> FastAPI:
         ]
 
     def _actor_can_view_portfolio(session: Session, actor_email: str) -> bool:
-        return bool(_owner_accounts_with_memberships(session, actor_email))
+        return bool(_owner_accounts_for_portfolio(session, actor_email))
 
     def _require_portfolio_owner(session: Session, actor_email: str) -> None:
         if _actor_can_view_portfolio(session, actor_email):
@@ -379,18 +380,21 @@ def create_app() -> FastAPI:
     def _admin_nav_items(runtime: ResolvedRuntimeContext) -> list[dict[str, str]]:
         permissions = runtime.permissions
         items: list[dict[str, str]] = []
+        feature_access = _feature_access_map(runtime.account)
         if "dashboard.read" in permissions or "*" in permissions:
-            items.append({"key": "brief", "label": "Brief", "path": "brief"})
-            items.append({"key": "delivery", "label": "Delivery", "path": "delivery"})
+            if feature_access["owner_briefs"]["allowed"]:
+                items.append({"key": "brief", "label": "Brief", "path": "brief"})
+                items.append({"key": "delivery", "label": "Delivery", "path": "delivery"})
             items.append({"key": "dashboard", "label": "Dashboard", "path": "dashboard"})
-            items.append({"key": "goals", "label": "Goals", "path": "goals"})
+            if feature_access["goals_tracking"]["allowed"]:
+                items.append({"key": "goals", "label": "Goals", "path": "goals"})
         if "alerts.read" in permissions or "tasks.read" in permissions or "*" in permissions:
             items.append({"key": "alerts_tasks", "label": "Alerts / Tasks", "path": "alerts-tasks"})
         if _is_manager_role(runtime.role_code):
             items.append({"key": "members", "label": "Members", "path": "members"})
-        if "integrations.manage" in permissions or "*" in permissions:
+        if ("integrations.manage" in permissions or "*" in permissions) and feature_access["integrations_setup"]["allowed"]:
             items.append({"key": "integrations", "label": "Integrations", "path": "integrations"})
-        if {"integrations.manage", "rules.manage", "tasks.read", "alerts.read"}.issubset(permissions) or "*" in permissions:
+        if ({"integrations.manage", "rules.manage", "tasks.read", "alerts.read"}.issubset(permissions) or "*" in permissions) and feature_access["ops_console"]["allowed"]:
             items.append({"key": "ops_sync", "label": "Ops / Sync", "path": "ops-sync"})
         if _is_manager_role(runtime.role_code):
             items.append({"key": "settings", "label": "Settings", "path": "settings"})
@@ -462,6 +466,7 @@ def create_app() -> FastAPI:
     ) -> dict[str, object]:
         actor_email = runtime.actor_user.email
         account_settings = _account_product_config(runtime.account)
+        feature_access = _feature_access_map(runtime.account)
         return {
             "runtime": runtime,
             "page": page,
@@ -476,6 +481,8 @@ def create_app() -> FastAPI:
             "can_manage_users_global": _actor_can_manage_accounts(session, actor_email),
             "can_view_portfolio": _actor_can_view_portfolio(session, actor_email),
             "can_view_platform": _actor_can_manage_accounts(session, actor_email),
+            "can_view_super_admin": _actor_can_manage_accounts(session, actor_email),
+            "feature_access": feature_access,
             "csrf_token": _ensure_session_csrf_token(request),
             "flashes": _pop_flashes(request),
             "shell_brand_title": account_settings["branding_title"] or "Hermes Admin",
@@ -888,6 +895,7 @@ def create_app() -> FastAPI:
         actor = _require_admin_user(request, session)
         runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor.email)
         _require_account_owner(runtime)
+        _ensure_account_feature(runtime, "portfolio_console", "Portfolio console")
         return runtime
 
     def _membership_rows(account: Account, session: Session) -> list[AccountUser]:
@@ -1042,6 +1050,54 @@ def create_app() -> FastAPI:
                 }
             )
         return rows
+
+    def _account_feature_access(account: Account, feature_key: str) -> dict[str, object]:
+        flags = _account_feature_flags(account)
+        plan_profiles = _plan_profiles()
+        profile = plan_profiles.get(account.plan_type, plan_profiles["internal"])
+        included = feature_key in set(profile["recommended_features"])
+        enabled = bool(flags.get(feature_key, False))
+        allowed = included and enabled and account.status == "active"
+        if account.status != "active":
+            reason = f"Feature is unavailable while account status is `{account.status}`."
+        elif not included:
+            reason = f"Feature is not included in the current `{account.plan_type}` plan."
+        elif not enabled:
+            reason = "Feature is disabled for this account."
+        else:
+            reason = None
+        return {
+            "key": feature_key,
+            "included_by_plan": included,
+            "enabled": enabled,
+            "allowed": allowed,
+            "reason": reason,
+        }
+
+    def _feature_access_map(account: Account) -> dict[str, dict[str, object]]:
+        return {item["key"]: _account_feature_access(account, item["key"]) for item in _feature_flag_definitions()}
+
+    def _ensure_account_feature(runtime: ResolvedRuntimeContext, feature_key: str, section_label: str) -> None:
+        access = _account_feature_access(runtime.account, feature_key)
+        if access["allowed"]:
+            return
+        detail = f"{section_label} is unavailable. {access['reason']}"
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=detail)
+
+    def _owner_accounts_for_portfolio(session: Session, actor_email: str) -> list[dict[str, object]]:
+        rows = _owner_accounts_with_memberships(session, actor_email)
+        return [item for item in rows if _account_feature_access(item["account"], "portfolio_console")["allowed"]]
+
+    def _account_membership_visibility(account: Account, session: Session) -> dict[str, object]:
+        active_memberships = [item for item in _membership_rows(account, session) if item.status == "active"]
+        owners = [item for item in active_memberships if item.role and item.role.code == "owner"]
+        admins = [item for item in active_memberships if item.role and item.role.code == "admin"]
+        return {
+            "owners_count": len(owners),
+            "admins_count": len(admins),
+            "owner_labels": [item.user.full_name or item.user.email for item in owners[:3] if item.user is not None],
+            "admin_labels": [item.user.full_name or item.user.email for item in admins[:3] if item.user is not None],
+        }
 
     def _account_soft_limits(account: Account) -> dict[str, int | None]:
         limits: dict[str, int | None] = {item["key"]: None for item in _soft_limit_definitions()}
@@ -1209,6 +1265,39 @@ def create_app() -> FastAPI:
                 for plan_type in _account_plan_options()
             },
         }
+
+    def _super_admin_account_rows(session: Session, actor_email: str) -> list[dict[str, object]]:
+        rows: list[dict[str, object]] = []
+        for item in _platform_account_readiness_rows(session, actor_email):
+            account = item["account"]
+            membership_visibility = _account_membership_visibility(account, session)
+            feature_rows = item["feature_rows"]
+            top_issues: list[str] = []
+            if item["readiness"]["critical_alerts_count"]:
+                top_issues.append(f"critical alerts {item['readiness']['critical_alerts_count']}")
+            if item["readiness"]["failed_sync_jobs_count"]:
+                top_issues.append(f"failed sync {item['readiness']['failed_sync_jobs_count']}")
+            if item["readiness"]["goals_at_risk_count"]:
+                top_issues.append(f"goals at risk {item['readiness']['goals_at_risk_count']}")
+            if item["readiness"]["overdue_tasks_count"]:
+                top_issues.append(f"overdue tasks {item['readiness']['overdue_tasks_count']}")
+            if not top_issues and item["readiness"]["next_steps"]:
+                top_issues.append(item["readiness"]["next_steps"][0]["label"])
+            rows.append(
+                {
+                    **item,
+                    "membership": membership_visibility,
+                    "membership_visibility": membership_visibility,
+                    "feature_access": _feature_access_map(account),
+                    "feature_summary": {
+                        "enabled": sum(1 for feature in feature_rows if feature["enabled"]),
+                        "included": sum(1 for feature in feature_rows if feature["included_by_plan"]),
+                        "disabled": sum(1 for feature in feature_rows if not feature["enabled"]),
+                    },
+                    "top_issues": top_issues[:3],
+                }
+            )
+        return rows
 
     def _default_account_users(runtime: ResolvedRuntimeContext, session: Session) -> dict[str, User | None]:
         settings_payload = _account_product_config(runtime.account)
@@ -2484,7 +2573,7 @@ def create_app() -> FastAPI:
             return _login_redirect("/admin/portfolio")
         actor_email = user.email
         _require_portfolio_owner(session, actor_email)
-        owner_rows = _owner_accounts_with_memberships(session, actor_email)
+        owner_rows = _owner_accounts_for_portfolio(session, actor_email)
         portfolio_rows = [_portfolio_account_row(session, actor_email, item["account"]) for item in owner_rows]
         portfolio_rows.sort(key=lambda item: (-int(item["risk_score"]), item["account"].name.lower()))
         portfolio = _portfolio_summary(portfolio_rows)
@@ -2502,6 +2591,7 @@ def create_app() -> FastAPI:
                 "can_manage_users_global": _actor_can_manage_accounts(session, actor_email),
                 "can_view_portfolio": True,
                 "can_view_platform": _actor_can_manage_accounts(session, actor_email),
+                "can_view_super_admin": _actor_can_manage_accounts(session, actor_email),
                 "shell_brand_title": "Hermes Admin",
                 "shell_brand_subtitle": "Cross-account owner console",
                 "portfolio_rows": portfolio_rows,
@@ -2537,6 +2627,7 @@ def create_app() -> FastAPI:
                 "can_manage_users_global": True,
                 "can_view_portfolio": _actor_can_view_portfolio(session, actor_email),
                 "can_view_platform": True,
+                "can_view_super_admin": True,
                 "shell_brand_title": "Hermes Admin",
                 "shell_brand_subtitle": "Runtime and environment visibility",
                 "runtime_visibility": _runtime_visibility(session),
@@ -2544,6 +2635,165 @@ def create_app() -> FastAPI:
                 "account_readiness_rows": account_readiness_rows,
                 "plan_profiles": _plan_profiles(),
             },
+        )
+
+    @app.get("/admin/super-admin", response_class=HTMLResponse)
+    def admin_super_admin_page(
+        request: Request,
+        selected: str | None = Query(default=None),
+        session: Session = Depends(get_db_session),
+    ) -> HTMLResponse:
+        user = _current_session_user(session, request)
+        if user is None:
+            request.session.clear()
+            return _login_redirect("/admin/super-admin")
+        actor_email = user.email
+        if not _actor_can_manage_accounts(session, actor_email):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Owner or admin access is required.")
+        account_rows = _super_admin_account_rows(session, actor_email)
+        selected_slug = selected or _session_account_slug(request) or (account_rows[0]["account"].slug if account_rows else None)
+        selected_row = next((row for row in account_rows if row["account"].slug == selected_slug), None)
+        return templates.TemplateResponse(
+            request,
+            "admin/super_admin.html",
+            {
+                "page": "super_admin",
+                "page_path": "super-admin",
+                "actor_email": actor_email,
+                "csrf_token": _ensure_session_csrf_token(request),
+                "flashes": _pop_flashes(request),
+                "can_manage_accounts_global": True,
+                "can_manage_users_global": True,
+                "can_view_portfolio": _actor_can_view_portfolio(session, actor_email),
+                "can_view_platform": True,
+                "can_view_super_admin": True,
+                "shell_brand_title": "Hermes Admin",
+                "shell_brand_subtitle": "Platform owner control surface",
+                "account_rows": account_rows,
+                "selected_row": selected_row,
+                "account_status_options": _account_status_options(),
+                "account_plan_options": _account_plan_options(),
+            },
+        )
+
+    @app.post("/admin/super-admin/accounts/{account_slug}/update")
+    async def admin_super_admin_update_account(
+        request: Request,
+        account_slug: str,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        actor = _require_admin_user(request, session)
+        actor_email = actor.email
+        if not _actor_can_manage_accounts(session, actor_email):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Owner or admin access is required.")
+        account = AccountService(session).get_by_slug(account_slug)
+        if account is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Account not found.")
+        if account.id not in _accessible_account_ids(session, actor_email):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account is not accessible.")
+        payload = await request.json()
+        next_status = str(payload.get("status") or account.status).strip()
+        next_plan_type = str(payload.get("plan_type") or account.plan_type).strip()
+        if next_status not in set(_account_status_options()):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported account status.")
+        if next_plan_type not in set(_account_plan_options()):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported plan type.")
+        incoming_flags = payload.get("feature_flags")
+        incoming_limits = payload.get("soft_limits")
+        feature_flags = _account_feature_flags(account)
+        if isinstance(incoming_flags, dict):
+            for item in _feature_flag_definitions():
+                key = item["key"]
+                if key in incoming_flags:
+                    feature_flags[key] = bool(incoming_flags[key])
+        soft_limits = _account_soft_limits(account)
+        if isinstance(incoming_limits, dict):
+            for item in _soft_limit_definitions():
+                key = item["key"]
+                if key in incoming_limits:
+                    value = incoming_limits[key]
+                    soft_limits[key] = None if value in {None, ""} else max(0, int(value))
+        before = {
+            "status": account.status,
+            "plan_type": account.plan_type,
+            "feature_flags": _account_feature_flags(account),
+            "soft_limits": _account_soft_limits(account),
+        }
+        AccountService(session).update_account(
+            account,
+            status=next_status,
+            plan_type=next_plan_type,
+            feature_flags_json=feature_flags,
+            soft_limits_json=soft_limits,
+        )
+        audit_context = TenantContext(account_id=account.id, actor_user_id=actor.id, source="super-admin", role_code="admin")
+        audit = AuditLogService(session)
+        if before["status"] != account.status:
+            audit.log(
+                audit_context,
+                "platform.account.status_changed",
+                "account",
+                str(account.id),
+                details={"before": before["status"], "after": account.status},
+            )
+        if before["plan_type"] != account.plan_type:
+            audit.log(
+                audit_context,
+                "platform.account.plan_changed",
+                "account",
+                str(account.id),
+                details={"before": before["plan_type"], "after": account.plan_type},
+            )
+        if before["feature_flags"] != feature_flags:
+            audit.log(
+                audit_context,
+                "platform.account.feature_flags_changed",
+                "account",
+                str(account.id),
+                details={"before": before["feature_flags"], "after": feature_flags},
+            )
+        if before["soft_limits"] != soft_limits:
+            audit.log(
+                audit_context,
+                "platform.account.soft_limits_changed",
+                "account",
+                str(account.id),
+                details={"before": before["soft_limits"], "after": soft_limits},
+            )
+        readiness = _account_product_readiness(
+            RuntimeContextService(session).resolve(
+                account_id=account.id,
+                account_slug=None,
+                actor_user_id=None,
+                actor_email=actor_email,
+                source="super-admin",
+                request_id=request.headers.get("x-request-id"),
+            ),
+            session,
+        )
+        return JSONResponse(
+            {
+                "account": _serialize_account(account),
+                "feature_flags": feature_flags,
+                "soft_limits": soft_limits,
+                "readiness": {
+                    "status": readiness["status"],
+                    "onboarding": _serialize_onboarding(readiness["onboarding"]),
+                    "sync_health": {
+                        "status": readiness["sync_health"]["status"],
+                        "active_count": readiness["sync_health"]["active_count"],
+                        "broken_count": readiness["sync_health"]["broken_count"],
+                        "stale_count": readiness["sync_health"]["stale_count"],
+                    },
+                    "critical_alerts_count": readiness["critical_alerts_count"],
+                    "overdue_tasks_count": readiness["overdue_tasks_count"],
+                    "goals_at_risk_count": readiness["goals_at_risk_count"],
+                    "failed_sync_jobs_count": readiness["failed_sync_jobs_count"],
+                    "usage_rows": list(readiness["usage_rows"]),
+                    "next_steps": list(readiness["next_steps"]),
+                },
+            }
         )
 
     @app.get("/admin/portfolio/brief")
@@ -2554,7 +2804,7 @@ def create_app() -> FastAPI:
         actor = _require_admin_user(request, session)
         actor_email = actor.email
         _require_portfolio_owner(session, actor_email)
-        owner_rows = _owner_accounts_with_memberships(session, actor_email)
+        owner_rows = _owner_accounts_for_portfolio(session, actor_email)
         portfolio_rows = [_portfolio_account_row(session, actor_email, item["account"]) for item in owner_rows]
         portfolio_rows.sort(key=lambda item: (-int(item["risk_score"]), item["account"].name.lower()))
         portfolio = _portfolio_summary(portfolio_rows)
@@ -2568,7 +2818,7 @@ def create_app() -> FastAPI:
         actor = _require_admin_user(request, session)
         actor_email = actor.email
         _require_portfolio_owner(session, actor_email)
-        owner_rows = _owner_accounts_with_memberships(session, actor_email)
+        owner_rows = _owner_accounts_for_portfolio(session, actor_email)
         portfolio_rows = [_portfolio_account_row(session, actor_email, item["account"]) for item in owner_rows]
         portfolio_rows.sort(key=lambda item: (-int(item["risk_score"]), item["account"].name.lower()))
         portfolio = _portfolio_summary(portfolio_rows)
@@ -2583,7 +2833,7 @@ def create_app() -> FastAPI:
         actor = _require_admin_user(request, session)
         actor_email = actor.email
         _require_portfolio_owner(session, actor_email)
-        owner_rows = _owner_accounts_with_memberships(session, actor_email)
+        owner_rows = _owner_accounts_for_portfolio(session, actor_email)
         portfolio_rows = [_portfolio_account_row(session, actor_email, item["account"]) for item in owner_rows]
         portfolio_rows.sort(key=lambda item: (-int(item["risk_score"]), item["account"].name.lower()))
         portfolio = _portfolio_summary(portfolio_rows)
@@ -2599,7 +2849,7 @@ def create_app() -> FastAPI:
         actor = _require_admin_user(request, session)
         actor_email = actor.email
         _require_portfolio_owner(session, actor_email)
-        owner_rows = _owner_accounts_with_memberships(session, actor_email)
+        owner_rows = _owner_accounts_for_portfolio(session, actor_email)
         portfolio_rows = [_portfolio_account_row(session, actor_email, item["account"]) for item in owner_rows]
         portfolio_rows.sort(key=lambda item: (-int(item["risk_score"]), item["account"].name.lower()))
         portfolio = _portfolio_summary(portfolio_rows)
@@ -2656,6 +2906,7 @@ def create_app() -> FastAPI:
                 "can_manage_users_global": True,
                 "can_view_portfolio": _actor_can_view_portfolio(session, actor_email),
                 "can_view_platform": True,
+                "can_view_super_admin": True,
                 "csrf_token": _ensure_session_csrf_token(request),
                 "flashes": _pop_flashes(request),
                 "shell_brand_title": "Hermes Admin",
@@ -2742,6 +2993,7 @@ def create_app() -> FastAPI:
                 "can_manage_users_global": True,
                 "can_view_portfolio": _actor_can_view_portfolio(session, actor_email),
                 "can_view_platform": True,
+                "can_view_super_admin": True,
                 "csrf_token": _ensure_session_csrf_token(request),
                 "flashes": _pop_flashes(request),
                 "shell_brand_title": "Hermes Admin",
@@ -2878,6 +3130,7 @@ def create_app() -> FastAPI:
         runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
         request.session["admin_account_slug"] = runtime.account.slug
         ensure_permission(runtime, "dashboard.read")
+        _ensure_account_feature(runtime, "owner_briefs", "Execution brief")
         brief = _account_brief_digest(runtime, session)
         return templates.TemplateResponse(
             request,
@@ -2899,6 +3152,7 @@ def create_app() -> FastAPI:
         actor = _require_admin_user(request, session)
         runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor.email)
         ensure_permission(runtime, "dashboard.read")
+        _ensure_account_feature(runtime, "owner_briefs", "Execution brief")
         brief = _account_brief_digest(runtime, session)
         return {
             "generated_at": brief["generated_at"],
@@ -2945,6 +3199,7 @@ def create_app() -> FastAPI:
         runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
         request.session["admin_account_slug"] = runtime.account.slug
         ensure_permission(runtime, "dashboard.read")
+        _ensure_account_feature(runtime, "owner_briefs", "Delivery pack")
         pack = _account_delivery_pack(runtime, session)
         return templates.TemplateResponse(
             request,
@@ -2965,6 +3220,7 @@ def create_app() -> FastAPI:
         actor = _require_admin_user(request, session)
         runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor.email)
         ensure_permission(runtime, "dashboard.read")
+        _ensure_account_feature(runtime, "owner_briefs", "Delivery pack")
         pack = _account_delivery_pack(runtime, session)
         return {
             "generated_at": pack["generated_at"],
@@ -3002,6 +3258,7 @@ def create_app() -> FastAPI:
         actor = _require_admin_user(request, session)
         runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor.email)
         ensure_permission(runtime, "dashboard.read")
+        _ensure_account_feature(runtime, "owner_briefs", "Delivery pack")
         pack = _account_delivery_pack(runtime, session)
         return PlainTextResponse(_account_delivery_markdown(pack), media_type="text/markdown; charset=utf-8")
 
@@ -3014,6 +3271,7 @@ def create_app() -> FastAPI:
         actor = _require_admin_user(request, session)
         runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor.email)
         ensure_permission(runtime, "dashboard.read")
+        _ensure_account_feature(runtime, "owner_briefs", "Delivery pack")
         pack = _account_delivery_pack(runtime, session)
         return PlainTextResponse(_account_delivery_text(pack), media_type="text/plain; charset=utf-8")
 
@@ -3027,6 +3285,7 @@ def create_app() -> FastAPI:
         actor = _require_admin_user(request, session)
         runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor.email)
         ensure_permission(runtime, "dashboard.read")
+        _ensure_account_feature(runtime, "owner_briefs", "Delivery pack")
         pack = _account_delivery_pack(runtime, session)
         paths = write_delivery_bundle(
             scope="accounts",
@@ -3080,6 +3339,7 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="actor_email is required.")
         runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
         ensure_permission(runtime, "dashboard.read")
+        _ensure_account_feature(runtime, "owner_briefs", "Delivery pack")
         pack = _account_delivery_pack(runtime, session)
         paths = write_delivery_bundle(
             scope="accounts",
@@ -3119,7 +3379,7 @@ def create_app() -> FastAPI:
         if not actor_email:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="actor_email is required.")
         _require_portfolio_owner(session, actor_email)
-        owner_rows = _owner_accounts_with_memberships(session, actor_email)
+        owner_rows = _owner_accounts_for_portfolio(session, actor_email)
         portfolio_rows = [_portfolio_account_row(session, actor_email, item["account"]) for item in owner_rows]
         portfolio_rows.sort(key=lambda item: (-int(item["risk_score"]), item["account"].name.lower()))
         portfolio = _portfolio_summary(portfolio_rows)
@@ -3211,6 +3471,7 @@ def create_app() -> FastAPI:
         runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
         request.session["admin_account_slug"] = runtime.account.slug
         ensure_permission(runtime, "integrations.manage")
+        _ensure_account_feature(runtime, "integrations_setup", "Integrations setup")
         service = RuntimeIntegrationService(session)
         integrations = service.list_integrations(runtime.context)
         sync_status = {
@@ -3601,6 +3862,7 @@ def create_app() -> FastAPI:
         ensure_permission(runtime, "rules.manage")
         ensure_permission(runtime, "tasks.read")
         ensure_permission(runtime, "alerts.read")
+        _ensure_account_feature(runtime, "ops_console", "Ops / Sync")
         ops = AdminQueryService(session).ops_summary(runtime.account.id)
         if sync_state:
             filtered_rows = []
@@ -3637,6 +3899,7 @@ def create_app() -> FastAPI:
         runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
         request.session["admin_account_slug"] = runtime.account.slug
         ensure_permission(runtime, "dashboard.read")
+        _ensure_account_feature(runtime, "goals_tracking", "Goals tracking")
         service = GoalService(session)
         goals = service.list_goals(runtime.context)
         goal_summaries: dict[int, dict[str, object]] = {}
@@ -3710,6 +3973,7 @@ def create_app() -> FastAPI:
         actor_email = _require_admin_user(request, session).email
         runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
         ensure_permission(runtime, "integrations.manage")
+        _ensure_account_feature(runtime, "integrations_setup", "Integrations setup")
         service = RuntimeIntegrationService(session)
         idempotency_key = f"admin-ui-sync:{integration_id}:{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')}"
         job, _ = service.enqueue_sync_job(
@@ -3854,6 +4118,7 @@ def create_app() -> FastAPI:
         next_status = str(payload.get("status") or "").strip()
         runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
         ensure_permission(runtime, "integrations.manage")
+        _ensure_account_feature(runtime, "integrations_setup", "Integrations setup")
         service = RuntimeIntegrationService(session)
         try:
             integration = service.set_integration_status(runtime.context, integration_id=integration_id, status=next_status)
@@ -3872,6 +4137,7 @@ def create_app() -> FastAPI:
         actor_email = _require_admin_user(request, session).email
         runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
         ensure_permission(runtime, "integrations.manage")
+        _ensure_account_feature(runtime, "integrations_setup", "Integrations setup")
         body = _parse_admin_payload(payload, "integration")
         credentials = _parse_admin_payload(payload, "credentials")
         replace_mode = str(payload.get("replace_mode") or "merge")
@@ -3937,6 +4203,7 @@ def create_app() -> FastAPI:
         actor_email = _require_admin_user(request, session).email
         runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
         ensure_permission(runtime, "integrations.manage")
+        _ensure_account_feature(runtime, "integrations_setup", "Integrations setup")
         credentials = _parse_admin_payload(payload, "credentials")
         try:
             result = RuntimeIntegrationService(session).test_connection(
@@ -4045,6 +4312,7 @@ def create_app() -> FastAPI:
         actor_email = _require_admin_user(request, session).email
         runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
         ensure_permission(runtime, "rules.manage")
+        _ensure_account_feature(runtime, "goals_tracking", "Goals tracking")
         body = payload.get("goal") or {}
         targets = payload.get("targets") or []
         period_kind = str(body.get("period_kind") or "month")

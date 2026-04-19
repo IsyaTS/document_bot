@@ -8,10 +8,12 @@
   <div class="chips">
     <span class="chip">Period: {{ dashboard.period.label }}</span>
     <span class="chip">Timezone: {{ dashboard.period.timezone }}</span>
-    {% if show_owner_brief %}
+    {% if show_owner_brief and feature_access.owner_briefs.allowed %}
     <a class="pill-link" href="/admin/{{ runtime.account.slug }}/brief">execution brief</a>
     {% endif %}
+    {% if feature_access.owner_briefs.allowed %}
     <a class="pill-link" href="/admin/{{ runtime.account.slug }}/delivery">delivery pack</a>
+    {% endif %}
   </div>
 </div>
 
@@ -53,7 +55,9 @@
 <section class="grid cols-2" style="margin-top: 16px;">
   <article class="card">
     <h3>Plan vs Fact</h3>
-    {% if goal_snapshots %}
+    {% if not feature_access.goals_tracking.allowed %}
+      <div class="notice">{{ feature_access.goals_tracking.reason }}</div>
+    {% elif goal_snapshots %}
       <div class="stack">
         {% for snapshot in goal_snapshots %}
         <div class="card" style="padding: 14px;">

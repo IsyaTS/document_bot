@@ -1,0 +1,180 @@
+{% extends "admin/base.html" %}
+{% block content %}
+<div class="topbar">
+  <div>
+    <h2>Super Admin</h2>
+    <p class="subtle">Platform-level account lifecycle, plan control, feature flags and soft limits.</p>
+  </div>
+  <div class="chips">
+    <span class="chip">{{ account_rows|length }} accounts</span>
+    <a class="pill-link" href="/admin/platform">platform</a>
+    <a class="pill-link" href="/admin/accounts">accounts</a>
+  </div>
+</div>
+
+<section class="grid cols-2">
+  <article class="card">
+    <h3>Account Control Matrix</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Account</th><th>Status</th><th>Plan</th><th>Readiness</th><th>Sync</th><th>Owners/Admins</th><th>Features</th><th>Pressure</th><th>Top issues</th></tr></thead>
+        <tbody>
+          {% for row in account_rows %}
+          <tr>
+            <td>
+              <strong>{{ row.account.name }}</strong>
+              <div class="status-line">{{ row.account.slug }}</div>
+              <div class="actions" style="margin-top: 8px;">
+                <a class="pill-link" href="/admin/super-admin?selected={{ row.account.slug }}">manage</a>
+                <a class="pill-link" href="/admin/switch-account/{{ row.account.slug }}?next=/admin/{{ row.account.slug }}/settings">open</a>
+              </div>
+            </td>
+            <td><span class="badge {{ 'good' if row.account.status == 'active' else 'warn' if row.account.status == 'suspended' else 'bad' }}">{{ row.account.status }}</span></td>
+            <td>{{ row.account.plan_type }}</td>
+            <td><span class="badge {{ 'good' if row.readiness.status == 'ready' else 'warn' if row.readiness.status == 'attention' else 'bad' }}">{{ row.readiness.status }}</span></td>
+            <td><span class="badge {{ 'good' if row.readiness.sync_health.status == 'healthy' else 'warn' if row.readiness.sync_health.status == 'warning' else 'bad' }}">{{ row.readiness.sync_health.status }}</span></td>
+            <td>
+              <div class="status-line">owners {{ row.membership.owners_count }} · admins {{ row.membership.admins_count }}</div>
+              <div class="status-line">{{ (row.membership.owner_labels + row.membership.admin_labels)[:2]|join(', ') or "—" }}</div>
+            </td>
+            <td>{{ row.features_enabled }}/{{ row.features_included }}</td>
+            <td><span class="badge {{ 'good' if row.usage_pressure_count == 0 else 'warn' }}">{{ row.usage_pressure_count }}</span></td>
+            <td>
+              {% for issue in row.top_issues[:2] %}
+              <div class="status-line">{{ issue }}</div>
+              {% else %}
+              <span class="status-line">No major issues</span>
+              {% endfor %}
+            </td>
+          </tr>
+          {% else %}
+          <tr><td colspan="9" class="empty">No accessible accounts for super-admin control.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </article>
+
+  <article class="card">
+    {% if selected_row %}
+    <div class="actions" style="justify-content: space-between;">
+      <div>
+        <h3>{{ selected_row.account.name }}</h3>
+        <p class="subtle">{{ selected_row.account.slug }} · plan {{ selected_row.account.plan_type }} · status {{ selected_row.account.status }}</p>
+      </div>
+      <span class="badge {{ 'good' if selected_row.readiness.status == 'ready' else 'warn' if selected_row.readiness.status == 'attention' else 'bad' }}">{{ selected_row.readiness.status }}</span>
+    </div>
+
+    <div class="notice" style="margin-top: 14px;">
+      Top issues: {{ selected_row.top_issues|join(' · ') if selected_row.top_issues else 'No urgent platform issues.' }}
+    </div>
+
+    <div class="form-grid two" style="margin-top: 14px;">
+      <label>
+        Account status
+        <select id="super-status">
+          {% for item in account_status_options %}
+          <option value="{{ item }}" {{ 'selected' if selected_row.account.status == item else '' }}>{{ item }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>
+        Plan type
+        <select id="super-plan-type">
+          {% for item in account_plan_options %}
+          <option value="{{ item }}" {{ 'selected' if selected_row.account.plan_type == item else '' }}>{{ item }}</option>
+          {% endfor %}
+        </select>
+      </label>
+    </div>
+
+    <section class="card soft-card" style="margin-top: 16px;">
+      <h4>Feature Flags</h4>
+      <div class="stack">
+        {% for item in selected_row.feature_rows %}
+        <label class="inline-toggle">
+          <input type="checkbox" class="super-feature-flag" data-feature-key="{{ item.key }}" {% if item.enabled %}checked{% endif %}>
+          <span>{{ item.label }} · {{ item.description }}</span>
+          <span class="badge {{ 'good' if item.included_by_plan else 'warn' }}">{{ 'included' if item.included_by_plan else 'outside current plan' }}</span>
+        </label>
+        {% endfor %}
+      </div>
+    </section>
+
+    <section class="card soft-card" style="margin-top: 16px;">
+      <h4>Soft Limits</h4>
+      <div class="form-grid two">
+        {% for item in selected_row.usage_rows %}
+        <label>
+          {{ item.label }}
+          <input type="number" min="0" class="super-soft-limit" data-limit-key="{{ item.key }}" value="{{ item.limit if item.limit is not none else '' }}" placeholder="unlimited">
+          <span class="status-line">Current {{ item.current }} · {{ item.description }}</span>
+        </label>
+        {% endfor %}
+      </div>
+    </section>
+
+    <section class="card soft-card" style="margin-top: 16px;">
+      <h4>Availability</h4>
+      <div class="stack">
+        {% for item in selected_row.feature_access.values() %}
+        <div class="inline-card">
+          <div class="actions" style="justify-content: space-between;">
+            <strong>{{ item.key }}</strong>
+            <span class="badge {{ 'good' if item.allowed else 'bad' }}">{{ 'available' if item.allowed else 'blocked' }}</span>
+          </div>
+          <div class="status-line">{{ item.reason or 'Enabled and available for this account.' }}</div>
+        </div>
+        {% endfor %}
+      </div>
+    </section>
+
+    <div class="actions" style="margin-top: 16px;">
+      <button type="button" id="super-admin-save">Apply changes</button>
+      <a class="pill-link" href="/admin/switch-account/{{ selected_row.account.slug }}?next=/admin/{{ selected_row.account.slug }}/settings">open account settings</a>
+      <span class="subtle" id="super-admin-status"></span>
+    </div>
+    {% else %}
+    <h3>Select Account</h3>
+    <p class="empty">Choose an account from the left table to manage lifecycle, plan and feature availability.</p>
+    {% endif %}
+  </article>
+</section>
+
+{% if selected_row %}
+<script>
+  document.getElementById("super-admin-save").addEventListener("click", async () => {
+    const payload = {
+      status: document.getElementById("super-status").value,
+      plan_type: document.getElementById("super-plan-type").value,
+      feature_flags: {},
+      soft_limits: {},
+    };
+    for (const input of document.querySelectorAll(".super-feature-flag")) {
+      payload.feature_flags[input.dataset.featureKey] = input.checked;
+    }
+    for (const input of document.querySelectorAll(".super-soft-limit")) {
+      payload.soft_limits[input.dataset.limitKey] = input.value === "" ? null : Number(input.value);
+    }
+    const statusNode = document.getElementById("super-admin-status");
+    statusNode.textContent = "Applying...";
+    try {
+      const response = await adminFetch("/admin/super-admin/accounts/{{ selected_row.account.slug }}/update", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(payload),
+      });
+      if (!response.ok) {
+        throw new Error(await response.text());
+      }
+      const body = await response.json();
+      statusNode.textContent = `Saved ${body.account.slug}`;
+      window.location.reload();
+    } catch (error) {
+      statusNode.textContent = "";
+      alert(`Super-admin update failed: ${error}`);
+    }
+  });
+</script>
+{% endif %}
+{% endblock %}
