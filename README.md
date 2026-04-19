@@ -176,6 +176,7 @@ Telegram-бот продолжает жить как legacy adapter, а platform
 - stage 9.3: procurement, logistics and document workflows
 - stage 9.4: outbound delivery channels and notification transport
 - stage 9.5: payroll register, billing and document settlements workflow
+- stage 9.6: automatic messaging webhook ingestion
 - stage 7.8: productization layer
 - stage 7.9: execution brief and account actions
 - stage 8.0: delivery layer and product polish
@@ -186,6 +187,7 @@ Telegram-бот продолжает жить как legacy adapter, а platform
 - multi-tenant account/user/RBAC model
 - canonical business tables for customers, leads, lead_events, deals, campaigns, ad_metrics, stock, purchases, banking and tasks
 - communication batch import and notification dispatch outbox
+- messaging webhook ingestion for telegram and whatsapp into communication reviews
 - real notification transport for webhook plus configured delivery targets for telegram/email
 - execution check-ins and payroll payment register
 - billing document settlements and payroll register exports
@@ -492,6 +494,20 @@ Stage 9.5 adds:
   - `GET /admin/{account_slug}/payroll/periods/{payroll_period_id}/register.{txt|json}`
   - payout register export for payroll periods
 - PDF preview support for operations / billing document previews
+
+Stage 9.6 adds:
+
+- real messaging webhook ingestion:
+  - `POST /webhooks/messaging/{integration_id}`
+  - active `messaging` integrations can now ingest Telegram and WhatsApp webhook payloads
+- provider adapter hardening:
+  - Telegram webhook parsing into normalized inbound message records
+  - WhatsApp webhook parsing into normalized inbound message records
+  - optional outbound send methods for both providers
+- communication automation linkage:
+  - inbound messages are converted into `communication_reviews`
+  - critical webhook reviews can auto-create follow-up tasks
+  - integration `last_webhook_at` is updated on successful ingest
 
 Stage 8.8 adds:
 

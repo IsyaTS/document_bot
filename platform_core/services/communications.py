@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from platform_core.exceptions import PlatformCoreError, TenantContextError
 from platform_core.models import CommunicationImportBatch, CommunicationReview, Customer, Employee, Lead, Task, TaskEvent
+from platform_core.providers.contracts import InboundMessageRecord
 from platform_core.tenancy import TenantContext, require_account_id
 
 
@@ -166,6 +167,56 @@ class CommunicationService:
             "critical_count": critical_count,
             "channels": sorted({review.channel for review in reviews}),
         }
+        self.session.flush()
+        return batch, reviews
+
+    def import_inbound_messages(
+        self,
+        context: TenantContext,
+        *,
+        created_by_user_id: int | None,
+        source_kind: str,
+        batch_ref: str | None,
+        records: list[InboundMessageRecord],
+    ) -> tuple[CommunicationImportBatch, list[CommunicationReview]]:
+        payload_items: list[dict[str, Any]] = []
+        for index, record in enumerate(records, start=1):
+            metadata = dict(record.metadata or {})
+            payload_items.append(
+                {
+                    "title": str(metadata.get("title") or f"{source_kind} message #{index}"),
+                    "channel": str(metadata.get("channel") or "message"),
+                    "direction": str(metadata.get("direction") or "inbound"),
+                    "transcript_text": record.body,
+                    "response_delay_minutes": metadata.get("response_delay_minutes"),
+                    "customer_id": metadata.get("customer_id"),
+                    "lead_id": metadata.get("lead_id"),
+                    "employee_id": metadata.get("employee_id"),
+                    "metadata": {
+                        **metadata,
+                        "external_message_id": record.external_message_id,
+                        "conversation_external_id": record.conversation_external_id,
+                        "sender_external_id": record.sender_external_id,
+                        "received_at": record.received_at.isoformat(),
+                    },
+                }
+            )
+        batch, reviews = self.import_reviews(
+            context,
+            created_by_user_id=created_by_user_id,
+            source_kind=source_kind,
+            batch_ref=batch_ref,
+            payload_items=payload_items,
+        )
+        for review, record in zip(reviews, records, strict=False):
+            review.summary_json = {
+                **(review.summary_json or {}),
+                "external_message_id": record.external_message_id,
+                "conversation_external_id": record.conversation_external_id,
+                "sender_external_id": record.sender_external_id,
+                "received_at": record.received_at.isoformat(),
+                **(record.metadata or {}),
+            }
         self.session.flush()
         return batch, reviews
 

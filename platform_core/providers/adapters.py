@@ -5,6 +5,8 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Any
 
+import requests
+
 from platform_core.providers.contracts import (
     AdsCampaignRecord,
     AdsLeadRecord,
@@ -14,12 +16,14 @@ from platform_core.providers.contracts import (
     BankBalanceRecord,
     BankProvider,
     BankTransactionRecord,
+    InboundMessageRecord,
     ERPProductRecord,
     ERPPurchaseRecord,
     ERPProvider,
     ERPStockMovementRecord,
     ERPStockRecord,
     MessagingProvider,
+    MessageSendResult,
     SpreadsheetProvider,
     SyncCursor,
 )
@@ -869,26 +873,135 @@ class TelegramMessagingProviderAdapter(MessagingProvider):
     provider_name = "telegram"
 
     def send(self, credentials: dict[str, object], request):
-        raise NotImplementedError("TelegramMessagingProviderAdapter is not implemented in this stage.")
+        bot_token = str(credentials.get("bot_token") or "")
+        if not bot_token:
+            raise ValueError("Telegram credentials require bot_token.")
+        response = requests.post(
+            f"https://api.telegram.org/bot{bot_token}/sendMessage",
+            json={"chat_id": request.recipient_external_id, "text": request.body},
+            timeout=int(credentials.get("timeout_seconds", 15)),
+        )
+        response.raise_for_status()
+        payload = response.json()
+        result = payload.get("result") or {}
+        return MessageSendResult(
+            provider_message_id=str(result.get("message_id") or payload.get("ok") or "telegram-message"),
+            sent_at=datetime.now(timezone.utc),
+            status="sent",
+            metadata={"telegram_response": payload},
+        )
 
     def receive_webhook(self, headers: dict[str, str], body: bytes):
-        raise NotImplementedError("TelegramMessagingProviderAdapter is not implemented in this stage.")
+        del headers
+        payload = json.loads(body.decode("utf-8"))
+        items = []
+        for field_name in ("message", "edited_message", "channel_post", "edited_channel_post"):
+            message = payload.get(field_name)
+            if not isinstance(message, dict):
+                continue
+            message_id = message.get("message_id")
+            chat = message.get("chat") or {}
+            sender = message.get("from") or chat
+            body_text = str(message.get("text") or message.get("caption") or "").strip()
+            if not body_text:
+                continue
+            received_at = datetime.fromtimestamp(int(message.get("date") or datetime.now(timezone.utc).timestamp()), tz=timezone.utc)
+            items.append(
+                InboundMessageRecord(
+                    external_message_id=str(message_id or payload.get("update_id") or "telegram"),
+                    conversation_external_id=str(chat.get("id") or sender.get("id") or "telegram-chat"),
+                    sender_external_id=str(sender.get("id") or chat.get("id") or "telegram-user"),
+                    received_at=received_at,
+                    body=body_text,
+                    metadata={
+                        "channel": "message",
+                        "direction": "inbound",
+                        "provider_name": "telegram",
+                        "title": f"Telegram message from {sender.get('username') or sender.get('first_name') or sender.get('id') or 'user'}",
+                        "chat_type": chat.get("type"),
+                        "sender_username": sender.get("username"),
+                    },
+                )
+            )
+        return items
 
     def fetch_conversation_metrics(self, credentials: dict[str, object], *, date_from, date_to):
-        raise NotImplementedError("TelegramMessagingProviderAdapter is not implemented in this stage.")
+        del credentials, date_from, date_to
+        return {"provider_name": "telegram", "status": "webhook_only"}
 
 
 class WhatsAppMessagingProviderAdapter(MessagingProvider):
     provider_name = "whatsapp"
 
     def send(self, credentials: dict[str, object], request):
-        raise NotImplementedError("WhatsAppMessagingProviderAdapter is not implemented in this stage.")
+        api_token = str(credentials.get("api_token") or "")
+        phone_number_id = str(credentials.get("phone_number_id") or "")
+        if not api_token or not phone_number_id:
+            raise ValueError("WhatsApp credentials require api_token and phone_number_id.")
+        response = requests.post(
+            f"https://graph.facebook.com/v21.0/{phone_number_id}/messages",
+            headers={"Authorization": f"Bearer {api_token}"},
+            json={
+                "messaging_product": "whatsapp",
+                "to": request.recipient_external_id,
+                "type": "text",
+                "text": {"body": request.body},
+            },
+            timeout=int(credentials.get("timeout_seconds", 15)),
+        )
+        response.raise_for_status()
+        payload = response.json()
+        message_ids = payload.get("messages") or []
+        provider_message_id = str((message_ids[0] or {}).get("id") if message_ids else "whatsapp-message")
+        return MessageSendResult(
+            provider_message_id=provider_message_id,
+            sent_at=datetime.now(timezone.utc),
+            status="sent",
+            metadata={"whatsapp_response": payload},
+        )
 
     def receive_webhook(self, headers: dict[str, str], body: bytes):
-        raise NotImplementedError("WhatsAppMessagingProviderAdapter is not implemented in this stage.")
+        del headers
+        payload = json.loads(body.decode("utf-8"))
+        records: list[InboundMessageRecord] = []
+        for entry in payload.get("entry") or []:
+            for change in (entry or {}).get("changes") or []:
+                value = (change or {}).get("value") or {}
+                contacts = value.get("contacts") or []
+                contact_name = ((contacts[0] or {}).get("profile") or {}).get("name") if contacts else None
+                for message in value.get("messages") or []:
+                    message_type = message.get("type")
+                    if message_type == "text":
+                        body_text = str(((message.get("text") or {}).get("body") or "")).strip()
+                    elif message_type == "button":
+                        body_text = str(((message.get("button") or {}).get("text") or "")).strip()
+                    else:
+                        body_text = ""
+                    if not body_text:
+                        continue
+                    ts = int(message.get("timestamp") or datetime.now(timezone.utc).timestamp())
+                    records.append(
+                        InboundMessageRecord(
+                            external_message_id=str(message.get("id") or f"wa-{ts}"),
+                            conversation_external_id=str(value.get("metadata", {}).get("display_phone_number") or message.get("from") or "whatsapp-chat"),
+                            sender_external_id=str(message.get("from") or "whatsapp-user"),
+                            received_at=datetime.fromtimestamp(ts, tz=timezone.utc),
+                            body=body_text,
+                            metadata={
+                                "channel": "message",
+                                "direction": "inbound",
+                                "provider_name": "whatsapp",
+                                "title": f"WhatsApp message from {contact_name or message.get('from') or 'user'}",
+                                "contact_name": contact_name,
+                                "message_type": message_type,
+                            },
+                        )
+                    )
+        return records
 
     def fetch_conversation_metrics(self, credentials: dict[str, object], *, date_from, date_to):
-        raise NotImplementedError("WhatsAppMessagingProviderAdapter is not implemented in this stage.")
+        del credentials, date_from, date_to
+        return {"provider_name": "whatsapp", "status": "webhook_only"}
 
 
 class GoogleSheetsSpreadsheetProviderAdapter(SpreadsheetProvider):

@@ -38,6 +38,7 @@ from platform_core.models import (
     Goal,
     GoalTarget,
     InstallationRequest,
+    Integration,
     KnowledgeItem,
     Lead,
     NotificationEvent,
@@ -85,6 +86,7 @@ from platform_core.services.runtime import (
     RuntimeContextService,
     RuntimeIntegrationService,
     SchedulerService,
+    build_provider_registry,
 )
 from platform_core.settings import load_platform_settings
 from platform_core.tenancy import TenantContext
@@ -5791,6 +5793,87 @@ def create_app() -> FastAPI:
                 )
                 created_tasks += 1
         return JSONResponse({"batch": _serialize_communication_import_batch(batch), "reviews_count": len(reviews), "tasks_count": created_tasks})
+
+    @app.post("/webhooks/messaging/{integration_id}")
+    async def messaging_webhook_ingest(
+        request: Request,
+        integration_id: int,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        integration = session.execute(select(Integration).where(Integration.id == integration_id)).scalar_one_or_none()
+        if integration is None or integration.status != "active":
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Messaging integration not found.")
+        if integration.provider_kind != "messaging":
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Integration is not a messaging provider.")
+        registry = build_provider_registry()
+        adapter = registry.get(integration.provider_kind, integration.provider_name)
+        if adapter is None:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Messaging provider adapter is not available.")
+        body = await request.body()
+        try:
+            records = adapter.receive_webhook(dict(request.headers), body)  # type: ignore[attr-defined]
+        except Exception as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Webhook parsing failed: {exc}") from exc
+        context = TenantContext(
+            account_id=integration.account_id,
+            actor_user_id=None,
+            source=f"{integration.provider_name}-webhook",
+            request_id=request.headers.get("x-request-id"),
+            is_system=True,
+        )
+        integration.last_webhook_at = datetime.now(timezone.utc)
+        if integration.webhook_url is None:
+            integration.webhook_url = str(request.url)
+        batch, reviews = CommunicationService(session).import_inbound_messages(
+            context,
+            created_by_user_id=None,
+            source_kind=f"{integration.provider_name}_webhook",
+            batch_ref=f"{integration.external_ref or integration.id}:{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}",
+            records=records,
+        )
+        settings_payload = integration.settings_json if isinstance(integration.settings_json, dict) else {}
+        auto_create_tasks = bool(settings_payload.get("auto_create_tasks", True))
+        created_tasks = 0
+        if auto_create_tasks:
+            account = session.execute(select(Account).where(Account.id == integration.account_id)).scalar_one()
+            default_operator_id = None
+            if isinstance(account.settings_json, dict) and account.settings_json.get("default_operator_user_id"):
+                default_operator_id = int(account.settings_json["default_operator_user_id"])
+            for review in reviews:
+                if review.quality_status != "critical":
+                    continue
+                CommunicationService(session).create_follow_up_task(
+                    context,
+                    review_id=review.id,
+                    created_by_user_id=None,
+                    assignee_user_id=default_operator_id,
+                    assignee_employee_id=review.employee_id,
+                    due_at=None,
+                )
+                created_tasks += 1
+        AuditLogService(session).log(
+            context,
+            "communications.webhook.ingested",
+            "communication_import_batch",
+            str(batch.id),
+            details={
+                "integration_id": integration.id,
+                "provider_name": integration.provider_name,
+                "records": len(records),
+                "critical_count": batch.critical_count,
+                "auto_tasks": created_tasks,
+            },
+        )
+        return JSONResponse(
+            {
+                "integration_id": integration.id,
+                "provider_name": integration.provider_name,
+                "records_count": len(records),
+                "batch": _serialize_communication_import_batch(batch),
+                "reviews_count": len(reviews),
+                "tasks_count": created_tasks,
+            }
+        )
 
     @app.post("/admin/{account_slug}/communications/reviews/{review_id}/task")
     async def admin_create_communication_task(
