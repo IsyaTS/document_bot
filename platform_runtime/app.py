@@ -949,6 +949,34 @@ def create_app() -> FastAPI:
             {"key": "ops_console", "label": "Ops console", "description": "Ops / Sync visibility and actions."},
         ]
 
+    def _plan_profiles() -> dict[str, dict[str, object]]:
+        return {
+            "internal": {
+                "label": "Internal",
+                "summary": "Internal operator deployment with full platform surface for live business use.",
+                "recommended_features": {"portfolio_console", "owner_briefs", "goals_tracking", "integrations_setup", "ops_console"},
+                "usage_note": "Best fit for active internal operations and product validation.",
+            },
+            "pilot": {
+                "label": "Pilot",
+                "summary": "Small rollout for one operating team with core execution and onboarding flows.",
+                "recommended_features": {"owner_briefs", "goals_tracking", "integrations_setup", "ops_console"},
+                "usage_note": "Good for proving value before broad rollout.",
+            },
+            "growth": {
+                "label": "Growth",
+                "summary": "Multi-account owner workflow with portfolio visibility and delivery flows.",
+                "recommended_features": {"portfolio_console", "owner_briefs", "goals_tracking", "integrations_setup", "ops_console"},
+                "usage_note": "Designed for wider operational rollout.",
+            },
+            "enterprise": {
+                "label": "Enterprise",
+                "summary": "Highest readiness profile with all current product surfaces enabled.",
+                "recommended_features": {"portfolio_console", "owner_briefs", "goals_tracking", "integrations_setup", "ops_console"},
+                "usage_note": "Suitable for fully managed multi-account environments.",
+            },
+        }
+
     def _default_feature_flags() -> dict[str, bool]:
         return {item["key"]: True for item in _feature_flag_definitions()}
 
@@ -985,6 +1013,35 @@ def create_app() -> FastAPI:
             if key in raw:
                 flags[key] = bool(raw[key])
         return flags
+
+    def _account_feature_rows(account: Account) -> list[dict[str, object]]:
+        flags = _account_feature_flags(account)
+        plan_profiles = _plan_profiles()
+        recommended = set(plan_profiles.get(account.plan_type, plan_profiles["internal"])["recommended_features"])
+        rows: list[dict[str, object]] = []
+        for item in _feature_flag_definitions():
+            key = item["key"]
+            enabled = bool(flags.get(key))
+            included = key in recommended
+            if enabled and included:
+                status_code = "healthy"
+            elif enabled and not included:
+                status_code = "warning"
+            elif included and not enabled:
+                status_code = "critical"
+            else:
+                status_code = "warning"
+            rows.append(
+                {
+                    "key": key,
+                    "label": item["label"],
+                    "description": item["description"],
+                    "enabled": enabled,
+                    "included_by_plan": included,
+                    "status": status_code,
+                }
+            )
+        return rows
 
     def _account_soft_limits(account: Account) -> dict[str, int | None]:
         limits: dict[str, int | None] = {item["key"]: None for item in _soft_limit_definitions()}
@@ -1084,6 +1141,73 @@ def create_app() -> FastAPI:
             "failed_sync_jobs_count": len(ops["recent_failed_sync_jobs"]),
             "usage_rows": _account_usage_rows(runtime.account, session),
             "next_steps": next_steps[:6],
+        }
+
+    def _platform_account_readiness_rows(session: Session, actor_email: str) -> list[dict[str, object]]:
+        rows: list[dict[str, object]] = []
+        account_rows = _accessible_accounts_with_memberships(session, actor_email)
+        for item in account_rows:
+            account = item["account"]
+            resolved = RuntimeContextService(session).resolve(
+                account_id=account.id,
+                account_slug=None,
+                actor_user_id=None,
+                actor_email=actor_email,
+                source="admin-platform",
+                request_id=None,
+            )
+            readiness = _account_product_readiness(resolved, session)
+            feature_rows = _account_feature_rows(account)
+            usage_rows = _account_usage_rows(account, session)
+            rows.append(
+                {
+                    "account": account,
+                    "role": item["role"],
+                    "readiness": readiness,
+                    "features_enabled": sum(1 for feature in feature_rows if feature["enabled"]),
+                    "features_included": sum(1 for feature in feature_rows if feature["included_by_plan"]),
+                    "feature_rows": feature_rows,
+                    "usage_rows": usage_rows,
+                    "usage_pressure_count": sum(1 for usage in usage_rows if usage["status"] != "healthy"),
+                }
+            )
+        rows.sort(
+            key=lambda item: (
+                -_status_weight(item["readiness"]["status"]),
+                -int(item["readiness"]["critical_alerts_count"] + item["readiness"]["goals_at_risk_count"] + item["readiness"]["failed_sync_jobs_count"]),
+                item["account"].name.lower(),
+            )
+        )
+        return rows
+
+    def _platform_health_summary(session: Session, actor_email: str) -> dict[str, object]:
+        runtime_visibility = _runtime_visibility(session)
+        account_rows = _platform_account_readiness_rows(session, actor_email)
+        accounts_requiring_attention = [
+            item for item in account_rows
+            if item["readiness"]["status"] != "ready"
+            or item["usage_pressure_count"] > 0
+        ]
+        if runtime_visibility["database_status"] != "ok" or runtime_visibility["worker_health"] == "critical":
+            status_code = "critical"
+        elif runtime_visibility["warnings"] or accounts_requiring_attention:
+            status_code = "warning"
+        else:
+            status_code = "healthy"
+        return {
+            "status": status_code,
+            "accessible_accounts": len(account_rows),
+            "accounts_requiring_attention": len(accounts_requiring_attention),
+            "healthy_accounts": sum(1 for item in account_rows if item["readiness"]["status"] == "ready" and item["usage_pressure_count"] == 0),
+            "runtime_warnings_count": len(runtime_visibility["warnings"]),
+            "delivery_recorded": runtime_visibility["delivery_status"] is not None,
+            "database_status": runtime_visibility["database_status"],
+            "worker_health": runtime_visibility["worker_health"],
+            "top_attention_accounts": accounts_requiring_attention[:5],
+            "plan_mix": {
+                plan_type: sum(1 for item in account_rows if item["account"].plan_type == plan_type)
+                for plan_type in _account_plan_options()
+            },
         }
 
     def _default_account_users(runtime: ResolvedRuntimeContext, session: Session) -> dict[str, User | None]:
@@ -2399,6 +2523,7 @@ def create_app() -> FastAPI:
         actor_email = user.email
         if not _actor_can_manage_accounts(session, actor_email):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Owner or admin access is required.")
+        account_readiness_rows = _platform_account_readiness_rows(session, actor_email)
         return templates.TemplateResponse(
             request,
             "admin/platform.html",
@@ -2415,6 +2540,9 @@ def create_app() -> FastAPI:
                 "shell_brand_title": "Hermes Admin",
                 "shell_brand_subtitle": "Runtime and environment visibility",
                 "runtime_visibility": _runtime_visibility(session),
+                "platform_health": _platform_health_summary(session, actor_email),
+                "account_readiness_rows": account_readiness_rows,
+                "plan_profiles": _plan_profiles(),
             },
         )
 
@@ -3165,6 +3293,8 @@ def create_app() -> FastAPI:
         _require_account_manager(runtime)
         active_memberships = [item for item in _membership_rows(runtime.account, session) if item.status == "active"]
         account_settings = _account_product_config(runtime.account)
+        feature_rows = _account_feature_rows(runtime.account)
+        plan_profiles = _plan_profiles()
         return templates.TemplateResponse(
             request,
             "admin/settings.html",
@@ -3172,6 +3302,7 @@ def create_app() -> FastAPI:
                 **_admin_context(request, session, runtime, page="settings"),
                 "account_settings": account_settings,
                 "feature_flags": _account_feature_flags(runtime.account),
+                "feature_rows": feature_rows,
                 "feature_definitions": _feature_flag_definitions(),
                 "soft_limit_rows": _account_usage_rows(runtime.account, session),
                 "soft_limit_definitions": _soft_limit_definitions(),
@@ -3179,6 +3310,7 @@ def create_app() -> FastAPI:
                 "active_memberships": active_memberships,
                 "account_status_options": _account_status_options(),
                 "account_plan_options": _account_plan_options(),
+                "current_plan_profile": plan_profiles.get(runtime.account.plan_type, plan_profiles["internal"]),
             },
         )
 

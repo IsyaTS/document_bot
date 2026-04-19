@@ -201,4 +201,86 @@
     </div>
   </article>
 </section>
+
+<section class="grid cols-2" style="margin-top: 16px;">
+  <article class="card">
+    <h3>Current Plan Visibility</h3>
+    <div class="stack">
+      <div class="inline-card">
+        <div class="actions" style="justify-content: space-between;">
+          <strong>{{ current_plan_profile.label }}</strong>
+          <span class="badge">{{ runtime.account.plan_type }}</span>
+        </div>
+        <div class="status-line">{{ current_plan_profile.summary }}</div>
+        <div class="status-line">{{ current_plan_profile.usage_note }}</div>
+      </div>
+      <div class="inline-card">
+        <strong>What is available now</strong>
+        <div class="stack" style="gap: 8px;">
+          {% for item in feature_rows %}
+          {% if item.included_by_plan %}
+          <div class="actions" style="justify-content: space-between;">
+            <span>{{ item.label }}</span>
+            <span class="badge {{ 'good' if item.enabled else 'bad' }}">{{ 'enabled' if item.enabled else 'not enabled' }}</span>
+          </div>
+          {% endif %}
+          {% endfor %}
+        </div>
+      </div>
+      <div class="inline-card">
+        <strong>Not included or not enabled</strong>
+        <div class="stack" style="gap: 8px;">
+          {% for item in feature_rows %}
+          {% if not item.included_by_plan or not item.enabled %}
+          <div class="actions" style="justify-content: space-between;">
+            <span>{{ item.label }}</span>
+            <span class="badge {{ 'warn' if item.enabled else 'bad' }}">{{ 'outside current plan' if not item.included_by_plan else 'disabled' }}</span>
+          </div>
+          {% endif %}
+          {% endfor %}
+        </div>
+      </div>
+    </div>
+  </article>
+
+  <article class="card">
+    <h3>Usage And Readiness Signals</h3>
+    <div class="stack">
+      <div class="inline-card">
+        <strong>Current account limits</strong>
+        <div class="stack" style="gap: 8px;">
+          {% for item in soft_limit_rows %}
+          <div class="actions" style="justify-content: space-between;">
+            <span>{{ item.label }}</span>
+            <span class="badge {{ 'good' if item.status == 'healthy' else 'warn' if item.status == 'warning' else 'bad' }}">
+              {{ item.current }} / {{ item.limit if item.limit is not none else "∞" }}
+            </span>
+          </div>
+          {% endfor %}
+        </div>
+      </div>
+      <div class="inline-card">
+        <strong>Product readiness signals</strong>
+        <div class="chips">
+          <span class="chip">status {{ readiness.status }}</span>
+          <span class="chip">sync {{ readiness.sync_health.status }}</span>
+          <span class="chip">critical alerts {{ readiness.critical_alerts_count }}</span>
+          <span class="chip">goals at risk {{ readiness.goals_at_risk_count }}</span>
+          <span class="chip">failed sync {{ readiness.failed_sync_jobs_count }}</span>
+        </div>
+      </div>
+      <div class="inline-card">
+        <strong>Next product steps</strong>
+        <div class="stack" style="gap: 8px;">
+          {% for item in readiness.next_steps %}
+          <div class="actions" style="justify-content: space-between;">
+            <span>{{ item.label }}</span>
+            <a class="pill-link" href="{{ item.href }}">open</a>
+          </div>
+          {% endfor %}
+        </div>
+      </div>
+    </div>
+  </article>
+</section>
 {% endblock %}

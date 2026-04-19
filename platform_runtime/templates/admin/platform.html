@@ -14,10 +14,67 @@
 </div>
 
 <section class="grid cols-4">
+  <article class="card metric"><span class="subtle">Platform health</span><span class="value">{{ platform_health.status }}</span></article>
   <article class="card metric"><span class="subtle">DB status</span><span class="value">{{ runtime_visibility.database_status }}</span></article>
-  <article class="card metric"><span class="subtle">Revision</span><span class="value">{{ runtime_visibility.current_revision or "—" }}</span></article>
   <article class="card metric"><span class="subtle">Worker</span><span class="value">{{ runtime_visibility.worker_health }}</span></article>
-  <article class="card metric"><span class="subtle">Runtime leases</span><span class="value">{{ runtime_visibility.runtime_leases|length }}</span></article>
+  <article class="card metric"><span class="subtle">Accounts needing attention</span><span class="value">{{ platform_health.accounts_requiring_attention }}</span></article>
+</section>
+
+<section class="grid cols-2" style="margin-top: 16px;">
+  <article class="card">
+    <h3>Platform Health Summary</h3>
+    <div class="stack">
+      <div class="inline-card">
+        <div class="actions" style="justify-content: space-between;">
+          <strong>Current health</strong>
+          <span class="badge {{ 'good' if platform_health.status == 'healthy' else 'warn' if platform_health.status == 'warning' else 'bad' }}">{{ platform_health.status }}</span>
+        </div>
+        <div class="chips">
+          <span class="chip">accessible accounts {{ platform_health.accessible_accounts }}</span>
+          <span class="chip">healthy {{ platform_health.healthy_accounts }}</span>
+          <span class="chip">runtime warnings {{ platform_health.runtime_warnings_count }}</span>
+          <span class="chip">delivery recorded {{ 'yes' if platform_health.delivery_recorded else 'no' }}</span>
+        </div>
+      </div>
+      <div class="inline-card">
+        <strong>Plan mix</strong>
+        <div class="chips">
+          {% for plan_type, count in platform_health.plan_mix.items() %}
+          <span class="chip">{{ plan_type }} {{ count }}</span>
+          {% endfor %}
+        </div>
+      </div>
+      <div class="inline-card">
+        <strong>Top attention accounts</strong>
+        <div class="stack" style="gap: 8px;">
+          {% for row in platform_health.top_attention_accounts %}
+          <div class="actions" style="justify-content: space-between;">
+            <span>{{ row.account.name }} · {{ row.account.plan_type }}</span>
+            <a class="pill-link" href="/admin/switch-account/{{ row.account.slug }}?next=/admin/{{ row.account.slug }}/settings">open</a>
+          </div>
+          {% else %}
+          <p class="empty">No platform-level attention accounts right now.</p>
+          {% endfor %}
+        </div>
+      </div>
+    </div>
+  </article>
+
+  <article class="card">
+    <h3>Commercial Readiness</h3>
+    <div class="stack">
+      {% for plan_type, profile in plan_profiles.items() %}
+      <div class="inline-card">
+        <div class="actions" style="justify-content: space-between;">
+          <strong>{{ profile.label }}</strong>
+          <span class="badge">{{ plan_type }}</span>
+        </div>
+        <div class="status-line">{{ profile.summary }}</div>
+        <div class="status-line">{{ profile.usage_note }}</div>
+      </div>
+      {% endfor %}
+    </div>
+  </article>
 </section>
 
 <section class="grid cols-2" style="margin-top: 16px;">
@@ -31,6 +88,10 @@
       <div class="inline-card">
         <strong>Runtime environment</strong>
         <div class="status-line">{{ runtime_visibility.environment }}</div>
+      </div>
+      <div class="inline-card">
+        <strong>Migration revision</strong>
+        <div class="status-line">{{ runtime_visibility.current_revision or "—" }}</div>
       </div>
       <div class="inline-card">
         <strong>Database</strong>
@@ -123,5 +184,39 @@
       </table>
     </div>
   </article>
+</section>
+
+<section class="card" style="margin-top: 16px;">
+  <h3>Account Readiness Overview</h3>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Account</th><th>Role</th><th>Status</th><th>Plan</th><th>Readiness</th><th>Features</th><th>Usage pressure</th><th>Next step</th><th></th></tr></thead>
+      <tbody>
+        {% for row in account_readiness_rows %}
+        <tr>
+          <td>
+            <strong>{{ row.account.name }}</strong>
+            <div class="status-line">{{ row.account.slug }}</div>
+          </td>
+          <td>{{ row.role.code }}</td>
+          <td><span class="badge">{{ row.account.status }}</span></td>
+          <td>{{ row.account.plan_type }}</td>
+          <td><span class="badge {{ 'good' if row.readiness.status == 'ready' else 'warn' if row.readiness.status == 'attention' else 'bad' }}">{{ row.readiness.status }}</span></td>
+          <td>{{ row.features_enabled }}/{{ row.features_included }}</td>
+          <td><span class="badge {{ 'good' if row.usage_pressure_count == 0 else 'warn' }}">{{ row.usage_pressure_count }}</span></td>
+          <td>{{ row.readiness.next_steps[0].label if row.readiness.next_steps else "—" }}</td>
+          <td>
+            <div class="actions">
+              <a class="pill-link" href="/admin/switch-account/{{ row.account.slug }}?next=/admin/{{ row.account.slug }}/settings">settings</a>
+              <a class="pill-link" href="/admin/switch-account/{{ row.account.slug }}?next=/admin/{{ row.account.slug }}/delivery">delivery</a>
+            </div>
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="9" class="empty">No accessible accounts to summarize.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
 </section>
 {% endblock %}
