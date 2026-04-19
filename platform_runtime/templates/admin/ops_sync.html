@@ -5,6 +5,9 @@
     <h2>Ops / Sync</h2>
     <p class="subtle">Operational visibility layer: failed sync jobs, failed rule runs, overdue tasks и integration sync health.</p>
   </div>
+  <div class="chips">
+    <a class="pill-link" href="/admin/{{ runtime.account.slug }}/brief">execution brief</a>
+  </div>
 </div>
 
 <form class="card filters" method="get">
@@ -77,7 +80,7 @@
   <h3>Integration Sync Health</h3>
   <div class="table-wrap">
     <table>
-      <thead><tr><th>Integration</th><th>Provider</th><th>Last sync</th><th>Latest success</th><th>Latest failure</th></tr></thead>
+      <thead><tr><th>Integration</th><th>Provider</th><th>Last sync</th><th>Latest success</th><th>Latest failure</th><th></th></tr></thead>
       <tbody>
         {% for item in ops.integration_sync_status %}
         <tr>
@@ -86,10 +89,34 @@
           <td>{{ item.integration.last_sync_at or "—" }}</td>
           <td>{{ item.latest_success.finished_at if item.latest_success else "—" }}</td>
           <td>{{ human_sync_error(item.latest_failure) if item.latest_failure else "—" }}</td>
+          <td>
+            {% if item.integration.status != 'archived' %}
+            <button type="button" class="secondary run-sync" data-integration-id="{{ item.integration.id }}">run sync</button>
+            {% endif %}
+          </td>
         </tr>
+        {% else %}
+        <tr><td colspan="6" class="empty">No integrations visible for this filter.</td></tr>
         {% endfor %}
       </tbody>
     </table>
   </div>
 </section>
+
+<script>
+  for (const button of document.querySelectorAll(".run-sync")) {
+    button.addEventListener("click", async () => {
+      const response = await adminFetch(`/admin/{{ runtime.account.slug }}/integrations/${button.dataset.integrationId}/sync`, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({}),
+      });
+      if (!response.ok) {
+        alert(`Sync failed: ${await response.text()}`);
+        return;
+      }
+      window.location.reload();
+    });
+  }
+</script>
 {% endblock %}

@@ -224,6 +224,7 @@ def create_app() -> FastAPI:
             "platform": "platform",
             "accounts": "accounts",
             "users": "users",
+            "brief": "brief",
             "dashboard": "dashboard",
             "integrations": "integrations",
             "alerts_tasks": "alerts-tasks",
@@ -364,6 +365,7 @@ def create_app() -> FastAPI:
         permissions = runtime.permissions
         items: list[dict[str, str]] = []
         if "dashboard.read" in permissions or "*" in permissions:
+            items.append({"key": "brief", "label": "Brief", "path": "brief"})
             items.append({"key": "dashboard", "label": "Dashboard", "path": "dashboard"})
             items.append({"key": "goals", "label": "Goals", "path": "goals"})
         if "alerts.read" in permissions or "tasks.read" in permissions or "*" in permissions:
@@ -988,6 +990,116 @@ def create_app() -> FastAPI:
             "failed_sync_jobs_count": len(ops["recent_failed_sync_jobs"]),
             "usage_rows": _account_usage_rows(runtime.account, session),
             "next_steps": next_steps[:6],
+        }
+
+    def _default_account_users(runtime: ResolvedRuntimeContext, session: Session) -> dict[str, User | None]:
+        settings_payload = _account_product_config(runtime.account)
+        active_memberships = [item for item in _membership_rows(runtime.account, session) if item.status == "active"]
+        user_by_id = {item.user.id: item.user for item in active_memberships if item.user is not None}
+
+        def _first_by_roles(*role_codes: str) -> User | None:
+            for role_code in role_codes:
+                for membership in active_memberships:
+                    if membership.role is not None and membership.role.code == role_code and membership.user is not None:
+                        return membership.user
+            return None
+
+        owner_user = user_by_id.get(settings_payload.get("default_owner_user_id")) if settings_payload.get("default_owner_user_id") else None
+        if owner_user is None:
+            owner_user = _first_by_roles("owner", "admin", "operator")
+        operator_user = user_by_id.get(settings_payload.get("default_operator_user_id")) if settings_payload.get("default_operator_user_id") else None
+        if operator_user is None:
+            operator_user = _first_by_roles("operator", "admin", "owner")
+        return {
+            "owner": owner_user or runtime.actor_user,
+            "operator": operator_user or owner_user or runtime.actor_user,
+        }
+
+    def _account_brief_digest(runtime: ResolvedRuntimeContext, session: Session) -> dict[str, object]:
+        dashboard = ExecutiveDashboardService(session).get_dashboard(runtime.context, "today")
+        widgets = {item["widget_key"]: item["payload"] for item in dashboard["widgets"]}
+        automation = RuntimeAutomationService(session)
+        open_alerts = [item for item in automation.list_alerts(runtime.context) if item.status == "open"]
+        open_tasks = [item for item in automation.list_tasks(runtime.context) if item.status == "open"]
+        critical_alerts = [item for item in open_alerts if item.severity == "critical"]
+        overdue_tasks = [
+            item for item in open_tasks
+            if item.due_at is not None and item.due_at <= datetime.now(timezone.utc)
+        ]
+        goal_snapshots = [
+            _enrich_goal_snapshot(
+                account_slug=runtime.account.slug,
+                actor_email=runtime.actor_user.email,
+                snapshot=item,
+                open_alerts=open_alerts,
+                open_tasks=open_tasks,
+                top_problems=widgets.get("owner_panel", {}).get("top_problems", []),
+                attention_zones=widgets.get("owner_panel", {}).get("attention_zones", []),
+            )
+            for item in GoalService(session).get_dashboard_goal_snapshot(runtime.context)
+        ]
+        goals_at_risk = [item for item in goal_snapshots if item["summary"]["status"] != "on_track"]
+        ops = AdminQueryService(session).ops_summary(runtime.account.id)
+        defaults = _default_account_users(runtime, session)
+        must_do_now: list[dict[str, object]] = []
+        for alert in critical_alerts[:4]:
+            must_do_now.append(
+                {
+                    "type": "alert",
+                    "status": alert.severity,
+                    "title": alert.title,
+                    "context": alert.code,
+                    "href": f"/admin/{runtime.account.slug}/alerts-tasks?severity=critical",
+                }
+            )
+        for task in overdue_tasks[:4]:
+            must_do_now.append(
+                {
+                    "type": "task",
+                    "status": task.priority,
+                    "title": task.title,
+                    "context": f"due {task.due_at}",
+                    "href": f"/admin/{runtime.account.slug}/alerts-tasks?overdue=1",
+                }
+            )
+        for row in ops["integration_sync_status"]:
+            state = _portfolio_sync_health([row])
+            if state["status"] == "critical":
+                must_do_now.append(
+                    {
+                        "type": "sync",
+                        "status": "critical",
+                        "title": row["integration"].external_ref or row["integration"].display_name,
+                        "context": _human_sync_error(row["latest_failure"]) or "Broken sync",
+                        "href": f"/admin/{runtime.account.slug}/ops-sync?sync_state=critical",
+                    }
+                )
+        for snapshot in goals_at_risk[:4]:
+            if snapshot["blockers"]:
+                blocker = snapshot["blockers"][0]
+                must_do_now.append(
+                    {
+                        "type": "goal",
+                        "status": snapshot["summary"]["status"],
+                        "title": snapshot["goal"].title,
+                        "context": f"{blocker['metric']['label']} · delta {blocker['metric']['delta']}",
+                        "href": f"/admin/{runtime.account.slug}/goals?goal_id={snapshot['goal'].id}",
+                    }
+                )
+        must_do_now.sort(key=lambda item: -_status_weight(str(item.get("status") or "")))
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "defaults": defaults,
+            "dashboard": dashboard,
+            "widgets": widgets,
+            "critical_alerts": critical_alerts[:8],
+            "overdue_tasks": overdue_tasks[:8],
+            "failed_sync_jobs": list(ops["recent_failed_sync_jobs"])[:8],
+            "goals_at_risk": goals_at_risk[:8],
+            "must_do_now": must_do_now[:10],
+            "sync_health": _portfolio_sync_health(ops["integration_sync_status"]),
+            "top_problems": widgets.get("owner_panel", {}).get("top_problems", []),
+            "attention_zones": widgets.get("owner_panel", {}).get("attention_zones", []),
         }
 
     def _runtime_visibility(session: Session) -> dict[str, object]:
@@ -2289,6 +2401,73 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
         return JSONResponse({"user": _serialize_user(user)})
 
+    @app.get("/admin/{account_slug}/brief", response_class=HTMLResponse)
+    def admin_brief(
+        request: Request,
+        account_slug: str,
+        session: Session = Depends(get_db_session),
+    ) -> HTMLResponse:
+        user = _current_session_user(session, request)
+        if user is None:
+            request.session.clear()
+            return _login_redirect(f"/admin/{account_slug}/brief")
+        actor_email = user.email
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
+        request.session["admin_account_slug"] = runtime.account.slug
+        ensure_permission(runtime, "dashboard.read")
+        brief = _account_brief_digest(runtime, session)
+        return templates.TemplateResponse(
+            request,
+            "admin/brief.html",
+            {
+                **_admin_context(request, session, runtime, page="brief"),
+                "brief": brief,
+                "human_sync_error": _human_sync_error,
+                "can_assign_defaults": _is_manager_role(runtime.role_code),
+            },
+        )
+
+    @app.get("/admin/{account_slug}/brief.json")
+    def admin_brief_json(
+        request: Request,
+        account_slug: str,
+        session: Session = Depends(get_db_session),
+    ) -> dict[str, object]:
+        actor = _require_admin_user(request, session)
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor.email)
+        ensure_permission(runtime, "dashboard.read")
+        brief = _account_brief_digest(runtime, session)
+        return {
+            "generated_at": brief["generated_at"],
+            "account": _serialize_account(runtime.account),
+            "defaults": {
+                "owner": _serialize_user(brief["defaults"]["owner"]) if brief["defaults"]["owner"] is not None else None,
+                "operator": _serialize_user(brief["defaults"]["operator"]) if brief["defaults"]["operator"] is not None else None,
+            },
+            "critical_alerts": [_serialize_alert(item) for item in brief["critical_alerts"]],
+            "overdue_tasks": [_serialize_task(item) for item in brief["overdue_tasks"]],
+            "failed_sync_jobs": [_serialize_sync_job(item) for item in brief["failed_sync_jobs"]],
+            "goals_at_risk": [
+                {
+                    "goal": _serialize_goal(item["goal"], summary=item["summary"]),
+                    "blockers": [
+                        {
+                            "metric": blocker["metric"],
+                            "alert_codes": blocker["alert_codes"],
+                            "related_alerts": [_serialize_alert(alert) for alert in blocker["related_alerts"]],
+                            "related_tasks": [_serialize_task(task) for task in blocker["related_tasks"]],
+                            "related_problems": blocker["related_problems"],
+                            "attention_actions": blocker["attention_actions"],
+                            "links": blocker["links"],
+                        }
+                        for blocker in item["blockers"]
+                    ],
+                }
+                for item in brief["goals_at_risk"]
+            ],
+            "must_do_now": brief["must_do_now"],
+        }
+
     @app.get("/admin/{account_slug}/dashboard", response_class=HTMLResponse)
     def admin_dashboard(
         request: Request,
@@ -2306,6 +2485,7 @@ def create_app() -> FastAPI:
         dashboard = ExecutiveDashboardService(session).get_dashboard(runtime.context, "today")
         widgets = {item["widget_key"]: item["payload"] for item in dashboard["widgets"]}
         goals = GoalService(session).get_dashboard_goal_snapshot(runtime.context)
+        account_settings = _account_product_config(runtime.account)
         automation = RuntimeAutomationService(session)
         alerts = [
             item for item in RuntimeAutomationService(session).list_alerts(runtime.context)
@@ -2338,6 +2518,7 @@ def create_app() -> FastAPI:
                 "critical_alerts": alerts,
                 "overdue_tasks": overdue_tasks,
                 "readiness": readiness,
+                "show_owner_brief": bool(account_settings.get("show_owner_brief", True)),
             },
         )
 
@@ -2567,8 +2748,163 @@ def create_app() -> FastAPI:
                 "users": users,
                 "employees": employees,
                 "alert_slas": _alert_sla_map(),
+                "default_users": _default_account_users(runtime, session),
+                "can_assign_defaults": _is_manager_role(runtime.role_code),
             },
         )
+
+    @app.post("/admin/{account_slug}/alerts/{alert_id}/status")
+    async def admin_alert_status(
+        request: Request,
+        account_slug: str,
+        alert_id: int,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        payload = await request.json()
+        actor_email = _require_admin_user(request, session).email
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
+        ensure_permission(runtime, "alerts.read")
+        next_status = str(payload.get("status") or "").strip()
+        note = str(payload.get("note") or "").strip() or None
+        if next_status not in {"open", "acknowledged", "dismissed"}:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported alert status.")
+        alert = session.execute(
+            select(Alert).where(Alert.account_id == runtime.account.id, Alert.id == alert_id)
+        ).scalar_one_or_none()
+        if alert is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Alert not found.")
+        alert.status = next_status
+        AuditLogService(session).log(
+            runtime.context,
+            "account.alert.status",
+            "alert",
+            str(alert.id),
+            details={"status": next_status, "note": note, "source": "alerts-tasks"},
+        )
+        session.flush()
+        return JSONResponse({"alert": _serialize_alert(alert)})
+
+    @app.post("/admin/{account_slug}/alerts/{alert_id}/assign-default")
+    async def admin_alert_assign_default(
+        request: Request,
+        account_slug: str,
+        alert_id: int,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        payload = await request.json()
+        actor_email = _require_admin_user(request, session).email
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
+        _require_account_manager(runtime)
+        ensure_permission(runtime, "alerts.read")
+        assignee_kind = str(payload.get("assignee_kind") or "operator").strip()
+        defaults = _default_account_users(runtime, session)
+        assigned_user = defaults["owner"] if assignee_kind == "owner" else defaults["operator"]
+        if assigned_user is None:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Default assignee is not configured.")
+        alert = session.execute(
+            select(Alert).where(Alert.account_id == runtime.account.id, Alert.id == alert_id)
+        ).scalar_one_or_none()
+        if alert is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Alert not found.")
+        alert.assigned_user_id = assigned_user.id
+        AuditLogService(session).log(
+            runtime.context,
+            "account.alert.assign_default",
+            "alert",
+            str(alert.id),
+            details={"assigned_user_id": assigned_user.id, "assignee_kind": assignee_kind, "source": "alerts-tasks"},
+        )
+        session.flush()
+        return JSONResponse({"alert": _serialize_alert(alert), "assigned_user": _serialize_user(assigned_user)})
+
+    @app.post("/admin/{account_slug}/tasks/{task_id}/status")
+    async def admin_task_status(
+        request: Request,
+        account_slug: str,
+        task_id: int,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        payload = await request.json()
+        actor_email = _require_admin_user(request, session).email
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
+        ensure_permission(runtime, "tasks.read")
+        next_status = str(payload.get("status") or "").strip()
+        note = str(payload.get("note") or "").strip() or None
+        if next_status not in {"open", "done"}:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported task status.")
+        task = session.execute(
+            select(Task).where(Task.account_id == runtime.account.id, Task.id == task_id)
+        ).scalar_one_or_none()
+        if task is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found.")
+        task.status = next_status
+        task.completed_at = datetime.now(timezone.utc) if next_status == "done" else None
+        session.add(
+            TaskEvent(
+                account_id=runtime.account.id,
+                task_id=task.id,
+                actor_user_id=runtime.actor_user.id,
+                event_type="task.updated_from_account_ui",
+                event_at=datetime.now(timezone.utc),
+                payload_json={"status": next_status, "note": note, "source": "alerts-tasks"},
+            )
+        )
+        AuditLogService(session).log(
+            runtime.context,
+            "account.task.status",
+            "task",
+            str(task.id),
+            details={"status": next_status, "note": note, "source": "alerts-tasks"},
+        )
+        session.flush()
+        return JSONResponse({"task": _serialize_task(task)})
+
+    @app.post("/admin/{account_slug}/tasks/{task_id}/assign-default")
+    async def admin_task_assign_default(
+        request: Request,
+        account_slug: str,
+        task_id: int,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        payload = await request.json()
+        actor_email = _require_admin_user(request, session).email
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
+        _require_account_manager(runtime)
+        ensure_permission(runtime, "tasks.read")
+        assignee_kind = str(payload.get("assignee_kind") or "operator").strip()
+        defaults = _default_account_users(runtime, session)
+        assigned_user = defaults["owner"] if assignee_kind == "owner" else defaults["operator"]
+        if assigned_user is None:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Default assignee is not configured.")
+        task = session.execute(
+            select(Task).where(Task.account_id == runtime.account.id, Task.id == task_id)
+        ).scalar_one_or_none()
+        if task is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found.")
+        task.assignee_user_id = assigned_user.id
+        session.add(
+            TaskEvent(
+                account_id=runtime.account.id,
+                task_id=task.id,
+                actor_user_id=runtime.actor_user.id,
+                event_type="task.assigned_default",
+                event_at=datetime.now(timezone.utc),
+                payload_json={"assigned_user_id": assigned_user.id, "assignee_kind": assignee_kind, "source": "alerts-tasks"},
+            )
+        )
+        AuditLogService(session).log(
+            runtime.context,
+            "account.task.assign_default",
+            "task",
+            str(task.id),
+            details={"assigned_user_id": assigned_user.id, "assignee_kind": assignee_kind, "source": "alerts-tasks"},
+        )
+        session.flush()
+        return JSONResponse({"task": _serialize_task(task), "assigned_user": _serialize_user(assigned_user)})
 
     @app.get("/admin/{account_slug}/ops-sync", response_class=HTMLResponse)
     def admin_ops_sync(
@@ -3177,10 +3513,14 @@ def _serialize_task(task) -> dict[str, object]:
     return {
         "id": task.id,
         "account_id": task.account_id,
+        "assignee_user_id": task.assignee_user_id,
+        "assignee_employee_id": task.assignee_employee_id,
         "title": task.title,
+        "description": task.description,
         "status": task.status,
         "priority": task.priority,
         "due_at": _serialize_datetime(task.due_at),
+        "completed_at": _serialize_datetime(task.completed_at),
         "source": task.source,
         "source_rule_id": task.source_rule_id,
         "dedupe_key": task.dedupe_key,
@@ -3194,8 +3534,10 @@ def _serialize_alert(alert) -> dict[str, object]:
     return {
         "id": alert.id,
         "account_id": alert.account_id,
+        "assigned_user_id": alert.assigned_user_id,
         "code": alert.code,
         "title": alert.title,
+        "description": alert.description,
         "severity": alert.severity,
         "status": alert.status,
         "source_rule_id": alert.source_rule_id,

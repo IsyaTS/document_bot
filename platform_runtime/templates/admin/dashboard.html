@@ -8,6 +8,9 @@
   <div class="chips">
     <span class="chip">Period: {{ dashboard.period.label }}</span>
     <span class="chip">Timezone: {{ dashboard.period.timezone }}</span>
+    {% if show_owner_brief %}
+    <a class="pill-link" href="/admin/{{ runtime.account.slug }}/brief">execution brief</a>
+    {% endif %}
   </div>
 </div>
 

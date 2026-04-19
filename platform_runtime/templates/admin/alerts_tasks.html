@@ -5,6 +5,15 @@
     <h2>Alerts / Tasks</h2>
     <p class="subtle">Active alerts, open tasks, overdue work и быстрый фильтр по severity / priority.</p>
   </div>
+  <div class="chips">
+    <a class="pill-link" href="/admin/{{ runtime.account.slug }}/brief">execution brief</a>
+    {% if default_users.owner %}
+    <span class="chip">owner {{ default_users.owner.full_name or default_users.owner.email }}</span>
+    {% endif %}
+    {% if default_users.operator %}
+    <span class="chip">operator {{ default_users.operator.full_name or default_users.operator.email }}</span>
+    {% endif %}
+  </div>
 </div>
 
 <form class="card filters" method="get">
@@ -45,7 +54,7 @@
     <h3>Active Alerts</h3>
     <div class="table-wrap">
       <table>
-        <thead><tr><th>Code</th><th>Title</th><th>Severity</th><th>Owner</th><th>SLA</th></tr></thead>
+        <thead><tr><th>Code</th><th>Title</th><th>Severity</th><th>Owner</th><th>SLA</th><th></th></tr></thead>
         <tbody>
           {% for item in alerts %}
           <tr>
@@ -60,9 +69,19 @@
               {% endif %}
             </td>
             <td>{{ alert_slas.get(item.code, "same day") }}</td>
+            <td>
+              <div class="actions">
+                <button type="button" class="ghost alert-status" data-alert-id="{{ item.id }}" data-status="acknowledged">ack</button>
+                <button type="button" class="ghost alert-status" data-alert-id="{{ item.id }}" data-status="dismissed">dismiss</button>
+                {% if can_assign_defaults %}
+                <button type="button" class="secondary alert-assign" data-alert-id="{{ item.id }}" data-assignee-kind="owner">owner</button>
+                <button type="button" class="secondary alert-assign" data-alert-id="{{ item.id }}" data-assignee-kind="operator">operator</button>
+                {% endif %}
+              </div>
+            </td>
           </tr>
           {% else %}
-          <tr><td colspan="5" class="empty">Нет активных alerts.</td></tr>
+          <tr><td colspan="6" class="empty">Нет активных alerts.</td></tr>
           {% endfor %}
         </tbody>
       </table>
@@ -73,7 +92,7 @@
     <h3>Open Tasks</h3>
     <div class="table-wrap">
       <table>
-        <thead><tr><th>Title</th><th>Priority</th><th>Assignee</th><th>Due at</th><th>SLA</th></tr></thead>
+        <thead><tr><th>Title</th><th>Priority</th><th>Assignee</th><th>Due at</th><th>SLA</th><th></th></tr></thead>
         <tbody>
           {% for item in tasks %}
           <tr>
@@ -90,9 +109,18 @@
             </td>
             <td>{{ item.due_at or "—" }}</td>
             <td>{{ "overdue" if item in overdue_tasks else "in range" }}</td>
+            <td>
+              <div class="actions">
+                <button type="button" class="ghost task-status" data-task-id="{{ item.id }}" data-status="done">done</button>
+                {% if can_assign_defaults %}
+                <button type="button" class="secondary task-assign" data-task-id="{{ item.id }}" data-assignee-kind="owner">owner</button>
+                <button type="button" class="secondary task-assign" data-task-id="{{ item.id }}" data-assignee-kind="operator">operator</button>
+                {% endif %}
+              </div>
+            </td>
           </tr>
           {% else %}
-          <tr><td colspan="5" class="empty">Нет открытых tasks.</td></tr>
+          <tr><td colspan="6" class="empty">Нет открытых tasks.</td></tr>
           {% endfor %}
         </tbody>
       </table>
@@ -110,4 +138,43 @@
     {% endfor %}
   </div>
 </section>
+
+<script>
+  async function postJson(url, payload) {
+    const response = await adminFetch(url, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(payload),
+    });
+    if (!response.ok) {
+      throw new Error(await response.text());
+    }
+    return response.json();
+  }
+
+  for (const button of document.querySelectorAll(".alert-status")) {
+    button.addEventListener("click", async () => {
+      await postJson(`/admin/{{ runtime.account.slug }}/alerts/${button.dataset.alertId}/status`, {status: button.dataset.status});
+      window.location.reload();
+    });
+  }
+  for (const button of document.querySelectorAll(".alert-assign")) {
+    button.addEventListener("click", async () => {
+      await postJson(`/admin/{{ runtime.account.slug }}/alerts/${button.dataset.alertId}/assign-default`, {assignee_kind: button.dataset.assigneeKind});
+      window.location.reload();
+    });
+  }
+  for (const button of document.querySelectorAll(".task-status")) {
+    button.addEventListener("click", async () => {
+      await postJson(`/admin/{{ runtime.account.slug }}/tasks/${button.dataset.taskId}/status`, {status: button.dataset.status});
+      window.location.reload();
+    });
+  }
+  for (const button of document.querySelectorAll(".task-assign")) {
+    button.addEventListener("click", async () => {
+      await postJson(`/admin/{{ runtime.account.slug }}/tasks/${button.dataset.taskId}/assign-default`, {assignee_kind: button.dataset.assigneeKind});
+      window.location.reload();
+    });
+  }
+</script>
 {% endblock %}

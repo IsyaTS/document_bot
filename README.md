@@ -264,6 +264,7 @@ Server-rendered admin app lives in `platform_runtime/app.py` and now includes:
   - `/admin/platform`
 - account-scoped pages:
   - `/admin/{account_slug}/dashboard`
+  - `/admin/{account_slug}/brief`
   - `/admin/{account_slug}/integrations`
   - `/admin/{account_slug}/alerts-tasks`
   - `/admin/{account_slug}/ops-sync`
@@ -278,6 +279,20 @@ Stage 7.8 adds:
 - platform runtime visibility for app version, revision, DB, worker, backup, verify and smoke status
 - hand-off-ready readiness blocks and next-step hints
 - runtime status files in `data/runtime_status/`
+
+Stage 7.9 adds:
+
+- account-level execution brief page and JSON digest:
+  - `GET /admin/{account_slug}/brief`
+  - `GET /admin/{account_slug}/brief.json`
+- account-level owner/operator execution defaults derived from account settings and memberships
+- account-scoped execution actions:
+  - `POST /admin/{account_slug}/alerts/{alert_id}/status`
+  - `POST /admin/{account_slug}/alerts/{alert_id}/assign-default`
+  - `POST /admin/{account_slug}/tasks/{task_id}/status`
+  - `POST /admin/{account_slug}/tasks/{task_id}/assign-default`
+- account drilldown links from dashboard, goals, alerts/tasks and ops pages into the execution brief
+- execution-oriented account summary built from existing dashboard, ops, alerts/tasks and goals data, without new runtime framework
 
 For stage 6.9 operational hardening:
 
@@ -299,6 +314,7 @@ Main pages:
 - `/admin/accounts`
 - `/admin/users`
 - `/admin/{account_slug}/dashboard`
+- `/admin/{account_slug}/brief`
 - `/admin/{account_slug}/members`
 - `/admin/{account_slug}/integrations`
 - `/admin/{account_slug}/alerts-tasks`
@@ -386,6 +402,28 @@ Current owner action behavior:
   - critical alerts digest
   - failed sync digest
   - goals at risk digest
+
+Current account execution behavior:
+
+- account execution brief is available at:
+  - `GET /admin/{account_slug}/brief`
+  - `GET /admin/{account_slug}/brief.json`
+- account brief shows:
+  - critical alerts
+  - overdue tasks
+  - failed sync jobs
+  - goals at risk
+  - must-do-now list
+  - default owner and operator for execution routing
+- account actions available from brief and alerts/tasks views:
+  - acknowledge / dismiss / reopen alert
+  - assign alert to default owner or operator
+  - mark task open / done
+  - assign task to default owner or operator
+- account execution summary is derived from existing ops, goals and dashboard data and is intended to answer:
+  - what matters now
+  - who should react
+  - where to go next
 
 Current account onboarding and lifecycle behavior:
 
