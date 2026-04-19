@@ -8,7 +8,7 @@ from sqlalchemy import and_, select
 from sqlalchemy.orm import Session
 
 from platform_core.exceptions import PlatformCoreError, TenantContextError
-from platform_core.models import CommunicationReview, Employee, EmployeeKPI, PayrollEntry, PayrollPeriod, Task
+from platform_core.models import CommunicationReview, Employee, EmployeeKPI, PayrollEntry, PayrollPeriod, Task, TaskCheckin
 from platform_core.tenancy import TenantContext, require_account_id
 
 
@@ -17,6 +17,8 @@ PAYROLL_METRIC_DEFINITIONS: list[dict[str, str]] = [
     {"code": "completed_tasks", "label": "Completed tasks"},
     {"code": "overdue_tasks", "label": "Overdue tasks"},
     {"code": "quality_breaches", "label": "Communication quality breaches"},
+    {"code": "blocked_tasks", "label": "Blocked task check-ins"},
+    {"code": "resolved_with_note", "label": "Resolved tasks with execution note"},
 ]
 
 
@@ -190,6 +192,16 @@ class PayrollService:
                     CommunicationReview.quality_status.in_(["warning", "critical"]),
                 )
             ).scalars().all()
+            task_checkins = self.session.execute(
+                select(TaskCheckin).where(
+                    TaskCheckin.account_id == account_id,
+                    TaskCheckin.employee_id == employee.id,
+                    TaskCheckin.created_at >= period_start_dt,
+                    TaskCheckin.created_at <= period_end_dt,
+                )
+            ).scalars().all()
+            blocked_checkins = [item for item in task_checkins if item.checkin_type == "blocker"]
+            resolution_checkins = [item for item in task_checkins if item.checkin_type == "resolution" and item.note_text]
             rows.append(
                 self.upsert_kpi(
                     context,
@@ -222,6 +234,30 @@ class PayrollService:
                     period_start=payroll_period.period_start,
                     period_end=payroll_period.period_end,
                     actual_value=Decimal(len(quality_breaches)),
+                    target_value=None,
+                    source_kind="derived",
+                )
+            )
+            rows.append(
+                self.upsert_kpi(
+                    context,
+                    employee_id=employee.id,
+                    metric_code="blocked_tasks",
+                    period_start=payroll_period.period_start,
+                    period_end=payroll_period.period_end,
+                    actual_value=Decimal(len(blocked_checkins)),
+                    target_value=None,
+                    source_kind="derived",
+                )
+            )
+            rows.append(
+                self.upsert_kpi(
+                    context,
+                    employee_id=employee.id,
+                    metric_code="resolved_with_note",
+                    period_start=payroll_period.period_start,
+                    period_end=payroll_period.period_end,
+                    actual_value=Decimal(len(resolution_checkins)),
                     target_value=None,
                     source_kind="derived",
                 )
@@ -309,6 +345,8 @@ class PayrollService:
         revenue_generated = Decimal(str(kpis.get("revenue_generated").actual_value if kpis.get("revenue_generated") is not None else "0"))
         overdue_tasks = Decimal(str(kpis.get("overdue_tasks").actual_value if kpis.get("overdue_tasks") is not None else "0"))
         quality_breaches = Decimal(str(kpis.get("quality_breaches").actual_value if kpis.get("quality_breaches") is not None else "0"))
+        blocked_tasks = Decimal(str(kpis.get("blocked_tasks").actual_value if kpis.get("blocked_tasks") is not None else "0"))
+        resolved_with_note = Decimal(str(kpis.get("resolved_with_note").actual_value if kpis.get("resolved_with_note") is not None else "0"))
         score_values = [
             Decimal(str(item.score_pct))
             for item in kpis.values()
@@ -322,9 +360,12 @@ class PayrollService:
         else:
             ratio = min(Decimal("1.50"), max(Decimal("0.00"), average_score / Decimal("100")))
             bonus_amount = (Decimal(employee.kpi_bonus_amount) * ratio).quantize(Decimal("0.01"))
+        discipline_bonus = min(Decimal(employee.kpi_bonus_amount) * Decimal("0.50"), resolved_with_note * Decimal("100")).quantize(Decimal("0.01"))
+        bonus_amount = (bonus_amount + discipline_bonus).quantize(Decimal("0.01"))
         penalty_amount = (
             overdue_tasks * Decimal(employee.penalty_per_overdue_task)
             + quality_breaches * Decimal(employee.penalty_per_quality_breach)
+            + blocked_tasks * (Decimal(employee.penalty_per_overdue_task) / Decimal("2"))
         ).quantize(Decimal("0.01"))
         gross_amount = (base_salary_amount + commission_amount + bonus_amount).quantize(Decimal("0.01"))
         net_amount = max(Decimal("0.00"), gross_amount - penalty_amount).quantize(Decimal("0.01"))
@@ -343,7 +384,10 @@ class PayrollService:
                 "revenue_generated": str(revenue_generated),
                 "overdue_tasks": str(overdue_tasks),
                 "quality_breaches": str(quality_breaches),
+                "blocked_tasks": str(blocked_tasks),
+                "resolved_with_note": str(resolved_with_note),
                 "average_score_pct": str(average_score.quantize(Decimal("0.01"))) if average_score is not None else None,
+                "discipline_bonus": str(discipline_bonus),
             },
         )
 

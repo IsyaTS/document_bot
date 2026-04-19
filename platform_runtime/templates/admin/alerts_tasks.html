@@ -119,6 +119,9 @@
             <td>
               <div class="actions">
                 <button type="button" class="ghost task-status" data-task-id="{{ item.id }}" data-status="done">done</button>
+                <button type="button" class="ghost task-checkin" data-task-id="{{ item.id }}" data-checkin-type="progress">progress</button>
+                <button type="button" class="ghost task-checkin" data-task-id="{{ item.id }}" data-checkin-type="blocker">blocker</button>
+                <button type="button" class="ghost task-checkin" data-task-id="{{ item.id }}" data-checkin-type="resolution" data-status-after="done">resolve</button>
                 {% if can_assign_defaults %}
                 <button type="button" class="secondary task-assign" data-task-id="{{ item.id }}" data-assignee-kind="owner">owner</button>
                 <button type="button" class="secondary task-assign" data-task-id="{{ item.id }}" data-assignee-kind="operator">operator</button>
@@ -180,6 +183,20 @@
   for (const button of document.querySelectorAll(".task-assign")) {
     button.addEventListener("click", async () => {
       await postJson(`/admin/{{ runtime.account.slug }}/tasks/${button.dataset.taskId}/assign-default`, {assignee_kind: button.dataset.assigneeKind});
+      window.location.reload();
+    });
+  }
+  for (const button of document.querySelectorAll(".task-checkin")) {
+    button.addEventListener("click", async () => {
+      const noteText = window.prompt(`Add ${button.dataset.checkinType} note`, "");
+      if (noteText === null) return;
+      await postJson(`/admin/{{ runtime.account.slug }}/tasks/${button.dataset.taskId}/checkin`, {
+        checkin: {
+          checkin_type: button.dataset.checkinType,
+          note_text: noteText,
+          status_after: button.dataset.statusAfter || null,
+        }
+      });
       window.location.reload();
     });
   }

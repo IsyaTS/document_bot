@@ -39,12 +39,14 @@ from platform_core.models import (
     NotificationEvent,
     NotificationDispatch,
     PayrollEntry,
+    PayrollPayment,
     PayrollPeriod,
     Product,
     Purchase,
     Role,
     RuntimeLease,
     Task,
+    TaskCheckin,
     TaskEvent,
     User,
     Warehouse,
@@ -58,6 +60,8 @@ from platform_core.services import (
     BusinessOSService,
     CommunicationService,
     EmployeeSnapshot,
+    EmployeeExecutionSummary,
+    ExecutionService,
     ExecutiveDashboardService,
     GOAL_METRIC_DEFINITIONS,
     GoalService,
@@ -1078,8 +1082,10 @@ def create_app() -> FastAPI:
             {"key": "communication_reviews", "label": "Communication reviews", "description": "Soft limit for stored transcript reviews."},
             {"key": "communication_import_batches", "label": "Communication import batches", "description": "Soft limit for imported transcript batches."},
             {"key": "active_payroll_periods", "label": "Active payroll periods", "description": "Soft limit for non-paid payroll periods."},
+            {"key": "payroll_payments", "label": "Payroll payments", "description": "Soft limit for recorded payroll payments."},
             {"key": "notification_events", "label": "Notification events", "description": "Soft limit for generated notification events."},
             {"key": "notification_dispatches", "label": "Notification dispatches", "description": "Soft limit for delivered notification artifacts."},
+            {"key": "task_checkins", "label": "Task check-ins", "description": "Soft limit for execution check-ins and resolution notes."},
         ]
 
     def _default_account_settings() -> dict[str, object]:
@@ -1233,11 +1239,17 @@ def create_app() -> FastAPI:
                 PayrollPeriod.status.in_(["draft", "approved"]),
             )
         ).scalar_one()
+        payroll_payments = session.execute(
+            select(func.count()).select_from(PayrollPayment).where(PayrollPayment.account_id == account.id)
+        ).scalar_one()
         notification_events = session.execute(
             select(func.count()).select_from(NotificationEvent).where(NotificationEvent.account_id == account.id)
         ).scalar_one()
         notification_dispatches = session.execute(
             select(func.count()).select_from(NotificationDispatch).where(NotificationDispatch.account_id == account.id)
+        ).scalar_one()
+        task_checkins = session.execute(
+            select(func.count()).select_from(TaskCheckin).where(TaskCheckin.account_id == account.id)
         ).scalar_one()
         return {
             "active_memberships": sum(1 for item in memberships if item.status == "active"),
@@ -1251,8 +1263,10 @@ def create_app() -> FastAPI:
             "communication_reviews": int(communication_reviews or 0),
             "communication_import_batches": int(communication_import_batches or 0),
             "active_payroll_periods": int(active_payroll_periods or 0),
+            "payroll_payments": int(payroll_payments or 0),
             "notification_events": int(notification_events or 0),
             "notification_dispatches": int(notification_dispatches or 0),
+            "task_checkins": int(task_checkins or 0),
         }
 
     def _account_usage_rows(account: Account, session: Session) -> list[dict[str, object]]:
@@ -1333,6 +1347,16 @@ def create_app() -> FastAPI:
             next_steps.append({"label": "Configure the first compensation plan", "href": f"/admin/{runtime.account.slug}/payroll"})
         if payroll_period_count == 0:
             next_steps.append({"label": "Create the first payroll period", "href": f"/admin/{runtime.account.slug}/payroll"})
+        checkin_count = session.execute(
+            select(func.count()).select_from(TaskCheckin).where(TaskCheckin.account_id == runtime.account.id)
+        ).scalar_one()
+        if checkin_count == 0:
+            next_steps.append({"label": "Start logging execution check-ins on tasks", "href": f"/admin/{runtime.account.slug}/alerts-tasks"})
+        payroll_payment_count = session.execute(
+            select(func.count()).select_from(PayrollPayment).where(PayrollPayment.account_id == runtime.account.id)
+        ).scalar_one()
+        if payroll_period_count > 0 and payroll_payment_count == 0:
+            next_steps.append({"label": "Record the first payroll payment", "href": f"/admin/{runtime.account.slug}/payroll"})
         if len(onboarding["integration_rows"]) == 0:
             next_steps.append({"label": "Connect the first integration", "href": f"/admin/{runtime.account.slug}/integrations"})
         if onboarding["last_success"] is None and len(onboarding["integration_rows"]) > 0:
@@ -4233,6 +4257,7 @@ def create_app() -> FastAPI:
         employees = people_service.list_employees(runtime.context)
         employee_snapshots = _employee_snapshot_map(runtime, session)
         selected_employee = None
+        execution_summary = None
         if employee_id is not None:
             try:
                 selected_employee = people_service.get_employee(runtime.context, employee_id)
@@ -4248,6 +4273,7 @@ def create_app() -> FastAPI:
                 item for item in RuntimeAutomationService(session).list_tasks(runtime.context)
                 if item.assignee_employee_id == selected_employee.id or (selected_employee.user_id is not None and item.assignee_user_id == selected_employee.user_id)
             ][:12]
+            execution_summary = ExecutionService(session).employee_execution_summary(runtime.context, selected_employee.id)
         return templates.TemplateResponse(
             request,
             "admin/people.html",
@@ -4257,6 +4283,7 @@ def create_app() -> FastAPI:
                 "employee_snapshots": employee_snapshots,
                 "selected_employee": selected_employee,
                 "selected_tasks": selected_tasks,
+                "execution_summary": execution_summary,
                 "selectable_users": selectable_users,
                 "employee_status_options": _employee_status_options(),
                 "default_users": _default_account_users(runtime, session),
@@ -4394,6 +4421,7 @@ def create_app() -> FastAPI:
         elif periods:
             selected_period = periods[0]
         entries = payroll_service.list_entries(runtime.context, payroll_period_id=selected_period.id if selected_period else None)
+        payments = ExecutionService(session).list_payroll_payments(runtime.context)
         kpis = payroll_service.list_kpis(
             runtime.context,
             period_start=selected_period.period_start if selected_period else None,
@@ -4412,6 +4440,7 @@ def create_app() -> FastAPI:
                 "periods": periods,
                 "selected_period": selected_period,
                 "entries": entries,
+                "payments": payments,
                 "kpi_rows": kpi_rows,
                 "employee_snapshots": employee_snapshots,
                 "payroll_metric_definitions": PAYROLL_METRIC_DEFINITIONS,
@@ -4584,6 +4613,42 @@ def create_app() -> FastAPI:
         except (PlatformCoreError, TenantContextError) as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
         return JSONResponse({"payroll_period": _serialize_payroll_period(payroll_period)})
+
+    @app.post("/admin/{account_slug}/payroll/entries/{entry_id}/payment")
+    async def admin_record_payroll_payment(
+        request: Request,
+        account_slug: str,
+        entry_id: int,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        payload = await request.json()
+        actor = _require_admin_user(request, session)
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor.email)
+        _require_account_manager(runtime)
+        ensure_permission(runtime, "business.write")
+        _ensure_account_feature(runtime, "payroll_kpi", "Payroll")
+        body = _parse_admin_payload(payload, "payment")
+        try:
+            entry, payment = ExecutionService(session).record_payroll_payment(
+                runtime.context,
+                payroll_entry_id=entry_id,
+                recorded_by_user_id=runtime.actor_user.id,
+                payment_date_value=date.fromisoformat(str(body.get("payment_date"))),
+                amount=Decimal(str(body.get("amount") or "0")),
+                payment_ref=str(body.get("payment_ref") or "").strip() or None,
+                status_code=str(body.get("status") or "recorded").strip() or "recorded",
+            )
+            AuditLogService(session).log(
+                runtime.context,
+                "payroll.payment.recorded",
+                "payroll_payment",
+                str(payment.id),
+                details={"entry_id": entry.id, "amount": str(payment.amount), "status": payment.status},
+            )
+        except (PlatformCoreError, TenantContextError, ValueError, ArithmeticError) as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        return JSONResponse({"entry": _serialize_payroll_entry(entry), "payment": _serialize_payroll_payment(payment)})
 
     @app.get("/admin/{account_slug}/crm", response_class=HTMLResponse)
     def admin_crm(
@@ -5671,6 +5736,40 @@ def create_app() -> FastAPI:
         session.flush()
         return JSONResponse({"task": _serialize_task(task), "assigned_user": _serialize_user(assigned_user)})
 
+    @app.post("/admin/{account_slug}/tasks/{task_id}/checkin")
+    async def admin_task_checkin(
+        request: Request,
+        account_slug: str,
+        task_id: int,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        payload = await request.json()
+        actor = _require_admin_user(request, session)
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor.email)
+        ensure_permission(runtime, "tasks.read")
+        body = _parse_admin_payload(payload, "checkin")
+        try:
+            task, checkin = ExecutionService(session).create_task_checkin(
+                runtime.context,
+                task_id=task_id,
+                actor_user_id=runtime.actor_user.id,
+                employee_id=int(body["employee_id"]) if body.get("employee_id") else None,
+                checkin_type=str(body.get("checkin_type") or "progress").strip() or "progress",
+                note_text=str(body.get("note_text") or "").strip() or None,
+                status_after=str(body.get("status_after") or "").strip() or None,
+            )
+            AuditLogService(session).log(
+                runtime.context,
+                "account.task.checkin",
+                "task_checkin",
+                str(checkin.id),
+                details={"task_id": task.id, "checkin_type": checkin.checkin_type, "status_after": checkin.status_after},
+            )
+        except (PlatformCoreError, TenantContextError, ValueError) as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        return JSONResponse({"task": _serialize_task(task), "checkin": _serialize_task_checkin(checkin)})
+
     @app.get("/admin/{account_slug}/ops-sync", response_class=HTMLResponse)
     def admin_ops_sync(
         request: Request,
@@ -6339,6 +6438,22 @@ def _serialize_payroll_entry(entry: PayrollEntry) -> dict[str, object]:
     }
 
 
+def _serialize_payroll_payment(payment: PayrollPayment) -> dict[str, object]:
+    return {
+        "id": payment.id,
+        "account_id": payment.account_id,
+        "payroll_entry_id": payment.payroll_entry_id,
+        "recorded_by_user_id": payment.recorded_by_user_id,
+        "payment_date": payment.payment_date.isoformat(),
+        "amount": str(payment.amount),
+        "payment_ref": payment.payment_ref,
+        "status": payment.status,
+        "payload_json": payment.payload_json or {},
+        "created_at": _serialize_datetime(payment.created_at),
+        "updated_at": _serialize_datetime(payment.updated_at),
+    }
+
+
 def _serialize_notification_event(event: NotificationEvent) -> dict[str, object]:
     return {
         "id": event.id,
@@ -6406,6 +6521,22 @@ def _serialize_task(task) -> dict[str, object]:
         "escalation_level": task.escalation_level,
         "related_entity_type": task.related_entity_type,
         "related_entity_id": task.related_entity_id,
+    }
+
+
+def _serialize_task_checkin(checkin: TaskCheckin) -> dict[str, object]:
+    return {
+        "id": checkin.id,
+        "account_id": checkin.account_id,
+        "task_id": checkin.task_id,
+        "actor_user_id": checkin.actor_user_id,
+        "employee_id": checkin.employee_id,
+        "checkin_type": checkin.checkin_type,
+        "note_text": checkin.note_text,
+        "status_after": checkin.status_after,
+        "payload_json": checkin.payload_json or {},
+        "created_at": _serialize_datetime(checkin.created_at),
+        "updated_at": _serialize_datetime(checkin.updated_at),
     }
 
 

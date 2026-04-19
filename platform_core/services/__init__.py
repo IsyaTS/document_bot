@@ -9,6 +9,7 @@ from platform_core.services.business_os import BusinessOSService, InventoryInsig
 from platform_core.services.communications import CommunicationAnalysis, CommunicationService
 from platform_core.services.credentials import CredentialCrypto, CredentialCryptoError
 from platform_core.services.dashboard import DashboardCatalogService, ExecutiveDashboardService
+from platform_core.services.execution import EmployeeExecutionSummary, ExecutionService
 from platform_core.services.goals import GOAL_METRIC_DEFINITIONS, GoalMetricDefinition, GoalService
 from platform_core.services.knowledge import KnowledgeService
 from platform_core.services.operations import OperationsService, StagnantStockRow
@@ -44,6 +45,8 @@ __all__ = [
     "CoreBootstrapService",
     "DashboardCatalogService",
     "ExecutiveDashboardService",
+    "EmployeeExecutionSummary",
+    "ExecutionService",
     "GOAL_METRIC_DEFINITIONS",
     "GoalMetricDefinition",
     "GoalService",

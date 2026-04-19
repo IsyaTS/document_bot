@@ -172,6 +172,7 @@ Telegram-бот продолжает жить как legacy adapter, а platform
 - stage 8.9: payroll, employee KPI and compensation foundation
 - stage 9.0: business os expansion foundation
 - stage 9.1: auto communications and outbound notification dispatch foundation
+- stage 9.2: execution discipline and payroll payments foundation
 - stage 7.8: productization layer
 - stage 7.9: execution brief and account actions
 - stage 8.0: delivery layer and product polish
@@ -182,6 +183,7 @@ Telegram-бот продолжает жить как legacy adapter, а platform
 - multi-tenant account/user/RBAC model
 - canonical business tables for customers, leads, lead_events, deals, campaigns, ad_metrics, stock, purchases, banking and tasks
 - communication batch import and notification dispatch outbox
+- execution check-ins and payroll payment register
 - integration layer with `integrations`, `integration_credentials`, `provider_tokens`, `sync_jobs`, `integration_logs`
 - runtime API in `platform_runtime/app.py`
 - scheduler/worker loop in `platform_runtime/worker.py`

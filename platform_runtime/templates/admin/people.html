@@ -143,6 +143,8 @@
       <article class="card metric"><span class="subtle">Done 30d</span><span class="value">{{ snapshot.completed_30d if snapshot else 0 }}</span></article>
       <article class="card metric"><span class="subtle">Open alerts</span><span class="value">{{ snapshot.open_alerts if snapshot else 0 }}</span></article>
       <article class="card metric"><span class="subtle">Avg completion hours</span><span class="value">{{ "%.1f"|format(snapshot.avg_completion_hours_30d) if snapshot and snapshot.avg_completion_hours_30d is not none else "—" }}</span></article>
+      <article class="card metric"><span class="subtle">Blockers logged</span><span class="value">{{ execution_summary.blocker_count if execution_summary else 0 }}</span></article>
+      <article class="card metric"><span class="subtle">Resolutions logged</span><span class="value">{{ execution_summary.resolution_count if execution_summary else 0 }}</span></article>
     </section>
 
     {% if can_create_tasks %}
@@ -200,6 +202,26 @@
             </tr>
             {% else %}
             <tr><td colspan="4" class="empty">No tasks tied to this employee yet.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="card soft-card" style="margin-top: 16px; padding: 0;">
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Execution check-in</th><th>Type</th><th>Status after</th><th>When</th></tr></thead>
+          <tbody>
+            {% for checkin in execution_summary.recent_checkins if execution_summary %}
+            <tr>
+              <td>{{ checkin.note_text or "—" }}</td>
+              <td>{{ checkin.checkin_type }}</td>
+              <td>{{ checkin.status_after or "—" }}</td>
+              <td>{{ checkin.created_at }}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="4" class="empty">No execution check-ins yet.</td></tr>
             {% endfor %}
           </tbody>
         </table>

@@ -125,7 +125,7 @@
     </div>
     <div class="table-wrap" style="margin-top: 14px;">
       <table>
-        <thead><tr><th>Employee</th><th>Revenue</th><th>Completed</th><th>Overdue</th><th>Quality</th><th></th></tr></thead>
+        <thead><tr><th>Employee</th><th>Revenue</th><th>Completed</th><th>Overdue</th><th>Quality</th><th>Blocked</th><th>Resolved</th><th></th></tr></thead>
         <tbody>
           {% for employee in employees %}
           {% set employee_kpis = kpi_rows.get(employee.id, {}) %}
@@ -138,6 +138,8 @@
             <td>{{ employee_kpis.get('completed_tasks').actual_value if employee_kpis.get('completed_tasks') else 0 }}</td>
             <td>{{ employee_kpis.get('overdue_tasks').actual_value if employee_kpis.get('overdue_tasks') else 0 }}</td>
             <td>{{ employee_kpis.get('quality_breaches').actual_value if employee_kpis.get('quality_breaches') else 0 }}</td>
+            <td>{{ employee_kpis.get('blocked_tasks').actual_value if employee_kpis.get('blocked_tasks') else 0 }}</td>
+            <td>{{ employee_kpis.get('resolved_with_note').actual_value if employee_kpis.get('resolved_with_note') else 0 }}</td>
             <td>
               {% if can_manage_payroll %}
               <button type="button" class="secondary save-revenue-kpi" data-employee-id="{{ employee.id }}">Save revenue KPI</button>
@@ -167,7 +169,7 @@
     </div>
     <div class="table-wrap" style="margin-top: 14px;">
       <table>
-        <thead><tr><th>Employee</th><th>Base</th><th>Comm</th><th>Bonus</th><th>Penalty</th><th>Net</th><th>Status</th></tr></thead>
+        <thead><tr><th>Employee</th><th>Base</th><th>Comm</th><th>Bonus</th><th>Penalty</th><th>Net</th><th>Status</th><th></th></tr></thead>
         <tbody>
           {% for entry in entries %}
           {% set employee = (employees | selectattr('id', 'equalto', entry.employee_id) | list | first) %}
@@ -179,15 +181,38 @@
             <td>{{ entry.penalty_amount }}</td>
             <td><strong>{{ entry.net_amount }}</strong></td>
             <td>{{ entry.status }}</td>
+            <td>{% if can_manage_payroll %}<button type="button" class="secondary record-payment" data-entry-id="{{ entry.id }}" data-net-amount="{{ entry.net_amount }}">pay</button>{% endif %}</td>
           </tr>
           {% else %}
-          <tr><td colspan="7" class="empty">No payroll entries computed yet.</td></tr>
+          <tr><td colspan="8" class="empty">No payroll entries computed yet.</td></tr>
           {% endfor %}
         </tbody>
       </table>
     </div>
     <div class="subtle" id="compute-status" style="margin-top: 12px;"></div>
   </article>
+</section>
+
+<section class="card" style="margin-top: 16px;">
+  <h3>Payment Register</h3>
+  <div class="table-wrap" style="margin-top: 14px;">
+    <table>
+      <thead><tr><th>Payment date</th><th>Entry</th><th>Amount</th><th>Ref</th><th>Status</th></tr></thead>
+      <tbody>
+        {% for payment in payments %}
+        <tr>
+          <td>{{ payment.payment_date }}</td>
+          <td>#{{ payment.payroll_entry_id }}</td>
+          <td>{{ payment.amount }}</td>
+          <td>{{ payment.payment_ref or "—" }}</td>
+          <td>{{ payment.status }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="5" class="empty">No payroll payments recorded yet.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
 </section>
 {% endif %}
 
@@ -314,5 +339,35 @@
   if (payButton) {
     payButton.addEventListener("click", async () => updatePayrollStatus("paid"));
   }
+
+  document.querySelectorAll(".record-payment").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const paymentDate = window.prompt("Payment date (YYYY-MM-DD)", "{{ selected_period.period_end if selected_period else '' }}");
+      if (!paymentDate) return;
+      const amount = window.prompt("Payment amount", button.dataset.netAmount || "0");
+      if (!amount) return;
+      const paymentRef = window.prompt("Payment reference", `payroll-${button.dataset.entryId}`);
+      const response = await adminFetch(`/admin/{{ runtime.account.slug }}/payroll/entries/${button.dataset.entryId}/payment`, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+          payment: {
+            payment_date: paymentDate,
+            amount,
+            payment_ref: paymentRef || null,
+            status: "recorded",
+          }
+        }),
+      });
+      const statusNode = document.getElementById("compute-status");
+      if (!response.ok) {
+        statusNode.textContent = await response.text();
+        return;
+      }
+      const body = await response.json();
+      statusNode.textContent = `Recorded payment #${body.payment.id}.`;
+      window.location.reload();
+    });
+  });
 </script>
 {% endblock %}

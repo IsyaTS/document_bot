@@ -585,6 +585,23 @@ class PayrollEntry(Base, AccountScopedMixin, TimestampMixin):
     summary_json: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False, default=dict)
 
 
+class PayrollPayment(Base, AccountScopedMixin, TimestampMixin):
+    __tablename__ = "payroll_payments"
+    __table_args__ = (
+        Index("ix_payroll_payments_account_entry_payment_date", "account_id", "payroll_entry_id", "payment_date"),
+        Index("ix_payroll_payments_account_status_payment_date", "account_id", "status", "payment_date"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    payroll_entry_id: Mapped[int] = mapped_column(ForeignKey("payroll_entries.id", ondelete="CASCADE"), nullable=False)
+    recorded_by_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    payment_date: Mapped[date] = mapped_column(Date, nullable=False)
+    amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
+    payment_ref: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="recorded")
+    payload_json: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False, default=dict)
+
+
 class NotificationEvent(Base, AccountScopedMixin, TimestampMixin):
     __tablename__ = "notification_events"
     __table_args__ = (
@@ -648,3 +665,21 @@ class KnowledgeItem(Base, AccountScopedMixin, TimestampMixin):
     content_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     tags_json: Mapped[list[object]] = mapped_column(JSON, nullable=False, default=list)
     metadata_json: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False, default=dict)
+
+
+class TaskCheckin(Base, AccountScopedMixin, TimestampMixin):
+    __tablename__ = "task_checkins"
+    __table_args__ = (
+        Index("ix_task_checkins_account_task_created_at", "account_id", "task_id", "created_at"),
+        Index("ix_task_checkins_account_employee_created_at", "account_id", "employee_id", "created_at"),
+        Index("ix_task_checkins_account_type_created_at", "account_id", "checkin_type", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    task_id: Mapped[int] = mapped_column(ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False)
+    actor_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    employee_id: Mapped[int | None] = mapped_column(ForeignKey("employees.id", ondelete="SET NULL"), nullable=True)
+    checkin_type: Mapped[str] = mapped_column(String(32), nullable=False, default="progress")
+    note_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status_after: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    payload_json: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False, default=dict)
