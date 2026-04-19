@@ -1,0 +1,276 @@
+{% extends "admin/base.html" %}
+{% block content %}
+<div class="topbar">
+  <div>
+    <h2>People</h2>
+    <p class="subtle">Employee registry, workload view, KPI snapshots and direct task creation without leaving the account console.</p>
+  </div>
+  <div class="chips">
+    <span class="chip">{{ employees|length }} employees</span>
+    {% if default_users.owner %}<span class="chip">owner {{ default_users.owner.full_name or default_users.owner.email }}</span>{% endif %}
+    {% if default_users.operator %}<span class="chip">operator {{ default_users.operator.full_name or default_users.operator.email }}</span>{% endif %}
+    <a class="pill-link" href="/admin/{{ runtime.account.slug }}/delivery">delivery pack</a>
+  </div>
+</div>
+
+{% if not employees %}
+<section class="notice" style="margin-bottom: 16px;">
+  No employees configured yet. Next step: add the first employee record, link it to an existing user where possible, and start assigning tasks from this page.
+</section>
+{% endif %}
+
+<section class="grid cols-2 integrations-layout">
+  <article class="card">
+    <div class="actions" style="justify-content: space-between;">
+      <div>
+        <h3>Employee Registry</h3>
+        <p class="subtle">Keep the operational roster inside the platform so tasks, KPI and ownership stay readable.</p>
+      </div>
+      {% if selected_employee %}
+      <a class="pill-link" href="/admin/{{ runtime.account.slug }}/people">new employee</a>
+      {% endif %}
+    </div>
+
+    {% if can_manage_people %}
+    <section class="card soft-card" style="margin-top: 14px; padding: 14px;">
+      <div class="form-grid two">
+        <label>
+          Employee code
+          <input id="employee-code" value="{{ selected_employee.employee_code if selected_employee else '' }}">
+        </label>
+        <label>
+          Full name
+          <input id="employee-full-name" value="{{ selected_employee.full_name if selected_employee else '' }}">
+        </label>
+        <label>
+          Role title
+          <input id="employee-role-title" value="{{ selected_employee.role_title if selected_employee else '' }}">
+        </label>
+        <label>
+          Department
+          <input id="employee-department" value="{{ selected_employee.department if selected_employee else '' }}">
+        </label>
+        <label>
+          Email
+          <input id="employee-email" value="{{ selected_employee.email if selected_employee else '' }}">
+        </label>
+        <label>
+          Phone
+          <input id="employee-phone" value="{{ selected_employee.phone if selected_employee else '' }}">
+        </label>
+        <label>
+          Linked user
+          <select id="employee-user-id">
+            <option value="">—</option>
+            {% for user in selectable_users %}
+            <option value="{{ user.id }}" {{ 'selected' if selected_employee and selected_employee.user_id == user.id else '' }}>{{ user.full_name or user.email }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>
+          Status
+          <select id="employee-status">
+            {% for status_code in employee_status_options %}
+            <option value="{{ status_code }}" {{ 'selected' if selected_employee and selected_employee.status == status_code else ('selected' if not selected_employee and status_code == 'active' else '') }}>{{ status_code }}</option>
+            {% endfor %}
+          </select>
+        </label>
+      </div>
+      <div class="actions" style="margin-top: 14px;">
+        <button type="button" id="save-employee">{{ "Save employee" if selected_employee else "Create employee" }}</button>
+        <span class="subtle" id="employee-save-status"></span>
+      </div>
+    </section>
+    {% else %}
+    <section class="notice" style="margin-top: 14px;">
+      Read-only mode. Employee registry is visible, but only account managers can change it.
+    </section>
+    {% endif %}
+
+    <section class="card soft-card" style="margin-top: 16px; padding: 0;">
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Employee</th>
+              <th>Status</th>
+              <th>Open</th>
+              <th>Overdue</th>
+              <th>Done 7d</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for employee in employees %}
+            {% set snapshot = employee_snapshots.get(employee.id) %}
+            <tr>
+              <td>
+                <strong>{{ employee.full_name }}</strong>
+                <div class="status-line">{{ employee.role_title or "—" }} · {{ employee.department or "—" }}</div>
+              </td>
+              <td><span class="badge {{ 'bad' if snapshot and snapshot.status == 'critical' else 'warn' if snapshot and snapshot.status == 'warning' else 'good' }}">{{ employee.status }}</span></td>
+              <td>{{ snapshot.open_tasks if snapshot else 0 }}</td>
+              <td>{{ snapshot.overdue_tasks if snapshot else 0 }}</td>
+              <td>{{ snapshot.completed_7d if snapshot else 0 }}</td>
+              <td><a class="pill-link" href="/admin/{{ runtime.account.slug }}/people?employee_id={{ employee.id }}">open</a></td>
+            </tr>
+            {% else %}
+            <tr><td colspan="6" class="empty">No employee records yet.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </article>
+
+  <article class="card">
+    <div class="actions" style="justify-content: space-between;">
+      <div>
+        <h3>Execution and KPI</h3>
+        <p class="subtle">Workload, overdue pressure and completion rhythm for the selected employee.</p>
+      </div>
+      {% if selected_employee %}
+      <span class="badge">{{ selected_employee.full_name }}</span>
+      {% endif %}
+    </div>
+
+    {% if selected_employee %}
+    {% set snapshot = employee_snapshots.get(selected_employee.id) %}
+    <section class="grid cols-2" style="margin-top: 14px;">
+      <article class="card metric"><span class="subtle">Open tasks</span><span class="value">{{ snapshot.open_tasks if snapshot else 0 }}</span></article>
+      <article class="card metric"><span class="subtle">Overdue</span><span class="value">{{ snapshot.overdue_tasks if snapshot else 0 }}</span></article>
+      <article class="card metric"><span class="subtle">Done 7d</span><span class="value">{{ snapshot.completed_7d if snapshot else 0 }}</span></article>
+      <article class="card metric"><span class="subtle">Done 30d</span><span class="value">{{ snapshot.completed_30d if snapshot else 0 }}</span></article>
+      <article class="card metric"><span class="subtle">Open alerts</span><span class="value">{{ snapshot.open_alerts if snapshot else 0 }}</span></article>
+      <article class="card metric"><span class="subtle">Avg completion hours</span><span class="value">{{ "%.1f"|format(snapshot.avg_completion_hours_30d) if snapshot and snapshot.avg_completion_hours_30d is not none else "—" }}</span></article>
+    </section>
+
+    {% if can_create_tasks %}
+    <section class="card soft-card" style="margin-top: 16px; padding: 14px;">
+      <h4>Create Task For Employee</h4>
+      <div class="form-grid two" style="margin-top: 12px;">
+        <label>
+          Title
+          <input id="people-task-title" placeholder="Call supplier and confirm stock">
+        </label>
+        <label>
+          Priority
+          <select id="people-task-priority">
+            {% for option in ['low', 'normal', 'high', 'critical'] %}
+            <option value="{{ option }}" {{ 'selected' if option == 'normal' else '' }}>{{ option }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>
+          Due at (UTC ISO)
+          <input id="people-task-due-at" placeholder="2026-04-20T10:00:00+00:00">
+        </label>
+        <label>
+          Fallback assignee user
+          <select id="people-task-user-id">
+            <option value="{{ selected_employee.user_id if selected_employee.user_id else '' }}">{{ (selected_employee.full_name ~ ' linked user') if selected_employee.user_id else 'auto from linked user / none' }}</option>
+            {% for user in selectable_users %}
+            <option value="{{ user.id }}">{{ user.full_name or user.email }}</option>
+            {% endfor %}
+          </select>
+        </label>
+      </div>
+      <label style="margin-top: 12px;">
+        Description
+        <textarea id="people-task-description" rows="4" placeholder="What exactly should be done, what outcome is expected, what to escalate if blocked."></textarea>
+      </label>
+      <div class="actions" style="margin-top: 14px;">
+        <button type="button" id="create-people-task">Create task</button>
+        <span class="subtle" id="people-task-status"></span>
+      </div>
+    </section>
+    {% endif %}
+
+    <section class="card soft-card" style="margin-top: 16px; padding: 0;">
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Task</th><th>Priority</th><th>Status</th><th>Due</th></tr></thead>
+          <tbody>
+            {% for task in selected_tasks %}
+            <tr>
+              <td>{{ task.title }}</td>
+              <td>{{ task.priority }}</td>
+              <td>{{ task.status }}</td>
+              <td>{{ task.due_at or '—' }}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="4" class="empty">No tasks tied to this employee yet.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+    {% else %}
+    <p class="empty" style="margin-top: 16px;">Choose an employee from the left or create the first one.</p>
+    {% endif %}
+  </article>
+</section>
+
+<script>
+  const saveEmployeeButton = document.getElementById("save-employee");
+  if (saveEmployeeButton) {
+    saveEmployeeButton.addEventListener("click", async () => {
+      const statusNode = document.getElementById("employee-save-status");
+      statusNode.textContent = "Saving...";
+      const response = await adminFetch(`/admin/{{ runtime.account.slug }}/people/employee/save`, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+          employee_id: {{ selected_employee.id if selected_employee else 'null' }},
+          employee: {
+            user_id: document.getElementById("employee-user-id").value || null,
+            employee_code: document.getElementById("employee-code").value.trim() || null,
+            full_name: document.getElementById("employee-full-name").value.trim(),
+            role_title: document.getElementById("employee-role-title").value.trim() || null,
+            department: document.getElementById("employee-department").value.trim() || null,
+            email: document.getElementById("employee-email").value.trim() || null,
+            phone: document.getElementById("employee-phone").value.trim() || null,
+            status: document.getElementById("employee-status").value,
+          }
+        }),
+      });
+      if (!response.ok) {
+        statusNode.textContent = await response.text();
+        return;
+      }
+      const body = await response.json();
+      statusNode.textContent = `Saved employee #${body.employee.id}`;
+      window.location.href = `/admin/{{ runtime.account.slug }}/people?employee_id=${body.employee.id}`;
+    });
+  }
+
+  const createTaskButton = document.getElementById("create-people-task");
+  if (createTaskButton) {
+    createTaskButton.addEventListener("click", async () => {
+      const statusNode = document.getElementById("people-task-status");
+      statusNode.textContent = "Creating...";
+      const response = await adminFetch(`/admin/{{ runtime.account.slug }}/people/tasks/create`, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+          task: {
+            assignee_employee_id: {{ selected_employee.id if selected_employee else 'null' }},
+            assignee_user_id: document.getElementById("people-task-user-id").value || null,
+            title: document.getElementById("people-task-title").value.trim(),
+            description: document.getElementById("people-task-description").value.trim() || null,
+            priority: document.getElementById("people-task-priority").value,
+            due_at: document.getElementById("people-task-due-at").value.trim() || null,
+          }
+        }),
+      });
+      if (!response.ok) {
+        statusNode.textContent = await response.text();
+        return;
+      }
+      const body = await response.json();
+      statusNode.textContent = `Task #${body.task.id} created`;
+      window.location.reload();
+    });
+  }
+</script>
+{% endblock %}

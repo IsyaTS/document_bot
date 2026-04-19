@@ -25,7 +25,7 @@ from platform_core.runtime_delivery import write_delivery_bundle
 from platform_core.runtime_obsidian import export_account_delivery_note, export_portfolio_brief_note
 from platform_core.exceptions import AuthorizationError, PlatformCoreError, TenantContextError
 from platform_core.runtime_status import read_runtime_status, write_runtime_status
-from platform_core.services import AuditLogService, ExecutiveDashboardService, GOAL_METRIC_DEFINITIONS, GoalService, KnowledgeService
+from platform_core.services import AuditLogService, EmployeeSnapshot, ExecutiveDashboardService, GOAL_METRIC_DEFINITIONS, GoalService, KnowledgeService, PeopleService
 from platform_core.services.accounts import AccountService, MembershipService, UserService
 from platform_core.services.user_security import UserSecurityService
 from platform_core.services.runtime import (
@@ -245,6 +245,7 @@ def create_app() -> FastAPI:
             "alerts_tasks": "alerts-tasks",
             "ops_sync": "ops-sync",
             "knowledge": "knowledge",
+            "people": "people",
             "goals": "goals",
             "members": "members",
             "settings": "settings",
@@ -401,6 +402,8 @@ def create_app() -> FastAPI:
             items.append({"key": "dashboard", "label": "Dashboard", "path": "dashboard"})
             if feature_access["knowledge_base"]["allowed"]:
                 items.append({"key": "knowledge", "label": "Knowledge", "path": "knowledge"})
+            if feature_access["people_execution"]["allowed"]:
+                items.append({"key": "people", "label": "People", "path": "people"})
             if feature_access["goals_tracking"]["allowed"]:
                 items.append({"key": "goals", "label": "Goals", "path": "goals"})
         if "alerts.read" in permissions or "tasks.read" in permissions or "*" in permissions:
@@ -969,6 +972,7 @@ def create_app() -> FastAPI:
             {"key": "portfolio_console", "label": "Portfolio console", "description": "Owner-level portfolio visibility."},
             {"key": "owner_briefs", "label": "Owner briefs", "description": "Portfolio briefs and digest blocks."},
             {"key": "knowledge_base", "label": "Knowledge base", "description": "Operational memory, files and SOP knowledge."},
+            {"key": "people_execution", "label": "People execution", "description": "Employee registry, workload and KPI view."},
             {"key": "goals_tracking", "label": "Goals tracking", "description": "Plan vs fact and goal workflows."},
             {"key": "integrations_setup", "label": "Integrations setup", "description": "Admin UI for integration setup and sync."},
             {"key": "ops_console", "label": "Ops console", "description": "Ops / Sync visibility and actions."},
@@ -979,25 +983,25 @@ def create_app() -> FastAPI:
             "internal": {
                 "label": "Internal",
                 "summary": "Internal operator deployment with full platform surface for live business use.",
-                "recommended_features": {"portfolio_console", "owner_briefs", "knowledge_base", "goals_tracking", "integrations_setup", "ops_console"},
+                "recommended_features": {"portfolio_console", "owner_briefs", "knowledge_base", "people_execution", "goals_tracking", "integrations_setup", "ops_console"},
                 "usage_note": "Best fit for active internal operations and product validation.",
             },
             "pilot": {
                 "label": "Pilot",
                 "summary": "Small rollout for one operating team with core execution and onboarding flows.",
-                "recommended_features": {"owner_briefs", "knowledge_base", "goals_tracking", "integrations_setup", "ops_console"},
+                "recommended_features": {"owner_briefs", "knowledge_base", "people_execution", "goals_tracking", "integrations_setup", "ops_console"},
                 "usage_note": "Good for proving value before broad rollout.",
             },
             "growth": {
                 "label": "Growth",
                 "summary": "Multi-account owner workflow with portfolio visibility and delivery flows.",
-                "recommended_features": {"portfolio_console", "owner_briefs", "knowledge_base", "goals_tracking", "integrations_setup", "ops_console"},
+                "recommended_features": {"portfolio_console", "owner_briefs", "knowledge_base", "people_execution", "goals_tracking", "integrations_setup", "ops_console"},
                 "usage_note": "Designed for wider operational rollout.",
             },
             "enterprise": {
                 "label": "Enterprise",
                 "summary": "Highest readiness profile with all current product surfaces enabled.",
-                "recommended_features": {"portfolio_console", "owner_briefs", "knowledge_base", "goals_tracking", "integrations_setup", "ops_console"},
+                "recommended_features": {"portfolio_console", "owner_briefs", "knowledge_base", "people_execution", "goals_tracking", "integrations_setup", "ops_console"},
                 "usage_note": "Suitable for fully managed multi-account environments.",
             },
         }
@@ -1011,6 +1015,7 @@ def create_app() -> FastAPI:
             {"key": "active_integrations", "label": "Active integrations", "description": "Soft limit for non-archived integrations."},
             {"key": "active_goals", "label": "Active goals", "description": "Soft limit for active goals."},
             {"key": "active_knowledge_items", "label": "Knowledge items", "description": "Soft limit for active knowledge entries."},
+            {"key": "active_employees", "label": "Active employees", "description": "Soft limit for active employee records."},
         ]
 
     def _default_account_settings() -> dict[str, object]:
@@ -1136,11 +1141,13 @@ def create_app() -> FastAPI:
         )
         goals = GoalService(session).list_goals(TenantContext(account_id=account.id, actor_user_id=None, source="settings", is_system=True))
         knowledge_count = KnowledgeService(session).count_active_items(account.id)
+        active_employees = PeopleService(session).count_active_employees(account.id)
         return {
             "active_memberships": sum(1 for item in memberships if item.status == "active"),
             "active_integrations": sum(1 for item in integrations if item.status != "archived"),
             "active_goals": sum(1 for item in goals if item.status != "archived"),
             "active_knowledge_items": knowledge_count,
+            "active_employees": active_employees,
         }
 
     def _account_usage_rows(account: Account, session: Session) -> list[dict[str, object]]:
@@ -1187,6 +1194,8 @@ def create_app() -> FastAPI:
             next_steps.append({"label": "Create the first goal", "href": f"/admin/{runtime.account.slug}/goals"})
         if KnowledgeService(session).count_active_items(runtime.account.id) == 0:
             next_steps.append({"label": "Load the first SOP or knowledge note", "href": f"/admin/{runtime.account.slug}/knowledge"})
+        if PeopleService(session).count_active_employees(runtime.account.id) == 0:
+            next_steps.append({"label": "Add the first employee and assign ownership", "href": f"/admin/{runtime.account.slug}/people"})
         if len(onboarding["integration_rows"]) == 0:
             next_steps.append({"label": "Connect the first integration", "href": f"/admin/{runtime.account.slug}/integrations"})
         if onboarding["last_success"] is None and len(onboarding["integration_rows"]) > 0:
@@ -1583,6 +1592,12 @@ def create_app() -> FastAPI:
         relative = Path(account_slug) / datetime.now(timezone.utc).strftime("%Y/%m/%d") / f"{stamp}-{content_sha256[:10]}-{safe_name}{suffix}"
         absolute = knowledge_upload_root / relative
         return absolute, relative.as_posix()
+
+    def _employee_status_options() -> list[str]:
+        return ["active", "disabled"]
+
+    def _employee_snapshot_map(runtime: ResolvedRuntimeContext, session: Session) -> dict[int, EmployeeSnapshot]:
+        return {item.employee.id: item for item in PeopleService(session).employee_snapshots(runtime.context)}
 
     def _account_delivery_markdown(pack: dict[str, object]) -> str:
         account = pack["account"]
@@ -4032,6 +4047,160 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Knowledge file is missing.")
         return FileResponse(path=str(absolute_path), media_type=item.mime_type or "application/octet-stream", filename=item.file_name or absolute_path.name)
 
+    @app.get("/admin/{account_slug}/people", response_class=HTMLResponse)
+    def admin_people(
+        request: Request,
+        account_slug: str,
+        employee_id: int | None = Query(default=None),
+        session: Session = Depends(get_db_session),
+    ) -> HTMLResponse:
+        user = _current_session_user(session, request)
+        if user is None:
+            request.session.clear()
+            return _login_redirect(f"/admin/{account_slug}/people")
+        actor_email = user.email
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
+        request.session["admin_account_slug"] = runtime.account.slug
+        ensure_permission(runtime, "business.read")
+        _ensure_account_feature(runtime, "people_execution", "People execution")
+        people_service = PeopleService(session)
+        employees = people_service.list_employees(runtime.context)
+        employee_snapshots = _employee_snapshot_map(runtime, session)
+        selected_employee = None
+        if employee_id is not None:
+            try:
+                selected_employee = people_service.get_employee(runtime.context, employee_id)
+            except TenantContextError as exc:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        elif employees:
+            selected_employee = employees[0]
+        membership_rows = [item for item in _membership_rows(runtime.account, session) if item.status == "active" and item.user is not None]
+        selectable_users = [item.user for item in membership_rows]
+        selected_tasks = []
+        if selected_employee is not None:
+            selected_tasks = [
+                item for item in RuntimeAutomationService(session).list_tasks(runtime.context)
+                if item.assignee_employee_id == selected_employee.id or (selected_employee.user_id is not None and item.assignee_user_id == selected_employee.user_id)
+            ][:12]
+        return templates.TemplateResponse(
+            request,
+            "admin/people.html",
+            {
+                **_admin_context(request, session, runtime, page="people"),
+                "employees": employees,
+                "employee_snapshots": employee_snapshots,
+                "selected_employee": selected_employee,
+                "selected_tasks": selected_tasks,
+                "selectable_users": selectable_users,
+                "employee_status_options": _employee_status_options(),
+                "default_users": _default_account_users(runtime, session),
+                "can_manage_people": _is_manager_role(runtime.role_code),
+                "can_create_tasks": "*" in runtime.permissions or "tasks.manage" in runtime.permissions,
+            },
+        )
+
+    @app.post("/admin/{account_slug}/people/employee/save")
+    async def admin_save_employee(
+        request: Request,
+        account_slug: str,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        payload = await request.json()
+        actor_email = _require_admin_user(request, session).email
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
+        _require_account_manager(runtime)
+        ensure_permission(runtime, "business.write")
+        _ensure_account_feature(runtime, "people_execution", "People execution")
+        body = payload.get("employee") or {}
+        try:
+            employee = PeopleService(session).upsert_employee(
+                runtime.context,
+                employee_id=int(payload["employee_id"]) if payload.get("employee_id") else None,
+                user_id=int(body["user_id"]) if body.get("user_id") else None,
+                employee_code=str(body.get("employee_code") or "").strip() or None,
+                full_name=str(body.get("full_name") or "").strip(),
+                role_title=str(body.get("role_title") or "").strip() or None,
+                department=str(body.get("department") or "").strip() or None,
+                email=str(body.get("email") or "").strip() or None,
+                phone=str(body.get("phone") or "").strip() or None,
+                status=str(body.get("status") or "active").strip(),
+            )
+            AuditLogService(session).log(
+                runtime.context,
+                "people.employee.saved",
+                "employee",
+                str(employee.id),
+                details={"status": employee.status, "user_id": employee.user_id},
+            )
+        except (PlatformCoreError, TenantContextError, ValueError, IntegrityError) as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        return JSONResponse({"employee": _serialize_employee(employee)})
+
+    @app.post("/admin/{account_slug}/people/tasks/create")
+    async def admin_create_people_task(
+        request: Request,
+        account_slug: str,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        payload = await request.json()
+        actor_email = _require_admin_user(request, session).email
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
+        ensure_permission(runtime, "tasks.manage")
+        _ensure_account_feature(runtime, "people_execution", "People execution")
+        body = payload.get("task") or {}
+        title = str(body.get("title") or "").strip()
+        if not title:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Task title is required.")
+        employee_id = int(body["assignee_employee_id"]) if body.get("assignee_employee_id") else None
+        assignee_user_id = int(body["assignee_user_id"]) if body.get("assignee_user_id") else None
+        if employee_id is None and assignee_user_id is None:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Assignee is required.")
+        if employee_id is not None:
+            employee = PeopleService(session).get_employee(runtime.context, employee_id)
+            if assignee_user_id is None and employee.user_id is not None:
+                assignee_user_id = employee.user_id
+        due_at_raw = str(body.get("due_at") or "").strip()
+        due_at = datetime.fromisoformat(due_at_raw) if due_at_raw else None
+        if due_at is not None and due_at.tzinfo is None:
+            due_at = due_at.replace(tzinfo=timezone.utc)
+        task = Task(
+            account_id=runtime.account.id,
+            assignee_user_id=assignee_user_id,
+            assignee_employee_id=employee_id,
+            created_by_user_id=runtime.actor_user.id,
+            source="manual",
+            title=title,
+            description=str(body.get("description") or "").strip() or None,
+            status="open",
+            priority=str(body.get("priority") or "normal").strip() or "normal",
+            due_at=due_at,
+            related_entity_type="employee",
+            related_entity_id=str(employee_id) if employee_id is not None else None,
+        )
+        session.add(task)
+        session.flush()
+        session.add(
+            TaskEvent(
+                account_id=runtime.account.id,
+                task_id=task.id,
+                actor_user_id=runtime.actor_user.id,
+                event_type="task.created_from_people_ui",
+                event_at=datetime.now(timezone.utc),
+                payload_json={"assignee_employee_id": employee_id, "assignee_user_id": assignee_user_id},
+            )
+        )
+        AuditLogService(session).log(
+            runtime.context,
+            "people.task.created",
+            "task",
+            str(task.id),
+            details={"assignee_employee_id": employee_id, "assignee_user_id": assignee_user_id},
+        )
+        session.flush()
+        return JSONResponse({"task": _serialize_task(task)})
+
     @app.get("/admin/{account_slug}/alerts-tasks", response_class=HTMLResponse)
     def admin_alerts_tasks(
         request: Request,
@@ -4841,6 +5010,24 @@ def _serialize_membership(membership: AccountUser) -> dict[str, object]:
             "status": membership.user.status,
             "password_set_at": _serialize_datetime(membership.user.password_set_at),
         },
+    }
+
+
+def _serialize_employee(employee: Employee) -> dict[str, object]:
+    return {
+        "id": employee.id,
+        "account_id": employee.account_id,
+        "user_id": employee.user_id,
+        "employee_code": employee.employee_code,
+        "full_name": employee.full_name,
+        "role_title": employee.role_title,
+        "department": employee.department,
+        "email": employee.email,
+        "phone": employee.phone,
+        "status": employee.status,
+        "hired_at": employee.hired_at.isoformat() if employee.hired_at else None,
+        "created_at": _serialize_datetime(employee.created_at),
+        "updated_at": _serialize_datetime(employee.updated_at),
     }
 
 

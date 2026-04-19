@@ -271,6 +271,7 @@ Server-rendered admin app lives in `platform_runtime/app.py` and now includes:
   - `/admin/{account_slug}/brief`
   - `/admin/{account_slug}/delivery`
   - `/admin/{account_slug}/knowledge`
+  - `/admin/{account_slug}/people`
   - `/admin/{account_slug}/integrations`
   - `/admin/{account_slug}/alerts-tasks`
   - `/admin/{account_slug}/ops-sync`
@@ -387,6 +388,25 @@ Stage 8.5 adds:
   - `active_knowledge_items` soft-limit visibility
   - readiness next-step hint when account has no knowledge seeded
 - uploaded files are stored under `data/runtime_knowledge_uploads/`
+
+Stage 8.6 adds:
+
+- account-scoped people execution page:
+  - `GET /admin/{account_slug}/people`
+  - `POST /admin/{account_slug}/people/employee/save`
+  - `POST /admin/{account_slug}/people/tasks/create`
+- employee registry on top of the existing `employees` table
+- KPI snapshots derived from existing tasks and alerts:
+  - open tasks
+  - overdue tasks
+  - completed 7d / 30d
+  - average completion hours
+  - open alerts pressure
+- direct manual task creation for employees from the people console
+- product-layer integration:
+  - `people_execution` feature flag
+  - `active_employees` soft-limit visibility
+  - readiness hint when the account has no employees configured
 
 Stage 8.1 adds:
 
