@@ -1769,10 +1769,10 @@ def create_app() -> FastAPI:
         return ["invoice", "claim", "purchase_order", "receipt", "internal_note"]
 
     def _document_status_options() -> list[str]:
-        return ["draft", "issued", "sent", "paid", "archived"]
+        return ["draft", "issued", "sent", "accepted", "paid", "archived"]
 
     def _installation_status_options() -> list[str]:
-        return ["open", "scheduled", "done", "cancelled"]
+        return ["open", "scheduled", "en_route", "on_site", "done", "cancelled"]
 
     def _communication_channel_options() -> list[str]:
         return ["message", "call", "chat", "email"]
@@ -4958,6 +4958,7 @@ def create_app() -> FastAPI:
         installation_requests = operations_service.list_installation_requests(runtime.context)
         stagnant_threshold = threshold_days
         stagnant_stock = operations_service.stagnant_stock(runtime.context, threshold_days=stagnant_threshold)
+        reorder_suggestions = operations_service.reorder_suggestions(runtime.context)
         recent_customers = session.execute(
             select(Customer)
             .where(Customer.account_id == runtime.account.id)
@@ -5022,6 +5023,7 @@ def create_app() -> FastAPI:
                 "documents": documents,
                 "installation_requests": installation_requests,
                 "stagnant_stock": stagnant_stock,
+                "reorder_suggestions": reorder_suggestions,
                 "stagnant_threshold_days": stagnant_threshold,
                 "recent_customers": recent_customers,
                 "recent_deals": recent_deals,
@@ -5161,6 +5163,38 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
         return JSONResponse({"purchase": _serialize_purchase(purchase)})
 
+    @app.post("/admin/{account_slug}/operations/purchases/reorder")
+    async def admin_create_reorder_purchase(
+        request: Request,
+        account_slug: str,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        payload = await request.json()
+        actor_email = _require_admin_user(request, session).email
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
+        ensure_permission(runtime, "business.write")
+        _ensure_account_feature(runtime, "operations_workflows", "Operations")
+        body = _parse_admin_payload(payload, "reorder")
+        try:
+            purchase = OperationsService(session).create_reorder_purchase(
+                runtime.context,
+                stock_item_id=int(body["stock_item_id"]),
+                supplier_customer_id=int(body["supplier_customer_id"]) if body.get("supplier_customer_id") else None,
+                unit_cost=Decimal(str(body.get("unit_cost") or "0")),
+                notes=str(body.get("notes") or "").strip() or None,
+            )
+            AuditLogService(session).log(
+                runtime.context,
+                "operations.purchase.reorder_created",
+                "purchase",
+                str(purchase.id),
+                details={"purchase_number": purchase.purchase_number, "status": purchase.status},
+            )
+        except (PlatformCoreError, TenantContextError, ValueError, ArithmeticError, KeyError) as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        return JSONResponse({"purchase": _serialize_purchase(purchase)})
+
     @app.post("/admin/{account_slug}/operations/documents/save")
     async def admin_save_document(
         request: Request,
@@ -5200,6 +5234,30 @@ def create_app() -> FastAPI:
         except (PlatformCoreError, TenantContextError, ValueError, IntegrityError, ArithmeticError) as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
         return JSONResponse({"document": _serialize_document(document)})
+
+    @app.get("/admin/{account_slug}/operations/documents/{document_id}/preview.{format_name}")
+    def admin_document_preview_export(
+        request: Request,
+        account_slug: str,
+        document_id: int,
+        format_name: str,
+        session: Session = Depends(get_db_session),
+    ) -> PlainTextResponse:
+        user = _current_session_user(session, request)
+        if user is None:
+            request.session.clear()
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Admin session is required.")
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=user.email)
+        ensure_permission(runtime, "documents.manage")
+        _ensure_account_feature(runtime, "operations_workflows", "Operations")
+        preview = BusinessOSService(session).render_document_preview(runtime, document_id)
+        if format_name == "md":
+            payload = f"# {runtime.account.name} document preview\n\n```\n{preview}\n```\n"
+        elif format_name == "txt":
+            payload = preview + "\n"
+        else:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unsupported preview format.")
+        return PlainTextResponse(payload)
 
     @app.post("/admin/{account_slug}/operations/installations/save")
     async def admin_save_installation(
@@ -5268,6 +5326,44 @@ def create_app() -> FastAPI:
         except (PlatformCoreError, TenantContextError, ValueError, IntegrityError) as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
         return JSONResponse({"installation_request": _serialize_installation_request(installation), "task": _serialize_task(created_task) if created_task else None})
+
+    @app.post("/admin/{account_slug}/operations/installations/{installation_id}/dispatch")
+    async def admin_dispatch_installation(
+        request: Request,
+        account_slug: str,
+        installation_id: int,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        payload = await request.json()
+        actor_email = _require_admin_user(request, session).email
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
+        ensure_permission(runtime, "business.write")
+        _ensure_account_feature(runtime, "operations_workflows", "Operations")
+        body = _parse_admin_payload(payload, "dispatch")
+        scheduled_for_raw = str(body.get("scheduled_for") or "").strip()
+        scheduled_for = datetime.fromisoformat(scheduled_for_raw) if scheduled_for_raw else None
+        if scheduled_for is not None and scheduled_for.tzinfo is None:
+            scheduled_for = scheduled_for.replace(tzinfo=timezone.utc)
+        try:
+            request_item = OperationsService(session).dispatch_installation(
+                runtime.context,
+                installation_id=installation_id,
+                assigned_employee_id=int(body["assigned_employee_id"]) if body.get("assigned_employee_id") else None,
+                scheduled_for=scheduled_for,
+                address=str(body.get("address") or "").strip() or None,
+                dispatch_note=str(body.get("dispatch_note") or "").strip() or None,
+            )
+            AuditLogService(session).log(
+                runtime.context,
+                "operations.installation.dispatched",
+                "installation_request",
+                str(request_item.id),
+                details={"status": request_item.status, "assigned_employee_id": request_item.assigned_employee_id},
+            )
+        except (PlatformCoreError, TenantContextError, ValueError) as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        return JSONResponse({"installation_request": _serialize_installation_request(request_item)})
 
     @app.get("/admin/{account_slug}/communications", response_class=HTMLResponse)
     def admin_communications(

@@ -137,7 +137,7 @@ class BusinessOSService:
         request_item = self.session.execute(
             select(InstallationRequest).where(InstallationRequest.account_id == runtime.account.id, InstallationRequest.id == installation_id)
         ).scalar_one()
-        if status_code not in {"open", "scheduled", "done", "cancelled"}:
+        if status_code not in {"open", "scheduled", "en_route", "on_site", "done", "cancelled"}:
             raise ValueError("Unsupported installation status.")
         request_item.status = status_code
         self.session.flush()
@@ -147,7 +147,7 @@ class BusinessOSService:
         document = self.session.execute(
             select(Document).where(Document.account_id == runtime.account.id, Document.id == document_id)
         ).scalar_one()
-        if status_code not in {"draft", "issued", "sent", "paid", "archived"}:
+        if status_code not in {"draft", "issued", "sent", "accepted", "paid", "archived"}:
             raise ValueError("Unsupported document status.")
         document.status = status_code
         self.session.flush()
@@ -193,6 +193,14 @@ class BusinessOSService:
                 "- confirm goods or service scope",
                 "- send invoice to customer",
                 "- track payment status until paid",
+            ])
+        elif document.document_type == "purchase_order":
+            lines.extend([
+                "",
+                "Procurement instructions:",
+                "- confirm supplier and stock line",
+                "- move request to approved / ordered",
+                "- receive stock and close the order",
             ])
         return "\n".join(lines)
 

@@ -173,6 +173,7 @@ Telegram-бот продолжает жить как legacy adapter, а platform
 - stage 9.0: business os expansion foundation
 - stage 9.1: auto communications and outbound notification dispatch foundation
 - stage 9.2: execution discipline and payroll payments foundation
+- stage 9.3: procurement, logistics and document workflows
 - stage 7.8: productization layer
 - stage 7.9: execution brief and account actions
 - stage 8.0: delivery layer and product polish
@@ -440,6 +441,22 @@ Stage 8.7 adds:
   - `operations_workflows` feature flag
   - `active_documents`, `open_installation_requests`, `open_purchase_requests` soft-limit visibility
   - readiness hint when the account has no product/warehouse setup
+
+Stage 9.3 adds:
+
+- procurement workflow hardening:
+  - reorder suggestions from low stock
+  - `POST /admin/{account_slug}/operations/purchases/reorder`
+  - richer purchase lifecycle states in the operations console
+- logistics workflow hardening:
+  - `POST /admin/{account_slug}/operations/installations/{installation_id}/dispatch`
+  - dispatch scheduling and address confirmation
+  - lifecycle states for field work (`scheduled`, `en_route`, `on_site`, `done`)
+- documents workflow hardening:
+  - `GET /admin/{account_slug}/operations/documents/{document_id}/preview.txt`
+  - `GET /admin/{account_slug}/operations/documents/{document_id}/preview.md`
+  - richer document lifecycle states (`sent`, `accepted`, `paid`, `archived`)
+  - `purchase_order` preview support
 
 Stage 8.8 adds:
 

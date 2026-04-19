@@ -21,6 +21,16 @@ class StagnantStockRow:
     status: str
 
 
+@dataclass(frozen=True)
+class ReorderSuggestion:
+    stock_item: StockItem
+    product: Product
+    warehouse: Warehouse
+    current_quantity: Decimal
+    threshold_quantity: Decimal
+    recommended_quantity: Decimal
+
+
 class OperationsService:
     def __init__(self, session: Session) -> None:
         self.session = session
@@ -339,6 +349,105 @@ class OperationsService:
         rows.sort(key=lambda item: (-self._status_weight(item.status), -(item.days_since_movement or 0), item.product.name.lower()))
         return rows
 
+    def reorder_suggestions(self, context: TenantContext) -> list[ReorderSuggestion]:
+        account_id = require_account_id(context)
+        items = self.session.execute(
+            select(StockItem).where(StockItem.account_id == account_id).order_by(StockItem.id.asc())
+        ).scalars().all()
+        if not items:
+            return []
+        product_ids = {item.product_id for item in items}
+        warehouse_ids = {item.warehouse_id for item in items}
+        product_map = {
+            item.id: item
+            for item in self.session.execute(
+                select(Product).where(Product.account_id == account_id, Product.id.in_(product_ids))
+            ).scalars().all()
+        }
+        warehouse_map = {
+            item.id: item
+            for item in self.session.execute(
+                select(Warehouse).where(Warehouse.account_id == account_id, Warehouse.id.in_(warehouse_ids))
+            ).scalars().all()
+        }
+        rows: list[ReorderSuggestion] = []
+        for item in items:
+            product = product_map[item.product_id]
+            warehouse = warehouse_map[item.warehouse_id]
+            threshold = max(Decimal(item.min_quantity), Decimal(product.min_stock_level), Decimal("1"))
+            current_quantity = Decimal(item.quantity_on_hand)
+            if current_quantity > threshold:
+                continue
+            recommended_quantity = max(Decimal(item.reorder_quantity), (threshold * Decimal("2")) - current_quantity, Decimal("1"))
+            rows.append(
+                ReorderSuggestion(
+                    stock_item=item,
+                    product=product,
+                    warehouse=warehouse,
+                    current_quantity=current_quantity,
+                    threshold_quantity=threshold,
+                    recommended_quantity=recommended_quantity.quantize(Decimal("0.01")),
+                )
+            )
+        rows.sort(key=lambda item: (item.current_quantity, item.product.name.lower()))
+        return rows
+
+    def create_reorder_purchase(
+        self,
+        context: TenantContext,
+        *,
+        stock_item_id: int,
+        supplier_customer_id: int | None,
+        unit_cost: Decimal,
+        notes: str | None = None,
+    ) -> Purchase:
+        account_id = require_account_id(context)
+        stock_item = self.session.execute(
+            select(StockItem).where(StockItem.account_id == account_id, StockItem.id == stock_item_id)
+        ).scalar_one_or_none()
+        if stock_item is None:
+            raise PlatformCoreError("Stock item not found in selected account.")
+        suggestions = {item.stock_item.id: item for item in self.reorder_suggestions(context)}
+        suggestion = suggestions.get(stock_item.id)
+        if suggestion is None:
+            raise PlatformCoreError("Selected stock item does not need reorder right now.")
+        return self.create_purchase_request(
+            context,
+            supplier_customer_id=supplier_customer_id,
+            warehouse_id=stock_item.warehouse_id,
+            product_id=stock_item.product_id,
+            quantity=suggestion.recommended_quantity,
+            unit_cost=unit_cost,
+            notes=notes or f"Auto reorder for {suggestion.product.name}",
+        )
+
+    def dispatch_installation(
+        self,
+        context: TenantContext,
+        *,
+        installation_id: int,
+        assigned_employee_id: int | None,
+        scheduled_for: datetime | None,
+        address: str | None,
+        dispatch_note: str | None,
+    ) -> InstallationRequest:
+        request_item = self._installation_request(context, installation_id)
+        if assigned_employee_id is not None:
+            self._employee(request_item.account_id, assigned_employee_id)
+            request_item.assigned_employee_id = assigned_employee_id
+        if scheduled_for is not None:
+            request_item.scheduled_for = scheduled_for
+        if address is not None:
+            request_item.address = address.strip() or request_item.address
+        request_item.status = "scheduled" if request_item.status == "open" else request_item.status
+        request_item.notes_json = {
+            **(request_item.notes_json or {}),
+            "dispatch_note": (dispatch_note or "").strip() or None,
+            "last_dispatched_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self.session.flush()
+        return request_item
+
     def _purchase(self, context: TenantContext, purchase_id: int) -> Purchase:
         account_id = require_account_id(context)
         purchase = self.session.execute(
@@ -379,6 +488,15 @@ class OperationsService:
         if employee is None:
             raise PlatformCoreError("Employee not found in selected account.")
         return employee
+
+    def _installation_request(self, context: TenantContext, installation_id: int) -> InstallationRequest:
+        account_id = require_account_id(context)
+        request_item = self.session.execute(
+            select(InstallationRequest).where(InstallationRequest.account_id == account_id, InstallationRequest.id == installation_id)
+        ).scalar_one_or_none()
+        if request_item is None:
+            raise TenantContextError("Installation request not found in selected account.")
+        return request_item
 
     def _warehouse(self, account_id: int, warehouse_id: int) -> Warehouse:
         warehouse = self.session.execute(

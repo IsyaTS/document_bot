@@ -9,6 +9,7 @@
     <span class="chip">{{ products|length }} products</span>
     <span class="chip">{{ warehouses|length }} warehouses</span>
     <span class="chip">{{ purchases|length }} purchases</span>
+    <span class="chip">{{ reorder_suggestions|length }} reorder</span>
     <a class="pill-link" href="/admin/{{ runtime.account.slug }}/delivery">delivery pack</a>
   </div>
 </div>
@@ -103,6 +104,31 @@
         </table>
       </div>
     </section>
+
+    <section class="card soft-card" style="margin-top: 16px; padding: 0;">
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Reorder</th><th>Current</th><th>Threshold</th><th>Recommended</th><th></th></tr></thead>
+          <tbody>
+            {% for suggestion in reorder_suggestions %}
+            <tr>
+              <td><strong>{{ suggestion.product.name }}</strong><div class="status-line">{{ suggestion.warehouse.name }}</div></td>
+              <td>{{ suggestion.current_quantity }}</td>
+              <td>{{ suggestion.threshold_quantity }}</td>
+              <td>{{ suggestion.recommended_quantity }}</td>
+              <td>
+                {% if can_manage_operations %}
+                <button type="button" class="secondary create-reorder" data-stock-item-id="{{ suggestion.stock_item.id }}" data-unit-cost="{{ suggestion.product.cost_price }}">reorder</button>
+                {% endif %}
+              </td>
+            </tr>
+            {% else %}
+            <tr><td colspan="5" class="empty">No reorder suggestions right now.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
   </article>
 
   <article class="card">
@@ -174,8 +200,17 @@
               </td>
               <td>{{ purchase.total_amount }} {{ purchase.currency }}</td>
               <td>
-                {% if purchase.status != 'received' and can_manage_operations %}
-                <button type="button" class="secondary receive-purchase" data-purchase-id="{{ purchase.id }}">Receive</button>
+                {% if can_manage_operations %}
+                <div class="actions">
+                  <select class="purchase-status-select" data-purchase-id="{{ purchase.id }}">
+                    {% for status_code in ['draft','requested','approved','ordered','received','cancelled'] %}
+                    <option value="{{ status_code }}" {{ 'selected' if purchase.status == status_code else '' }}>{{ status_code }}</option>
+                    {% endfor %}
+                  </select>
+                  {% if purchase.status != 'received' %}
+                  <button type="button" class="secondary receive-purchase" data-purchase-id="{{ purchase.id }}">Receive</button>
+                  {% endif %}
+                </div>
                 {% else %}
                 <span class="status-line">{{ purchase.received_at or "received" }}</span>
                 {% endif %}
@@ -253,17 +288,31 @@
     <section class="card soft-card" style="margin-top: 16px; padding: 0;">
       <div class="table-wrap">
         <table>
-          <thead><tr><th>Document</th><th>Status</th><th>Customer</th><th>Total</th></tr></thead>
+          <thead><tr><th>Document</th><th>Status</th><th>Customer</th><th>Total</th><th></th></tr></thead>
           <tbody>
             {% for document in documents %}
             <tr>
               <td><strong>{{ document.document_number or (document.document_type ~ "-" ~ document.id) }}</strong><div class="status-line">{{ document.document_type }}</div></td>
-              <td>{{ document.status }}</td>
+              <td>
+                {% if can_manage_operations %}
+                <select class="document-status-select" data-document-id="{{ document.id }}">
+                  {% for option in document_status_options %}
+                  <option value="{{ option }}" {{ 'selected' if document.status == option else '' }}>{{ option }}</option>
+                  {% endfor %}
+                </select>
+                {% else %}
+                {{ document.status }}
+                {% endif %}
+              </td>
               <td>{{ customer_lookup.get(document.customer_id).name if document.customer_id in customer_lookup else "—" }}</td>
               <td>{{ document.total_amount }} {{ document.currency }}</td>
+              <td>
+                <a class="pill-link" href="/admin/{{ runtime.account.slug }}/operations/documents/{{ document.id }}/preview.txt">txt</a>
+                <a class="pill-link" href="/admin/{{ runtime.account.slug }}/operations/documents/{{ document.id }}/preview.md">md</a>
+              </td>
             </tr>
             {% else %}
-            <tr><td colspan="4" class="empty">No documents yet.</td></tr>
+            <tr><td colspan="5" class="empty">No documents yet.</td></tr>
             {% endfor %}
           </tbody>
         </table>
@@ -325,18 +374,33 @@
     <section class="card soft-card" style="margin-top: 16px; padding: 0;">
       <div class="table-wrap">
         <table>
-          <thead><tr><th>Request</th><th>Status</th><th>Assignee</th><th>Schedule</th></tr></thead>
+          <thead><tr><th>Request</th><th>Status</th><th>Assignee</th><th>Schedule</th><th></th></tr></thead>
           <tbody>
             {% for request_item in installation_requests %}
             {% set assignee = employee_lookup.get(request_item.assigned_employee_id) %}
             <tr>
               <td><strong>{{ request_item.request_number or ("inst-" ~ request_item.id) }}</strong><div class="status-line">{{ request_item.title }}</div></td>
-              <td>{{ request_item.status }}</td>
+              <td>
+                {% if can_manage_operations %}
+                <select class="installation-status-select" data-installation-id="{{ request_item.id }}">
+                  {% for option in installation_status_options %}
+                  <option value="{{ option }}" {{ 'selected' if request_item.status == option else '' }}>{{ option }}</option>
+                  {% endfor %}
+                </select>
+                {% else %}
+                {{ request_item.status }}
+                {% endif %}
+              </td>
               <td>{{ assignee.full_name if assignee else "—" }}</td>
               <td>{{ request_item.scheduled_for or "—" }}</td>
+              <td>
+                {% if can_manage_operations %}
+                <button type="button" class="secondary dispatch-installation" data-installation-id="{{ request_item.id }}" data-address="{{ request_item.address or '' }}" data-scheduled-for="{{ request_item.scheduled_for or '' }}" data-assigned-employee-id="{{ request_item.assigned_employee_id or '' }}">dispatch</button>
+                {% endif %}
+              </td>
             </tr>
             {% else %}
-            <tr><td colspan="4" class="empty">No installation requests yet.</td></tr>
+            <tr><td colspan="5" class="empty">No installation requests yet.</td></tr>
             {% endfor %}
           </tbody>
         </table>
@@ -466,6 +530,38 @@
     });
   });
 
+  document.querySelectorAll(".create-reorder").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const supplierId = window.prompt("Supplier customer id (optional)", "");
+      if (supplierId === null) return;
+      const unitCost = window.prompt("Unit cost", button.dataset.unitCost || "0");
+      if (unitCost === null) return;
+      const notes = window.prompt("Reorder note", "Auto reorder from operations console");
+      await postOperationsJson(
+        `/admin/{{ runtime.account.slug }}/operations/purchases/reorder`,
+        {reorder: {
+          stock_item_id: button.dataset.stockItemId,
+          supplier_customer_id: supplierId || null,
+          unit_cost: unitCost || 0,
+          notes: notes || null,
+        }},
+        "purchase-status",
+        (body) => `Created reorder purchase #${body.purchase.id}`
+      );
+    });
+  });
+
+  document.querySelectorAll(".purchase-status-select").forEach((node) => {
+    node.addEventListener("change", async () => {
+      await postOperationsJson(
+        `/admin/{{ runtime.account.slug }}/operations/purchases/${node.dataset.purchaseId}/status`,
+        {status: node.value},
+        "purchase-status",
+        () => "Purchase lifecycle updated."
+      );
+    });
+  });
+
   const saveDocumentButton = document.getElementById("save-document");
   if (saveDocumentButton) {
     saveDocumentButton.addEventListener("click", async () => {
@@ -487,6 +583,17 @@
     });
   }
 
+  document.querySelectorAll(".document-status-select").forEach((node) => {
+    node.addEventListener("change", async () => {
+      await postOperationsJson(
+        `/admin/{{ runtime.account.slug }}/operations/documents/${node.dataset.documentId}/status`,
+        {status: node.value},
+        "document-status-line",
+        () => "Document workflow updated."
+      );
+    });
+  });
+
   const saveInstallationButton = document.getElementById("save-installation");
   if (saveInstallationButton) {
     saveInstallationButton.addEventListener("click", async () => {
@@ -506,5 +613,39 @@
       );
     });
   }
+
+  document.querySelectorAll(".installation-status-select").forEach((node) => {
+    node.addEventListener("change", async () => {
+      await postOperationsJson(
+        `/admin/{{ runtime.account.slug }}/operations/installations/${node.dataset.installationId}/status`,
+        {status: node.value},
+        "installation-status-line",
+        () => "Installation lifecycle updated."
+      );
+    });
+  });
+
+  document.querySelectorAll(".dispatch-installation").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const scheduledFor = window.prompt("Dispatch schedule (UTC ISO)", button.dataset.scheduledFor || "");
+      if (scheduledFor === null) return;
+      const address = window.prompt("Dispatch address", button.dataset.address || "");
+      if (address === null) return;
+      const employeeId = window.prompt("Assigned employee id", button.dataset.assignedEmployeeId || "");
+      if (employeeId === null) return;
+      const dispatchNote = window.prompt("Dispatch note", "Crew confirmed and installation slot is locked.");
+      await postOperationsJson(
+        `/admin/{{ runtime.account.slug }}/operations/installations/${button.dataset.installationId}/dispatch`,
+        {dispatch: {
+          scheduled_for: scheduledFor || null,
+          address: address || null,
+          assigned_employee_id: employeeId || null,
+          dispatch_note: dispatchNote || null,
+        }},
+        "installation-status-line",
+        () => "Dispatch updated."
+      );
+    });
+  });
 </script>
 {% endblock %}
