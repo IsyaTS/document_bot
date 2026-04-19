@@ -15,6 +15,15 @@
 
 <section class="grid cols-2 integrations-layout">
   <article class="card">
+    <div class="inline-card" style="margin-bottom: 14px;">
+      <strong>Delivery targets</strong>
+      <div class="status-line">email: {{ (account_settings.notification_email_recipients or []) | join(', ') or "not configured" }}</div>
+      <div class="status-line">telegram: {{ (account_settings.notification_telegram_chat_ids or []) | join(', ') or "not configured" }}</div>
+      <div class="status-line">webhook: {{ account_settings.notification_webhook_url or "not configured" }}</div>
+      <div class="actions" style="margin-top: 10px;">
+        <a class="pill-link" href="/admin/{{ runtime.account.slug }}/settings">open settings</a>
+      </div>
+    </div>
     <h3>Generated Digests</h3>
     <div class="table-wrap" style="margin-top: 14px;">
       <table>
@@ -55,7 +64,12 @@
           <tr>
             <td>#{{ item.id }} · event #{{ item.notification_event_id }}</td>
             <td>{{ item.channel }}</td>
-            <td>{{ item.status }}</td>
+            <td>
+              {{ item.status }}
+              {% if item.payload_json.get('error') %}
+              <div class="status-line">{{ item.payload_json.get('error') }}</div>
+              {% endif %}
+            </td>
             <td><code>{{ item.delivery_path or "—" }}</code></td>
           </tr>
           {% else %}

@@ -111,3 +111,31 @@ def export_portfolio_brief_note(
         },
         settings=settings,
     )
+
+
+def export_notification_dispatch_note(
+    *,
+    account_slug: str,
+    account_name: str,
+    event_type: str,
+    channel: str,
+    generated_at: str,
+    markdown_text: str,
+    settings: PlatformSettings | None = None,
+) -> dict[str, str]:
+    timestamp = generated_at or datetime.now(timezone.utc).isoformat()
+    note_name = f"{timestamp[:10]} {account_slug} {event_type} {channel}"
+    return write_obsidian_note(
+        folder_parts=["Accounts", account_slug, "Notifications"],
+        note_name=note_name,
+        title=f"{account_name} {event_type} dispatch",
+        markdown_text=markdown_text,
+        metadata={
+            "account_slug": account_slug,
+            "scope": "notification_dispatch",
+            "event_type": event_type,
+            "channel": channel,
+            "generated_at": timestamp,
+        },
+        settings=settings,
+    )

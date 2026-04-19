@@ -1097,6 +1097,10 @@ def create_app() -> FastAPI:
             "show_portfolio_on_login": False,
             "default_owner_user_id": None,
             "default_operator_user_id": None,
+            "notification_email_recipients": [],
+            "notification_telegram_chat_ids": [],
+            "notification_webhook_url": "",
+            "export_notifications_to_obsidian": True,
         }
 
     def _account_product_config(account: Account) -> dict[str, object]:
@@ -3972,7 +3976,9 @@ def create_app() -> FastAPI:
         for item in _soft_limit_definitions():
             raw = _value(f"soft_limit_{item['key']}")
             soft_limits[item["key"]] = None if raw == "" else max(0, int(raw))
+        existing_settings = _account_product_config(runtime.account)
         updated_settings = {
+            **existing_settings,
             "branding_title": _value("branding_title"),
             "branding_subtitle": _value("branding_subtitle"),
             "default_dashboard_period": _value("default_dashboard_period", "today") or "today",
@@ -3980,6 +3986,10 @@ def create_app() -> FastAPI:
             "show_portfolio_on_login": bool(payload.get("show_portfolio_on_login")),
             "default_owner_user_id": int(_value("default_owner_user_id")) if _value("default_owner_user_id") else None,
             "default_operator_user_id": int(_value("default_operator_user_id")) if _value("default_operator_user_id") else None,
+            "notification_email_recipients": [item.strip() for item in _value("notification_email_recipients").split(",") if item.strip()],
+            "notification_telegram_chat_ids": [item.strip() for item in _value("notification_telegram_chat_ids").split(",") if item.strip()],
+            "notification_webhook_url": _value("notification_webhook_url"),
+            "export_notifications_to_obsidian": bool(payload.get("export_notifications_to_obsidian")),
         }
         try:
             AccountService(session).update_account(
@@ -4738,6 +4748,7 @@ def create_app() -> FastAPI:
                 "documents": documents,
                 "installations": installations,
                 "document_previews": document_previews,
+                "account_settings": _account_product_config(runtime.account),
                 "notification_channel_options": _notification_channel_options(),
                 "can_manage_business_os": _is_manager_role(runtime.role_code) or "*" in runtime.permissions or "business.write" in runtime.permissions,
             },

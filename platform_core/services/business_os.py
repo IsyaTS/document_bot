@@ -3,9 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
+from email.message import EmailMessage
 from pathlib import Path
 import re
+import smtplib
 
+import requests
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -24,6 +27,8 @@ from platform_core.models import (
     Task,
     Warehouse,
 )
+from platform_core.runtime_obsidian import export_notification_dispatch_note
+from platform_core.settings import load_platform_settings
 from platform_core.services.runtime import AdminQueryService, ResolvedRuntimeContext, RuntimeAutomationService
 
 
@@ -288,28 +293,48 @@ class BusinessOSService:
             generated_at=generated_at,
         )
         relative_path = delivery_path.relative_to(self._project_root())
+        resolved_target = self._resolve_dispatch_target(runtime, dispatch_channel, target_ref)
+        payload = {
+            "event_type": event.event_type,
+            "original_channel": event.channel,
+            "target_ref": resolved_target,
+        }
+        dispatch_status = "delivered"
+        try:
+            payload.update(
+                self._deliver_notification(
+                    runtime,
+                    event=event,
+                    channel=dispatch_channel,
+                    target_ref=resolved_target,
+                    artifact_path=delivery_path,
+                    generated_at=generated_at,
+                )
+            )
+        except Exception as exc:
+            dispatch_status = "failed"
+            payload["error"] = str(exc)
         dispatch = NotificationDispatch(
             account_id=runtime.account.id,
             notification_event_id=event.id,
             dispatched_by_user_id=dispatched_by_user_id,
             channel=dispatch_channel,
-            target_ref=(target_ref or "").strip() or None,
-            status="delivered",
+            target_ref=resolved_target,
+            status=dispatch_status,
             dispatched_at=generated_at,
             delivery_path=str(relative_path),
-            payload_json={
-                "event_type": event.event_type,
-                "original_channel": event.channel,
-                "target_ref": (target_ref or "").strip() or None,
-            },
+            payload_json=payload,
         )
         self.session.add(dispatch)
-        event.status = "delivered"
+        event.status = "delivered" if dispatch_status == "delivered" else "failed"
         event.payload_json = {
             **(event.payload_json or {}),
             "last_dispatch_path": str(relative_path),
             "last_dispatch_channel": dispatch_channel,
             "last_dispatched_at": generated_at.isoformat(),
+            "last_dispatch_target": resolved_target,
+            "last_dispatch_status": dispatch_status,
+            **({"last_dispatch_error": payload.get("error")} if payload.get("error") else {}),
         }
         self.session.flush()
         return dispatch
@@ -410,6 +435,202 @@ class BusinessOSService:
         latest_path = root / "latest.txt"
         latest_path.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
         return path
+
+    def _resolve_dispatch_target(
+        self,
+        runtime: ResolvedRuntimeContext,
+        channel: str,
+        target_ref: str | None,
+    ) -> str | None:
+        explicit = (target_ref or "").strip() or None
+        if explicit is not None:
+            return explicit
+        settings = runtime.account.settings_json if isinstance(runtime.account.settings_json, dict) else {}
+        if channel == "telegram":
+            chat_ids = settings.get("notification_telegram_chat_ids") or []
+            if isinstance(chat_ids, str):
+                chat_ids = [item.strip() for item in chat_ids.split(",") if item.strip()]
+            return ",".join(str(item).strip() for item in chat_ids if str(item).strip()) or None
+        if channel == "email":
+            recipients = settings.get("notification_email_recipients") or []
+            if isinstance(recipients, str):
+                recipients = [item.strip() for item in recipients.split(",") if item.strip()]
+            return ",".join(str(item).strip() for item in recipients if str(item).strip()) or None
+        if channel == "webhook":
+            webhook_url = str(settings.get("notification_webhook_url") or "").strip()
+            return webhook_url or None
+        return None
+
+    def _deliver_notification(
+        self,
+        runtime: ResolvedRuntimeContext,
+        *,
+        event: NotificationEvent,
+        channel: str,
+        target_ref: str | None,
+        artifact_path: Path,
+        generated_at: datetime,
+    ) -> dict[str, object]:
+        if channel == "internal":
+            self._export_dispatch_obsidian(
+                runtime,
+                event=event,
+                channel=channel,
+                generated_at=generated_at,
+                target_ref=target_ref,
+                artifact_path=artifact_path,
+            )
+            return {"mode": "artifact_only"}
+        if channel == "webhook":
+            return self._deliver_webhook(runtime, event, target_ref=target_ref, artifact_path=artifact_path, generated_at=generated_at)
+        if channel == "telegram":
+            return self._deliver_telegram(runtime, event, target_ref=target_ref, artifact_path=artifact_path, generated_at=generated_at)
+        if channel == "email":
+            return self._deliver_email(runtime, event, target_ref=target_ref, artifact_path=artifact_path, generated_at=generated_at)
+        raise ValueError(f"Unsupported notification channel: {channel}")
+
+    def _deliver_webhook(
+        self,
+        runtime: ResolvedRuntimeContext,
+        event: NotificationEvent,
+        *,
+        target_ref: str | None,
+        artifact_path: Path,
+        generated_at: datetime,
+    ) -> dict[str, object]:
+        if not target_ref:
+            raise ValueError("Webhook target is not configured.")
+        response = requests.post(
+            target_ref,
+            json={
+                "account_slug": runtime.account.slug,
+                "account_name": runtime.account.name,
+                "event_type": event.event_type,
+                "channel": "webhook",
+                "title": event.title,
+                "body_text": event.body_text,
+                "generated_at": generated_at.isoformat(),
+                "artifact_path": str(artifact_path),
+            },
+            timeout=10,
+        )
+        response.raise_for_status()
+        self._export_dispatch_obsidian(
+            runtime,
+            event=event,
+            channel="webhook",
+            generated_at=generated_at,
+            target_ref=target_ref,
+            artifact_path=artifact_path,
+        )
+        return {"mode": "webhook", "http_status": response.status_code}
+
+    def _deliver_telegram(
+        self,
+        runtime: ResolvedRuntimeContext,
+        event: NotificationEvent,
+        *,
+        target_ref: str | None,
+        artifact_path: Path,
+        generated_at: datetime,
+    ) -> dict[str, object]:
+        settings = load_platform_settings()
+        bot_token = settings.notification_telegram_bot_token
+        if not bot_token:
+            raise ValueError("PLATFORM_NOTIFICATION_TELEGRAM_BOT_TOKEN is not configured.")
+        chat_ids = [item.strip() for item in (target_ref or "").split(",") if item.strip()]
+        if not chat_ids:
+            raise ValueError("Telegram chat ids are not configured.")
+        text = f"{event.title}\n\n{event.body_text}".strip()
+        delivered = 0
+        for chat_id in chat_ids:
+            response = requests.post(
+                f"https://api.telegram.org/bot{bot_token}/sendMessage",
+                json={"chat_id": chat_id, "text": text},
+                timeout=10,
+            )
+            response.raise_for_status()
+            delivered += 1
+        self._export_dispatch_obsidian(
+            runtime,
+            event=event,
+            channel="telegram",
+            generated_at=generated_at,
+            target_ref=target_ref,
+            artifact_path=artifact_path,
+        )
+        return {"mode": "telegram", "delivered_count": delivered}
+
+    def _deliver_email(
+        self,
+        runtime: ResolvedRuntimeContext,
+        event: NotificationEvent,
+        *,
+        target_ref: str | None,
+        artifact_path: Path,
+        generated_at: datetime,
+    ) -> dict[str, object]:
+        settings = load_platform_settings()
+        if not settings.smtp_host or not settings.smtp_from_email:
+            raise ValueError("SMTP settings are not configured.")
+        recipients = [item.strip() for item in (target_ref or "").split(",") if item.strip()]
+        if not recipients:
+            raise ValueError("Email recipients are not configured.")
+        message = EmailMessage()
+        message["From"] = settings.smtp_from_email
+        message["To"] = ", ".join(recipients)
+        message["Subject"] = event.title
+        message.set_content(event.body_text)
+        with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=settings.smtp_timeout_seconds) as smtp:
+            if settings.smtp_use_starttls:
+                smtp.starttls()
+            if settings.smtp_username:
+                smtp.login(settings.smtp_username, settings.smtp_password or "")
+            smtp.send_message(message)
+        self._export_dispatch_obsidian(
+            runtime,
+            event=event,
+            channel="email",
+            generated_at=generated_at,
+            target_ref=target_ref,
+            artifact_path=artifact_path,
+        )
+        return {"mode": "email", "delivered_count": len(recipients)}
+
+    def _export_dispatch_obsidian(
+        self,
+        runtime: ResolvedRuntimeContext,
+        *,
+        event: NotificationEvent,
+        channel: str,
+        generated_at: datetime,
+        target_ref: str | None,
+        artifact_path: Path,
+    ) -> dict[str, str]:
+        settings_payload = runtime.account.settings_json if isinstance(runtime.account.settings_json, dict) else {}
+        if settings_payload.get("export_notifications_to_obsidian", True) is False:
+            return {}
+        markdown = "\n".join(
+            [
+                f"# {event.title}",
+                "",
+                f"- account: {runtime.account.name} ({runtime.account.slug})",
+                f"- channel: {channel}",
+                f"- target: {target_ref or 'default'}",
+                f"- generated_at: {generated_at.isoformat()}",
+                f"- artifact: {artifact_path}",
+                "",
+                event.body_text,
+            ]
+        ).strip() + "\n"
+        return export_notification_dispatch_note(
+            account_slug=runtime.account.slug,
+            account_name=runtime.account.name,
+            event_type=event.event_type,
+            channel=channel,
+            generated_at=generated_at.isoformat(),
+            markdown_text=markdown,
+        )
 
     def _project_root(self) -> Path:
         return Path(__file__).resolve().parent.parent.parent

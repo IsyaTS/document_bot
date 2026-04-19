@@ -118,6 +118,27 @@
       </section>
 
       <section class="card soft-card">
+        <h4>Notification Targets</h4>
+        <div class="form-grid two">
+          <label style="grid-column: 1 / span 2;">
+            Email recipients
+            <input name="notification_email_recipients" value="{{ (account_settings.notification_email_recipients or []) | join(', ') }}" placeholder="owner@example.com, ops@example.com">
+          </label>
+          <label style="grid-column: 1 / span 2;">
+            Telegram chat ids
+            <input name="notification_telegram_chat_ids" value="{{ (account_settings.notification_telegram_chat_ids or []) | join(', ') }}" placeholder="123456789, -100222333444">
+          </label>
+          <label style="grid-column: 1 / span 2;">
+            Webhook URL
+            <input name="notification_webhook_url" value="{{ account_settings.notification_webhook_url or '' }}" placeholder="https://example.com/webhooks/runtime-notifications">
+          </label>
+        </div>
+        <div class="chips" style="margin-top: 14px;">
+          <label class="inline-toggle"><input type="checkbox" name="export_notifications_to_obsidian" {% if account_settings.export_notifications_to_obsidian %}checked{% endif %}> export notification dispatches to Obsidian</label>
+        </div>
+      </section>
+
+      <section class="card soft-card">
         <h4>Feature Flags</h4>
         <div class="stack">
           {% for item in feature_definitions %}

@@ -28,6 +28,14 @@ class PlatformSettings:
     worker_id: str
     worker_poll_interval_seconds: int
     runtime_lease_ttl_seconds: int
+    notification_telegram_bot_token: str | None
+    smtp_host: str | None
+    smtp_port: int
+    smtp_username: str | None
+    smtp_password: str | None
+    smtp_from_email: str | None
+    smtp_use_starttls: bool
+    smtp_timeout_seconds: int
 
 
 def _default_database_url() -> str:
@@ -74,4 +82,12 @@ def load_platform_settings() -> PlatformSettings:
         worker_id=os.getenv("PLATFORM_WORKER_ID", "worker-default").strip() or "worker-default",
         worker_poll_interval_seconds=max(1, int(os.getenv("PLATFORM_WORKER_POLL_INTERVAL_SECONDS", "30"))),
         runtime_lease_ttl_seconds=max(15, int(os.getenv("PLATFORM_RUNTIME_LEASE_TTL_SECONDS", "120"))),
+        notification_telegram_bot_token=os.getenv("PLATFORM_NOTIFICATION_TELEGRAM_BOT_TOKEN") or None,
+        smtp_host=os.getenv("PLATFORM_SMTP_HOST") or None,
+        smtp_port=max(1, int(os.getenv("PLATFORM_SMTP_PORT", "587"))),
+        smtp_username=os.getenv("PLATFORM_SMTP_USERNAME") or None,
+        smtp_password=os.getenv("PLATFORM_SMTP_PASSWORD") or None,
+        smtp_from_email=os.getenv("PLATFORM_SMTP_FROM_EMAIL") or None,
+        smtp_use_starttls=(os.getenv("PLATFORM_SMTP_USE_STARTTLS", "true").strip().lower() not in {"0", "false", "no"}),
+        smtp_timeout_seconds=max(1, int(os.getenv("PLATFORM_SMTP_TIMEOUT_SECONDS", "15"))),
     )

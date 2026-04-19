@@ -174,6 +174,7 @@ Telegram-бот продолжает жить как legacy adapter, а platform
 - stage 9.1: auto communications and outbound notification dispatch foundation
 - stage 9.2: execution discipline and payroll payments foundation
 - stage 9.3: procurement, logistics and document workflows
+- stage 9.4: outbound delivery channels and notification transport
 - stage 7.8: productization layer
 - stage 7.9: execution brief and account actions
 - stage 8.0: delivery layer and product polish
@@ -184,6 +185,7 @@ Telegram-бот продолжает жить как legacy adapter, а platform
 - multi-tenant account/user/RBAC model
 - canonical business tables for customers, leads, lead_events, deals, campaigns, ad_metrics, stock, purchases, banking and tasks
 - communication batch import and notification dispatch outbox
+- real notification transport for webhook plus configured delivery targets for telegram/email
 - execution check-ins and payroll payment register
 - integration layer with `integrations`, `integration_credentials`, `provider_tokens`, `sync_jobs`, `integration_logs`
 - runtime API in `platform_runtime/app.py`
@@ -457,6 +459,21 @@ Stage 9.3 adds:
   - `GET /admin/{account_slug}/operations/documents/{document_id}/preview.md`
   - richer document lifecycle states (`sent`, `accepted`, `paid`, `archived`)
   - `purchase_order` preview support
+
+Stage 9.4 adds:
+
+- real outbound notification transport:
+  - webhook delivery via `requests`
+  - telegram delivery via Bot API when `PLATFORM_NOTIFICATION_TELEGRAM_BOT_TOKEN` is configured
+  - email delivery via SMTP when `PLATFORM_SMTP_*` settings are configured
+- account-level notification targets in `Settings`:
+  - email recipients
+  - telegram chat ids
+  - webhook URL
+  - optional Obsidian export toggle for notification dispatches
+- notification dispatches now record transport result payloads and delivery errors instead of artifact-only status
+- Obsidian notes for notification dispatches:
+  - `Accounts/<account>/Notifications/...`
 
 Stage 8.8 adds:
 
