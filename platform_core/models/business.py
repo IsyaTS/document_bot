@@ -568,6 +568,23 @@ class PayrollEntry(Base, AccountScopedMixin, TimestampMixin):
     summary_json: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False, default=dict)
 
 
+class NotificationEvent(Base, AccountScopedMixin, TimestampMixin):
+    __tablename__ = "notification_events"
+    __table_args__ = (
+        Index("ix_notification_events_account_channel_created_at", "account_id", "channel", "created_at"),
+        Index("ix_notification_events_account_status_created_at", "account_id", "status", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    created_by_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    channel: Mapped[str] = mapped_column(String(32), nullable=False, default="internal")
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    body_text: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="generated")
+    payload_json: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False, default=dict)
+
+
 class KnowledgeItem(Base, AccountScopedMixin, TimestampMixin):
     __tablename__ = "knowledge_items"
     __table_args__ = (

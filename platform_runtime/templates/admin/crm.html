@@ -1,0 +1,51 @@
+{% extends "admin/base.html" %}
+{% block content %}
+<div class="topbar">
+  <div>
+    <h2>CRM</h2>
+    <p class="subtle">Counterparty console with related documents, purchases, communications and execution context.</p>
+  </div>
+  <div class="chips"><span class="chip">{{ customers|length }} counterparties</span></div>
+</div>
+<section class="grid cols-2 integrations-layout">
+  <article class="card">
+    <h3>Counterparties</h3>
+    <div class="table-wrap" style="margin-top: 14px;">
+      <table>
+        <thead><tr><th>Name</th><th>Status</th><th></th></tr></thead>
+        <tbody>
+          {% for customer in customers %}
+          <tr>
+            <td><strong>{{ customer.name }}</strong><div class="status-line">{{ customer.email or customer.phone or "—" }}</div></td>
+            <td>{{ customer.status }}</td>
+            <td><a class="pill-link" href="/admin/{{ runtime.account.slug }}/crm?customer_id={{ customer.id }}">open</a></td>
+          </tr>
+          {% else %}
+          <tr><td colspan="3" class="empty">No counterparties yet.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </article>
+  <article class="card">
+    {% if selected_customer %}
+    <h3>{{ selected_customer.name }}</h3>
+    <p class="subtle">{{ selected_customer.email or "no email" }} · {{ selected_customer.phone or "no phone" }}</p>
+    <section class="card soft-card" style="margin-top: 14px; padding: 14px;">
+      <h4>Documents</h4>
+      <ul>{% for item in customer_snapshot.documents[:8] %}<li>{{ item.document_type }} · {{ item.document_number or item.id }} · {{ item.status }}</li>{% else %}<li>No documents.</li>{% endfor %}</ul>
+    </section>
+    <section class="card soft-card" style="margin-top: 14px; padding: 14px;">
+      <h4>Purchases / Supplier Activity</h4>
+      <ul>{% for item in customer_snapshot.purchases[:8] %}<li>{{ item.purchase_number or item.id }} · {{ item.status }} · {{ item.total_amount }}</li>{% else %}<li>No purchase activity.</li>{% endfor %}</ul>
+    </section>
+    <section class="card soft-card" style="margin-top: 14px; padding: 14px;">
+      <h4>Communications</h4>
+      <ul>{% for item in customer_snapshot.reviews[:8] %}<li>{{ item.channel }} · {{ item.quality_status }} · {{ item.title }}</li>{% else %}<li>No communication reviews.</li>{% endfor %}</ul>
+    </section>
+    {% else %}
+    <p class="empty">Select a counterparty on the left.</p>
+    {% endif %}
+  </article>
+</section>
+{% endblock %}

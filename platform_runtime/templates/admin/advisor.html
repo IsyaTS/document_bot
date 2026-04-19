@@ -1,0 +1,19 @@
+{% extends "admin/base.html" %}
+{% block content %}
+<div class="topbar">
+  <div>
+    <h2>Advisor</h2>
+    <p class="subtle">Cross-domain owner recommendations from alerts, communications, inventory and execution pressure.</p>
+  </div>
+  <div class="chips"><span class="chip">{{ advisor_items|length }} items</span></div>
+</div>
+<section class="grid cols-2" style="gap: 16px;">
+  {% for item in advisor_items %}
+  <article class="card">
+    <h3>{{ item.title }}</h3>
+    <p class="subtle">{{ item.reason }}</p>
+    <a class="pill-link" href="{{ item.action }}">Open action</a>
+  </article>
+  {% endfor %}
+</section>
+{% endblock %}

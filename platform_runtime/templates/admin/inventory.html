@@ -1,0 +1,32 @@
+{% extends "admin/base.html" %}
+{% block content %}
+<div class="topbar">
+  <div>
+    <h2>Inventory</h2>
+    <p class="subtle">Turnover proxy, reorder pressure and stagnant stock signals.</p>
+  </div>
+  <div class="chips"><span class="chip">{{ inventory_insights|length }} rows</span></div>
+</div>
+<section class="card">
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Product</th><th>Warehouse</th><th>On hand</th><th>Min</th><th>Days</th><th>Reorder</th><th>Stagnant</th></tr></thead>
+      <tbody>
+        {% for row in inventory_insights %}
+        <tr>
+          <td>{{ row.product.name }}</td>
+          <td>{{ row.warehouse.name }}</td>
+          <td>{{ row.stock_item.quantity_on_hand }}</td>
+          <td>{{ row.stock_item.min_quantity if row.stock_item.min_quantity > row.product.min_stock_level else row.product.min_stock_level }}</td>
+          <td>{{ row.days_since_movement if row.days_since_movement is not none else "unknown" }}</td>
+          <td><span class="badge {{ 'bad' if row.reorder_needed else 'good' }}">{{ "yes" if row.reorder_needed else "no" }}</span></td>
+          <td><span class="badge {{ 'warn' if row.stagnant else 'good' }}">{{ "yes" if row.stagnant else "no" }}</span></td>
+        </tr>
+        {% else %}
+        <tr><td colspan="7" class="empty">No inventory rows yet.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endblock %}

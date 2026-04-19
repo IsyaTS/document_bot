@@ -170,6 +170,7 @@ Telegram-бот продолжает жить как legacy adapter, а platform
 - stage 8.7: procurement, logistics and documents foundation
 - stage 8.8: communication intelligence and owner guidance foundation
 - stage 8.9: payroll, employee KPI and compensation foundation
+- stage 9.0: business os expansion foundation
 - stage 7.8: productization layer
 - stage 7.9: execution brief and account actions
 - stage 8.0: delivery layer and product polish
@@ -492,6 +493,34 @@ Stage 8.9 adds:
   - `payroll_kpi` feature flag
   - `active_payroll_periods` soft-limit visibility
   - readiness hints for first compensation plan and first payroll period
+
+Stage 9.0 adds:
+
+- CRM counterparty console:
+  - `GET /admin/{account_slug}/crm`
+  - customer-focused view over documents, supplier purchases and communication reviews
+- inventory analytics page:
+  - `GET /admin/{account_slug}/inventory`
+  - reorder pressure
+  - stagnant stock visibility
+  - movement-based inventory insights
+- notifications and delivery center:
+  - `GET /admin/{account_slug}/notifications`
+  - `POST /admin/{account_slug}/notifications/generate`
+  - generated digests persisted in `notification_events`
+- lifecycle actions:
+  - `POST /admin/{account_slug}/operations/purchases/{purchase_id}/status`
+  - `POST /admin/{account_slug}/operations/installations/{installation_id}/status`
+  - `POST /admin/{account_slug}/operations/documents/{document_id}/status`
+- document workflow foundation:
+  - status transitions for invoice / claim / other document records
+  - printable text preview rendering for invoices and claims
+- advisor page:
+  - `GET /admin/{account_slug}/advisor`
+  - cross-domain owner recommendations built from alerts, inventory, communications and execution pressure
+- product-layer integration:
+  - `business_os` feature flag
+  - `notification_events` soft-limit visibility
 
 Stage 8.1 adds:
 

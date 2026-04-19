@@ -1,0 +1,153 @@
+{% extends "admin/base.html" %}
+{% block content %}
+<div class="topbar">
+  <div>
+    <h2>Notifications</h2>
+    <p class="subtle">Generate outbound-ready digests and manage purchase, installation and document lifecycle states.</p>
+  </div>
+  <div class="chips">
+    <span class="chip">{{ notifications|length }} events</span>
+    {% if can_manage_business_os %}<button type="button" id="generate-notifications" class="secondary">Generate default digests</button>{% endif %}
+  </div>
+</div>
+
+<section class="grid cols-2 integrations-layout">
+  <article class="card">
+    <h3>Generated Digests</h3>
+    <div class="table-wrap" style="margin-top: 14px;">
+      <table>
+        <thead><tr><th>Title</th><th>Channel</th><th>Status</th></tr></thead>
+        <tbody>
+          {% for item in notifications %}
+          <tr><td>{{ item.title }}</td><td>{{ item.channel }}</td><td>{{ item.status }}</td></tr>
+          {% else %}
+          <tr><td colspan="3" class="empty">No notification events yet.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <div class="subtle" id="notification-status" style="margin-top: 12px;"></div>
+  </article>
+
+  <article class="card">
+    <h3>Purchase Lifecycle</h3>
+    <div class="table-wrap" style="margin-top: 14px;">
+      <table>
+        <thead><tr><th>Purchase</th><th>Status</th><th></th></tr></thead>
+        <tbody>
+          {% for item in purchases[:10] %}
+          <tr>
+            <td>{{ item.purchase_number or item.id }}</td>
+            <td>{{ item.status }}</td>
+            <td>
+              <select class="purchase-status" data-purchase-id="{{ item.id }}">
+                {% for status_code in ['draft','requested','approved','ordered','received','cancelled'] %}
+                <option value="{{ status_code }}" {{ 'selected' if item.status == status_code else '' }}>{{ status_code }}</option>
+                {% endfor %}
+              </select>
+            </td>
+          </tr>
+          {% else %}
+          <tr><td colspan="3" class="empty">No purchases yet.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    <h3 style="margin-top: 18px;">Installation Lifecycle</h3>
+    <div class="table-wrap" style="margin-top: 14px;">
+      <table>
+        <thead><tr><th>Request</th><th>Status</th><th></th></tr></thead>
+        <tbody>
+          {% for item in installations[:10] %}
+          <tr>
+            <td>{{ item.request_number or item.id }}</td>
+            <td>{{ item.status }}</td>
+            <td>
+              <select class="installation-status" data-installation-id="{{ item.id }}">
+                {% for status_code in ['open','scheduled','done','cancelled'] %}
+                <option value="{{ status_code }}" {{ 'selected' if item.status == status_code else '' }}>{{ status_code }}</option>
+                {% endfor %}
+              </select>
+            </td>
+          </tr>
+          {% else %}
+          <tr><td colspan="3" class="empty">No installation requests yet.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </article>
+</section>
+
+<section class="card" style="margin-top: 16px;">
+  <h3>Documents Workflow</h3>
+  <div class="table-wrap" style="margin-top: 14px;">
+    <table>
+      <thead><tr><th>Document</th><th>Status</th><th>Preview</th><th></th></tr></thead>
+      <tbody>
+        {% for item in documents[:10] %}
+        <tr>
+          <td>{{ item.document_number or item.id }} · {{ item.document_type }}</td>
+          <td>{{ item.status }}</td>
+          <td><pre style="white-space: pre-wrap;">{{ document_previews.get(item.id, '') }}</pre></td>
+          <td>
+            <select class="document-status" data-document-id="{{ item.id }}">
+              {% for status_code in ['draft','issued','sent','paid','archived'] %}
+              <option value="{{ status_code }}" {{ 'selected' if item.status == status_code else '' }}>{{ status_code }}</option>
+              {% endfor %}
+            </select>
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="4" class="empty">No documents yet.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<script>
+  const statusNode = document.getElementById("notification-status");
+  async function updateLifecycle(path, payload) {
+    const response = await adminFetch(path, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(payload),
+    });
+    if (!response.ok) {
+      statusNode.textContent = await response.text();
+      return;
+    }
+    statusNode.textContent = "Updated.";
+  }
+
+  const generateButton = document.getElementById("generate-notifications");
+  if (generateButton) {
+    generateButton.addEventListener("click", async () => {
+      const response = await adminFetch(`/admin/{{ runtime.account.slug }}/notifications/generate`, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({}),
+      });
+      if (!response.ok) {
+        statusNode.textContent = await response.text();
+        return;
+      }
+      const body = await response.json();
+      statusNode.textContent = `Generated ${body.events.length} digests.`;
+      window.location.reload();
+    });
+  }
+
+  document.querySelectorAll(".purchase-status").forEach((node) => {
+    node.addEventListener("change", async () => updateLifecycle(`/admin/{{ runtime.account.slug }}/operations/purchases/${node.dataset.purchaseId}/status`, {status: node.value}));
+  });
+  document.querySelectorAll(".installation-status").forEach((node) => {
+    node.addEventListener("change", async () => updateLifecycle(`/admin/{{ runtime.account.slug }}/operations/installations/${node.dataset.installationId}/status`, {status: node.value}));
+  });
+  document.querySelectorAll(".document-status").forEach((node) => {
+    node.addEventListener("change", async () => updateLifecycle(`/admin/{{ runtime.account.slug }}/operations/documents/${node.dataset.documentId}/status`, {status: node.value}));
+  });
+</script>
+{% endblock %}

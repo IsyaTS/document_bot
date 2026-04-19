@@ -5,6 +5,7 @@ from platform_core.services.automation import RuleCatalogService, RuleEngineServ
 from platform_core.services.audit import AuditLogService
 from platform_core.services.authz import AuthorizationService
 from platform_core.services.bootstrap import BootstrapResult, CoreBootstrapService
+from platform_core.services.business_os import BusinessOSService, InventoryInsight
 from platform_core.services.communications import CommunicationAnalysis, CommunicationService
 from platform_core.services.credentials import CredentialCrypto, CredentialCryptoError
 from platform_core.services.dashboard import DashboardCatalogService, ExecutiveDashboardService
@@ -35,6 +36,7 @@ __all__ = [
     "AuditLogService",
     "AuthorizationService",
     "BootstrapResult",
+    "BusinessOSService",
     "CommunicationAnalysis",
     "CommunicationService",
     "CredentialCrypto",
@@ -45,6 +47,7 @@ __all__ = [
     "GOAL_METRIC_DEFINITIONS",
     "GoalMetricDefinition",
     "GoalService",
+    "InventoryInsight",
     "KnowledgeService",
     "OperationsService",
     "PAYROLL_METRIC_DEFINITIONS",

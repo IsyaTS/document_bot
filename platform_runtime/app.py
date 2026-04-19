@@ -35,6 +35,7 @@ from platform_core.models import (
     InstallationRequest,
     KnowledgeItem,
     Lead,
+    NotificationEvent,
     PayrollEntry,
     PayrollPeriod,
     Product,
@@ -52,6 +53,7 @@ from platform_core.exceptions import AuthorizationError, PlatformCoreError, Tena
 from platform_core.runtime_status import read_runtime_status, write_runtime_status
 from platform_core.services import (
     AuditLogService,
+    BusinessOSService,
     CommunicationService,
     EmployeeSnapshot,
     ExecutiveDashboardService,
@@ -447,6 +449,11 @@ def create_app() -> FastAPI:
                 items.append({"key": "operations", "label": "Operations", "path": "operations"})
             if feature_access["communication_intelligence"]["allowed"]:
                 items.append({"key": "communications", "label": "Communications", "path": "communications"})
+            if feature_access["business_os"]["allowed"]:
+                items.append({"key": "crm", "label": "CRM", "path": "crm"})
+                items.append({"key": "inventory", "label": "Inventory", "path": "inventory"})
+                items.append({"key": "notifications", "label": "Notifications", "path": "notifications"})
+                items.append({"key": "advisor", "label": "Advisor", "path": "advisor"})
             if feature_access["goals_tracking"]["allowed"]:
                 items.append({"key": "goals", "label": "Goals", "path": "goals"})
         if "alerts.read" in permissions or "tasks.read" in permissions or "*" in permissions:
@@ -1019,6 +1026,7 @@ def create_app() -> FastAPI:
             {"key": "payroll_kpi", "label": "Payroll and KPI", "description": "Compensation plans, KPI metrics and payroll periods."},
             {"key": "operations_workflows", "label": "Operations workflows", "description": "Purchases, receiving, logistics requests and documents."},
             {"key": "communication_intelligence", "label": "Communication intelligence", "description": "Transcript reviews, quality signals and owner guidance."},
+            {"key": "business_os", "label": "Business OS", "description": "CRM, inventory analytics, notifications and advisor workflows."},
             {"key": "goals_tracking", "label": "Goals tracking", "description": "Plan vs fact and goal workflows."},
             {"key": "integrations_setup", "label": "Integrations setup", "description": "Admin UI for integration setup and sync."},
             {"key": "ops_console", "label": "Ops console", "description": "Ops / Sync visibility and actions."},
@@ -1029,25 +1037,25 @@ def create_app() -> FastAPI:
             "internal": {
                 "label": "Internal",
                 "summary": "Internal operator deployment with full platform surface for live business use.",
-                "recommended_features": {"portfolio_console", "owner_briefs", "knowledge_base", "people_execution", "payroll_kpi", "operations_workflows", "communication_intelligence", "goals_tracking", "integrations_setup", "ops_console"},
+                "recommended_features": {"portfolio_console", "owner_briefs", "knowledge_base", "people_execution", "payroll_kpi", "operations_workflows", "communication_intelligence", "business_os", "goals_tracking", "integrations_setup", "ops_console"},
                 "usage_note": "Best fit for active internal operations and product validation.",
             },
             "pilot": {
                 "label": "Pilot",
                 "summary": "Small rollout for one operating team with core execution and onboarding flows.",
-                "recommended_features": {"owner_briefs", "knowledge_base", "people_execution", "payroll_kpi", "operations_workflows", "communication_intelligence", "goals_tracking", "integrations_setup", "ops_console"},
+                "recommended_features": {"owner_briefs", "knowledge_base", "people_execution", "payroll_kpi", "operations_workflows", "communication_intelligence", "business_os", "goals_tracking", "integrations_setup", "ops_console"},
                 "usage_note": "Good for proving value before broad rollout.",
             },
             "growth": {
                 "label": "Growth",
                 "summary": "Multi-account owner workflow with portfolio visibility and delivery flows.",
-                "recommended_features": {"portfolio_console", "owner_briefs", "knowledge_base", "people_execution", "payroll_kpi", "operations_workflows", "communication_intelligence", "goals_tracking", "integrations_setup", "ops_console"},
+                "recommended_features": {"portfolio_console", "owner_briefs", "knowledge_base", "people_execution", "payroll_kpi", "operations_workflows", "communication_intelligence", "business_os", "goals_tracking", "integrations_setup", "ops_console"},
                 "usage_note": "Designed for wider operational rollout.",
             },
             "enterprise": {
                 "label": "Enterprise",
                 "summary": "Highest readiness profile with all current product surfaces enabled.",
-                "recommended_features": {"portfolio_console", "owner_briefs", "knowledge_base", "people_execution", "payroll_kpi", "operations_workflows", "communication_intelligence", "goals_tracking", "integrations_setup", "ops_console"},
+                "recommended_features": {"portfolio_console", "owner_briefs", "knowledge_base", "people_execution", "payroll_kpi", "operations_workflows", "communication_intelligence", "business_os", "goals_tracking", "integrations_setup", "ops_console"},
                 "usage_note": "Suitable for fully managed multi-account environments.",
             },
         }
@@ -1067,6 +1075,7 @@ def create_app() -> FastAPI:
             {"key": "open_purchase_requests", "label": "Open purchase requests", "description": "Soft limit for requested purchases awaiting receiving."},
             {"key": "communication_reviews", "label": "Communication reviews", "description": "Soft limit for stored transcript reviews."},
             {"key": "active_payroll_periods", "label": "Active payroll periods", "description": "Soft limit for non-paid payroll periods."},
+            {"key": "notification_events", "label": "Notification events", "description": "Soft limit for generated notification events."},
         ]
 
     def _default_account_settings() -> dict[str, object]:
@@ -1217,6 +1226,9 @@ def create_app() -> FastAPI:
                 PayrollPeriod.status.in_(["draft", "approved"]),
             )
         ).scalar_one()
+        notification_events = session.execute(
+            select(func.count()).select_from(NotificationEvent).where(NotificationEvent.account_id == account.id)
+        ).scalar_one()
         return {
             "active_memberships": sum(1 for item in memberships if item.status == "active"),
             "active_integrations": sum(1 for item in integrations if item.status != "archived"),
@@ -1228,6 +1240,7 @@ def create_app() -> FastAPI:
             "open_purchase_requests": int(open_purchase_requests or 0),
             "communication_reviews": int(communication_reviews or 0),
             "active_payroll_periods": int(active_payroll_periods or 0),
+            "notification_events": int(notification_events or 0),
         }
 
     def _account_usage_rows(account: Account, session: Session) -> list[dict[str, object]]:
@@ -4547,6 +4560,192 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
         return JSONResponse({"payroll_period": _serialize_payroll_period(payroll_period)})
 
+    @app.get("/admin/{account_slug}/crm", response_class=HTMLResponse)
+    def admin_crm(
+        request: Request,
+        account_slug: str,
+        customer_id: int | None = Query(default=None),
+        session: Session = Depends(get_db_session),
+    ) -> HTMLResponse:
+        user = _current_session_user(session, request)
+        if user is None:
+            request.session.clear()
+            return _login_redirect(f"/admin/{account_slug}/crm")
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=user.email)
+        request.session["admin_account_slug"] = runtime.account.slug
+        ensure_permission(runtime, "business.read")
+        _ensure_account_feature(runtime, "business_os", "CRM")
+        service = BusinessOSService(session)
+        customers = service.list_customers(runtime)
+        selected_customer_id = customer_id or (customers[0].id if customers else None)
+        snapshot = service.customer_snapshot(runtime, selected_customer_id) if selected_customer_id is not None else None
+        return templates.TemplateResponse(
+            request,
+            "admin/crm.html",
+            {
+                **_admin_context(request, session, runtime, page="crm"),
+                "customers": customers,
+                "selected_customer": snapshot["customer"] if snapshot else None,
+                "customer_snapshot": snapshot,
+            },
+        )
+
+    @app.get("/admin/{account_slug}/inventory", response_class=HTMLResponse)
+    def admin_inventory(
+        request: Request,
+        account_slug: str,
+        session: Session = Depends(get_db_session),
+    ) -> HTMLResponse:
+        user = _current_session_user(session, request)
+        if user is None:
+            request.session.clear()
+            return _login_redirect(f"/admin/{account_slug}/inventory")
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=user.email)
+        request.session["admin_account_slug"] = runtime.account.slug
+        ensure_permission(runtime, "business.read")
+        _ensure_account_feature(runtime, "business_os", "Inventory")
+        insights = BusinessOSService(session).inventory_insights(runtime, stagnant_days=30)
+        return templates.TemplateResponse(
+            request,
+            "admin/inventory.html",
+            {
+                **_admin_context(request, session, runtime, page="inventory"),
+                "inventory_insights": insights,
+            },
+        )
+
+    @app.get("/admin/{account_slug}/notifications", response_class=HTMLResponse)
+    def admin_notifications(
+        request: Request,
+        account_slug: str,
+        session: Session = Depends(get_db_session),
+    ) -> HTMLResponse:
+        user = _current_session_user(session, request)
+        if user is None:
+            request.session.clear()
+            return _login_redirect(f"/admin/{account_slug}/notifications")
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=user.email)
+        request.session["admin_account_slug"] = runtime.account.slug
+        ensure_permission(runtime, "dashboard.read")
+        _ensure_account_feature(runtime, "business_os", "Notifications")
+        service = BusinessOSService(session)
+        notifications = service.list_notifications(runtime)
+        purchases = OperationsService(session).list_purchases(runtime.context)
+        documents = OperationsService(session).list_documents(runtime.context)
+        installations = OperationsService(session).list_installation_requests(runtime.context)
+        document_previews = {}
+        for document in documents[:10]:
+            document_previews[document.id] = service.render_document_preview(runtime, document.id)
+        return templates.TemplateResponse(
+            request,
+            "admin/notifications.html",
+            {
+                **_admin_context(request, session, runtime, page="notifications"),
+                "notifications": notifications,
+                "purchases": purchases,
+                "documents": documents,
+                "installations": installations,
+                "document_previews": document_previews,
+                "can_manage_business_os": _is_manager_role(runtime.role_code) or "*" in runtime.permissions or "business.write" in runtime.permissions,
+            },
+        )
+
+    @app.post("/admin/{account_slug}/notifications/generate")
+    async def admin_generate_notifications(
+        request: Request,
+        account_slug: str,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        actor = _require_admin_user(request, session)
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor.email)
+        ensure_permission(runtime, "dashboard.read")
+        _ensure_account_feature(runtime, "business_os", "Notifications")
+        events = BusinessOSService(session).generate_default_digests(runtime, created_by_user_id=runtime.actor_user.id)
+        AuditLogService(session).log(
+            runtime.context,
+            "business_os.notifications.generated",
+            "notification_event",
+            str(events[0].id if events else 0),
+            details={"count": len(events)},
+        )
+        return JSONResponse({"events": [_serialize_notification_event(item) for item in events]})
+
+    @app.post("/admin/{account_slug}/operations/purchases/{purchase_id}/status")
+    async def admin_update_purchase_status(
+        request: Request,
+        account_slug: str,
+        purchase_id: int,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        payload = await request.json()
+        actor = _require_admin_user(request, session)
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor.email)
+        ensure_permission(runtime, "business.write")
+        _ensure_account_feature(runtime, "business_os", "Purchase lifecycle")
+        purchase = BusinessOSService(session).update_purchase_status(runtime, purchase_id, str(payload.get("status") or "").strip())
+        AuditLogService(session).log(runtime.context, "business_os.purchase.status", "purchase", str(purchase.id), details={"status": purchase.status})
+        return JSONResponse({"purchase": _serialize_purchase(purchase)})
+
+    @app.post("/admin/{account_slug}/operations/installations/{installation_id}/status")
+    async def admin_update_installation_status(
+        request: Request,
+        account_slug: str,
+        installation_id: int,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        payload = await request.json()
+        actor = _require_admin_user(request, session)
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor.email)
+        ensure_permission(runtime, "business.write")
+        _ensure_account_feature(runtime, "business_os", "Installation lifecycle")
+        request_item = BusinessOSService(session).update_installation_status(runtime, installation_id, str(payload.get("status") or "").strip())
+        AuditLogService(session).log(runtime.context, "business_os.installation.status", "installation_request", str(request_item.id), details={"status": request_item.status})
+        return JSONResponse({"installation_request": _serialize_installation_request(request_item)})
+
+    @app.post("/admin/{account_slug}/operations/documents/{document_id}/status")
+    async def admin_update_document_status(
+        request: Request,
+        account_slug: str,
+        document_id: int,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        payload = await request.json()
+        actor = _require_admin_user(request, session)
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor.email)
+        ensure_permission(runtime, "documents.manage")
+        _ensure_account_feature(runtime, "business_os", "Document lifecycle")
+        document = BusinessOSService(session).update_document_status(runtime, document_id, str(payload.get("status") or "").strip())
+        AuditLogService(session).log(runtime.context, "business_os.document.status", "document", str(document.id), details={"status": document.status})
+        return JSONResponse({"document": _serialize_document(document)})
+
+    @app.get("/admin/{account_slug}/advisor", response_class=HTMLResponse)
+    def admin_advisor(
+        request: Request,
+        account_slug: str,
+        session: Session = Depends(get_db_session),
+    ) -> HTMLResponse:
+        user = _current_session_user(session, request)
+        if user is None:
+            request.session.clear()
+            return _login_redirect(f"/admin/{account_slug}/advisor")
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=user.email)
+        request.session["admin_account_slug"] = runtime.account.slug
+        ensure_permission(runtime, "dashboard.read")
+        _ensure_account_feature(runtime, "business_os", "Advisor")
+        items = BusinessOSService(session).advisor_items(runtime)
+        return templates.TemplateResponse(
+            request,
+            "admin/advisor.html",
+            {
+                **_admin_context(request, session, runtime, page="advisor"),
+                "advisor_items": items,
+            },
+        )
+
     @app.get("/admin/{account_slug}/operations", response_class=HTMLResponse)
     def admin_operations(
         request: Request,
@@ -5913,6 +6112,22 @@ def _serialize_payroll_entry(entry: PayrollEntry) -> dict[str, object]:
         "summary_json": entry.summary_json or {},
         "created_at": _serialize_datetime(entry.created_at),
         "updated_at": _serialize_datetime(entry.updated_at),
+    }
+
+
+def _serialize_notification_event(event: NotificationEvent) -> dict[str, object]:
+    return {
+        "id": event.id,
+        "account_id": event.account_id,
+        "created_by_user_id": event.created_by_user_id,
+        "channel": event.channel,
+        "event_type": event.event_type,
+        "title": event.title,
+        "body_text": event.body_text,
+        "status": event.status,
+        "payload_json": event.payload_json or {},
+        "created_at": _serialize_datetime(event.created_at),
+        "updated_at": _serialize_datetime(event.updated_at),
     }
 
 
