@@ -29,11 +29,14 @@ from platform_core.models import (
     Deal,
     Document,
     Employee,
+    EmployeeKPI,
     Goal,
     GoalTarget,
     InstallationRequest,
     KnowledgeItem,
     Lead,
+    PayrollEntry,
+    PayrollPeriod,
     Product,
     Purchase,
     Role,
@@ -56,6 +59,8 @@ from platform_core.services import (
     GoalService,
     KnowledgeService,
     OperationsService,
+    PAYROLL_METRIC_DEFINITIONS,
+    PayrollService,
     PeopleService,
 )
 from platform_core.services.accounts import AccountService, MembershipService, UserService
@@ -436,6 +441,8 @@ def create_app() -> FastAPI:
                 items.append({"key": "knowledge", "label": "Knowledge", "path": "knowledge"})
             if feature_access["people_execution"]["allowed"]:
                 items.append({"key": "people", "label": "People", "path": "people"})
+            if feature_access["payroll_kpi"]["allowed"]:
+                items.append({"key": "payroll", "label": "Payroll", "path": "payroll"})
             if feature_access["operations_workflows"]["allowed"]:
                 items.append({"key": "operations", "label": "Operations", "path": "operations"})
             if feature_access["communication_intelligence"]["allowed"]:
@@ -1009,6 +1016,7 @@ def create_app() -> FastAPI:
             {"key": "owner_briefs", "label": "Owner briefs", "description": "Portfolio briefs and digest blocks."},
             {"key": "knowledge_base", "label": "Knowledge base", "description": "Operational memory, files and SOP knowledge."},
             {"key": "people_execution", "label": "People execution", "description": "Employee registry, workload and KPI view."},
+            {"key": "payroll_kpi", "label": "Payroll and KPI", "description": "Compensation plans, KPI metrics and payroll periods."},
             {"key": "operations_workflows", "label": "Operations workflows", "description": "Purchases, receiving, logistics requests and documents."},
             {"key": "communication_intelligence", "label": "Communication intelligence", "description": "Transcript reviews, quality signals and owner guidance."},
             {"key": "goals_tracking", "label": "Goals tracking", "description": "Plan vs fact and goal workflows."},
@@ -1021,25 +1029,25 @@ def create_app() -> FastAPI:
             "internal": {
                 "label": "Internal",
                 "summary": "Internal operator deployment with full platform surface for live business use.",
-                "recommended_features": {"portfolio_console", "owner_briefs", "knowledge_base", "people_execution", "operations_workflows", "communication_intelligence", "goals_tracking", "integrations_setup", "ops_console"},
+                "recommended_features": {"portfolio_console", "owner_briefs", "knowledge_base", "people_execution", "payroll_kpi", "operations_workflows", "communication_intelligence", "goals_tracking", "integrations_setup", "ops_console"},
                 "usage_note": "Best fit for active internal operations and product validation.",
             },
             "pilot": {
                 "label": "Pilot",
                 "summary": "Small rollout for one operating team with core execution and onboarding flows.",
-                "recommended_features": {"owner_briefs", "knowledge_base", "people_execution", "operations_workflows", "communication_intelligence", "goals_tracking", "integrations_setup", "ops_console"},
+                "recommended_features": {"owner_briefs", "knowledge_base", "people_execution", "payroll_kpi", "operations_workflows", "communication_intelligence", "goals_tracking", "integrations_setup", "ops_console"},
                 "usage_note": "Good for proving value before broad rollout.",
             },
             "growth": {
                 "label": "Growth",
                 "summary": "Multi-account owner workflow with portfolio visibility and delivery flows.",
-                "recommended_features": {"portfolio_console", "owner_briefs", "knowledge_base", "people_execution", "operations_workflows", "communication_intelligence", "goals_tracking", "integrations_setup", "ops_console"},
+                "recommended_features": {"portfolio_console", "owner_briefs", "knowledge_base", "people_execution", "payroll_kpi", "operations_workflows", "communication_intelligence", "goals_tracking", "integrations_setup", "ops_console"},
                 "usage_note": "Designed for wider operational rollout.",
             },
             "enterprise": {
                 "label": "Enterprise",
                 "summary": "Highest readiness profile with all current product surfaces enabled.",
-                "recommended_features": {"portfolio_console", "owner_briefs", "knowledge_base", "people_execution", "operations_workflows", "communication_intelligence", "goals_tracking", "integrations_setup", "ops_console"},
+                "recommended_features": {"portfolio_console", "owner_briefs", "knowledge_base", "people_execution", "payroll_kpi", "operations_workflows", "communication_intelligence", "goals_tracking", "integrations_setup", "ops_console"},
                 "usage_note": "Suitable for fully managed multi-account environments.",
             },
         }
@@ -1058,6 +1066,7 @@ def create_app() -> FastAPI:
             {"key": "open_installation_requests", "label": "Open installation requests", "description": "Soft limit for open logistics / installation requests."},
             {"key": "open_purchase_requests", "label": "Open purchase requests", "description": "Soft limit for requested purchases awaiting receiving."},
             {"key": "communication_reviews", "label": "Communication reviews", "description": "Soft limit for stored transcript reviews."},
+            {"key": "active_payroll_periods", "label": "Active payroll periods", "description": "Soft limit for non-paid payroll periods."},
         ]
 
     def _default_account_settings() -> dict[str, object]:
@@ -1202,6 +1211,12 @@ def create_app() -> FastAPI:
         communication_reviews = session.execute(
             select(func.count()).select_from(CommunicationReview).where(CommunicationReview.account_id == account.id)
         ).scalar_one()
+        active_payroll_periods = session.execute(
+            select(func.count()).select_from(PayrollPeriod).where(
+                PayrollPeriod.account_id == account.id,
+                PayrollPeriod.status.in_(["draft", "approved"]),
+            )
+        ).scalar_one()
         return {
             "active_memberships": sum(1 for item in memberships if item.status == "active"),
             "active_integrations": sum(1 for item in integrations if item.status != "archived"),
@@ -1212,6 +1227,7 @@ def create_app() -> FastAPI:
             "open_installation_requests": int(open_installations or 0),
             "open_purchase_requests": int(open_purchase_requests or 0),
             "communication_reviews": int(communication_reviews or 0),
+            "active_payroll_periods": int(active_payroll_periods or 0),
         }
 
     def _account_usage_rows(account: Account, session: Session) -> list[dict[str, object]]:
@@ -1273,6 +1289,20 @@ def create_app() -> FastAPI:
         ).scalar_one()
         if review_count == 0:
             next_steps.append({"label": "Review the first message or call transcript", "href": f"/admin/{runtime.account.slug}/communications"})
+        payroll_period_count = session.execute(
+            select(func.count()).select_from(PayrollPeriod).where(PayrollPeriod.account_id == runtime.account.id)
+        ).scalar_one()
+        compensated_employees = session.execute(
+            select(func.count()).select_from(Employee).where(
+                Employee.account_id == runtime.account.id,
+                Employee.status == "active",
+                Employee.base_salary > 0,
+            )
+        ).scalar_one()
+        if compensated_employees == 0:
+            next_steps.append({"label": "Configure the first compensation plan", "href": f"/admin/{runtime.account.slug}/payroll"})
+        if payroll_period_count == 0:
+            next_steps.append({"label": "Create the first payroll period", "href": f"/admin/{runtime.account.slug}/payroll"})
         if len(onboarding["integration_rows"]) == 0:
             next_steps.append({"label": "Connect the first integration", "href": f"/admin/{runtime.account.slug}/integrations"})
         if onboarding["last_success"] is None and len(onboarding["integration_rows"]) > 0:
@@ -1690,6 +1720,12 @@ def create_app() -> FastAPI:
 
     def _communication_direction_options() -> list[str]:
         return ["inbound", "outbound"]
+
+    def _payroll_period_kind_options() -> list[str]:
+        return ["month", "week", "custom"]
+
+    def _payroll_period_status_options() -> list[str]:
+        return ["draft", "approved", "paid"]
 
     def _account_delivery_markdown(pack: dict[str, object]) -> str:
         account = pack["account"]
@@ -4293,6 +4329,224 @@ def create_app() -> FastAPI:
         session.flush()
         return JSONResponse({"task": _serialize_task(task)})
 
+    @app.get("/admin/{account_slug}/payroll", response_class=HTMLResponse)
+    def admin_payroll(
+        request: Request,
+        account_slug: str,
+        payroll_period_id: int | None = Query(default=None),
+        session: Session = Depends(get_db_session),
+    ) -> HTMLResponse:
+        user = _current_session_user(session, request)
+        if user is None:
+            request.session.clear()
+            return _login_redirect(f"/admin/{account_slug}/payroll")
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=user.email)
+        request.session["admin_account_slug"] = runtime.account.slug
+        ensure_permission(runtime, "business.read")
+        _ensure_account_feature(runtime, "payroll_kpi", "Payroll")
+        payroll_service = PayrollService(session)
+        employees = PeopleService(session).list_employees(runtime.context)
+        periods = payroll_service.list_periods(runtime.context)
+        selected_period = None
+        if payroll_period_id is not None:
+            try:
+                selected_period = next(item for item in periods if item.id == payroll_period_id)
+            except StopIteration:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Payroll period not found.")
+        elif periods:
+            selected_period = periods[0]
+        entries = payroll_service.list_entries(runtime.context, payroll_period_id=selected_period.id if selected_period else None)
+        kpis = payroll_service.list_kpis(
+            runtime.context,
+            period_start=selected_period.period_start if selected_period else None,
+            period_end=selected_period.period_end if selected_period else None,
+        ) if selected_period else []
+        kpi_rows: dict[int, dict[str, EmployeeKPI]] = {}
+        for kpi in kpis:
+            kpi_rows.setdefault(kpi.employee_id, {})[kpi.metric_code] = kpi
+        employee_snapshots = _employee_snapshot_map(runtime, session)
+        return templates.TemplateResponse(
+            request,
+            "admin/payroll.html",
+            {
+                **_admin_context(request, session, runtime, page="payroll"),
+                "employees": employees,
+                "periods": periods,
+                "selected_period": selected_period,
+                "entries": entries,
+                "kpi_rows": kpi_rows,
+                "employee_snapshots": employee_snapshots,
+                "payroll_metric_definitions": PAYROLL_METRIC_DEFINITIONS,
+                "payroll_period_kind_options": _payroll_period_kind_options(),
+                "payroll_period_status_options": _payroll_period_status_options(),
+                "can_manage_payroll": _is_manager_role(runtime.role_code) or "*" in runtime.permissions or "business.write" in runtime.permissions,
+            },
+        )
+
+    @app.post("/admin/{account_slug}/payroll/employees/{employee_id}/compensation")
+    async def admin_update_employee_compensation(
+        request: Request,
+        account_slug: str,
+        employee_id: int,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        payload = await request.json()
+        actor = _require_admin_user(request, session)
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor.email)
+        _require_account_manager(runtime)
+        ensure_permission(runtime, "business.write")
+        _ensure_account_feature(runtime, "payroll_kpi", "Payroll")
+        body = payload.get("compensation") or {}
+        try:
+            employee = PayrollService(session).update_employee_compensation(
+                runtime.context,
+                employee_id=employee_id,
+                base_salary=Decimal(str(body.get("base_salary") or "0")),
+                commission_rate_pct=Decimal(str(body.get("commission_rate_pct") or "0")),
+                kpi_bonus_amount=Decimal(str(body.get("kpi_bonus_amount") or "0")),
+                penalty_per_overdue_task=Decimal(str(body.get("penalty_per_overdue_task") or "0")),
+                penalty_per_quality_breach=Decimal(str(body.get("penalty_per_quality_breach") or "0")),
+            )
+            AuditLogService(session).log(
+                runtime.context,
+                "payroll.employee.compensation_saved",
+                "employee",
+                str(employee.id),
+                details={"base_salary": str(employee.base_salary), "commission_rate_pct": str(employee.commission_rate_pct)},
+            )
+        except (PlatformCoreError, TenantContextError, ValueError, ArithmeticError) as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        return JSONResponse({"employee": _serialize_employee(employee)})
+
+    @app.post("/admin/{account_slug}/payroll/periods/save")
+    async def admin_save_payroll_period(
+        request: Request,
+        account_slug: str,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        payload = await request.json()
+        actor = _require_admin_user(request, session)
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor.email)
+        _require_account_manager(runtime)
+        ensure_permission(runtime, "business.write")
+        _ensure_account_feature(runtime, "payroll_kpi", "Payroll")
+        body = payload.get("period") or {}
+        try:
+            payroll_period = PayrollService(session).create_period(
+                runtime.context,
+                period_kind=str(body.get("period_kind") or "month").strip() or "month",
+                period_start=date.fromisoformat(str(body.get("period_start"))),
+                period_end=date.fromisoformat(str(body.get("period_end"))),
+                notes=str(body.get("notes") or "").strip() or None,
+            )
+            AuditLogService(session).log(
+                runtime.context,
+                "payroll.period.created",
+                "payroll_period",
+                str(payroll_period.id),
+                details={"period_start": payroll_period.period_start.isoformat(), "period_end": payroll_period.period_end.isoformat()},
+            )
+        except (PlatformCoreError, TenantContextError, ValueError, IntegrityError) as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        return JSONResponse({"payroll_period": _serialize_payroll_period(payroll_period)})
+
+    @app.post("/admin/{account_slug}/payroll/kpis/save")
+    async def admin_save_employee_kpi(
+        request: Request,
+        account_slug: str,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        payload = await request.json()
+        actor = _require_admin_user(request, session)
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor.email)
+        _require_account_manager(runtime)
+        ensure_permission(runtime, "business.write")
+        _ensure_account_feature(runtime, "payroll_kpi", "Payroll")
+        body = payload.get("kpi") or {}
+        try:
+            kpi = PayrollService(session).upsert_kpi(
+                runtime.context,
+                employee_id=int(body["employee_id"]),
+                metric_code=str(body.get("metric_code") or "").strip(),
+                period_start=date.fromisoformat(str(body.get("period_start"))),
+                period_end=date.fromisoformat(str(body.get("period_end"))),
+                actual_value=Decimal(str(body.get("actual_value") or "0")),
+                target_value=Decimal(str(body["target_value"])) if body.get("target_value") not in {None, ""} else None,
+                source_kind=str(body.get("source_kind") or "manual").strip() or "manual",
+                payload_json={"note": str(body.get("note") or "").strip()},
+            )
+            AuditLogService(session).log(
+                runtime.context,
+                "payroll.kpi.saved",
+                "employee_kpi",
+                str(kpi.id),
+                details={"metric_code": kpi.metric_code, "employee_id": kpi.employee_id, "actual_value": str(kpi.actual_value)},
+            )
+        except (PlatformCoreError, TenantContextError, ValueError, ArithmeticError, IntegrityError) as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        return JSONResponse({"kpi": _serialize_employee_kpi(kpi)})
+
+    @app.post("/admin/{account_slug}/payroll/periods/{payroll_period_id}/compute")
+    async def admin_compute_payroll_period(
+        request: Request,
+        account_slug: str,
+        payroll_period_id: int,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        actor = _require_admin_user(request, session)
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor.email)
+        _require_account_manager(runtime)
+        ensure_permission(runtime, "business.write")
+        _ensure_account_feature(runtime, "payroll_kpi", "Payroll")
+        try:
+            entries = PayrollService(session).compute_period(runtime.context, payroll_period_id)
+            AuditLogService(session).log(
+                runtime.context,
+                "payroll.period.computed",
+                "payroll_period",
+                str(payroll_period_id),
+                details={"entries": len(entries)},
+            )
+        except (PlatformCoreError, TenantContextError) as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        return JSONResponse({"entries": [_serialize_payroll_entry(item) for item in entries]})
+
+    @app.post("/admin/{account_slug}/payroll/periods/{payroll_period_id}/status")
+    async def admin_set_payroll_period_status(
+        request: Request,
+        account_slug: str,
+        payroll_period_id: int,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        payload = await request.json()
+        actor = _require_admin_user(request, session)
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor.email)
+        _require_account_manager(runtime)
+        ensure_permission(runtime, "business.write")
+        _ensure_account_feature(runtime, "payroll_kpi", "Payroll")
+        try:
+            payroll_period = PayrollService(session).set_period_status(
+                runtime.context,
+                payroll_period_id=payroll_period_id,
+                status_code=str(payload.get("status") or "").strip(),
+                approved_by_user_id=runtime.actor_user.id,
+            )
+            AuditLogService(session).log(
+                runtime.context,
+                "payroll.period.status",
+                "payroll_period",
+                str(payroll_period.id),
+                details={"status": payroll_period.status},
+            )
+        except (PlatformCoreError, TenantContextError) as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        return JSONResponse({"payroll_period": _serialize_payroll_period(payroll_period)})
+
     @app.get("/admin/{account_slug}/operations", response_class=HTMLResponse)
     def admin_operations(
         request: Request,
@@ -5601,8 +5855,64 @@ def _serialize_employee(employee: Employee) -> dict[str, object]:
         "phone": employee.phone,
         "status": employee.status,
         "hired_at": employee.hired_at.isoformat() if employee.hired_at else None,
+        "base_salary": str(employee.base_salary),
+        "commission_rate_pct": str(employee.commission_rate_pct),
+        "kpi_bonus_amount": str(employee.kpi_bonus_amount),
+        "penalty_per_overdue_task": str(employee.penalty_per_overdue_task),
+        "penalty_per_quality_breach": str(employee.penalty_per_quality_breach),
         "created_at": _serialize_datetime(employee.created_at),
         "updated_at": _serialize_datetime(employee.updated_at),
+    }
+
+
+def _serialize_payroll_period(payroll_period: PayrollPeriod) -> dict[str, object]:
+    return {
+        "id": payroll_period.id,
+        "account_id": payroll_period.account_id,
+        "approved_by_user_id": payroll_period.approved_by_user_id,
+        "period_kind": payroll_period.period_kind,
+        "period_start": payroll_period.period_start.isoformat(),
+        "period_end": payroll_period.period_end.isoformat(),
+        "status": payroll_period.status,
+        "paid_at": _serialize_datetime(payroll_period.paid_at),
+        "notes_json": payroll_period.notes_json or {},
+        "created_at": _serialize_datetime(payroll_period.created_at),
+        "updated_at": _serialize_datetime(payroll_period.updated_at),
+    }
+
+
+def _serialize_employee_kpi(kpi: EmployeeKPI) -> dict[str, object]:
+    return {
+        "id": kpi.id,
+        "account_id": kpi.account_id,
+        "employee_id": kpi.employee_id,
+        "metric_code": kpi.metric_code,
+        "period_start": kpi.period_start.isoformat(),
+        "period_end": kpi.period_end.isoformat(),
+        "target_value": str(kpi.target_value) if kpi.target_value is not None else None,
+        "actual_value": str(kpi.actual_value),
+        "score_pct": str(kpi.score_pct) if kpi.score_pct is not None else None,
+        "source_kind": kpi.source_kind,
+        "payload_json": kpi.payload_json or {},
+    }
+
+
+def _serialize_payroll_entry(entry: PayrollEntry) -> dict[str, object]:
+    return {
+        "id": entry.id,
+        "account_id": entry.account_id,
+        "payroll_period_id": entry.payroll_period_id,
+        "employee_id": entry.employee_id,
+        "status": entry.status,
+        "base_salary_amount": str(entry.base_salary_amount),
+        "commission_amount": str(entry.commission_amount),
+        "bonus_amount": str(entry.bonus_amount),
+        "penalty_amount": str(entry.penalty_amount),
+        "gross_amount": str(entry.gross_amount),
+        "net_amount": str(entry.net_amount),
+        "summary_json": entry.summary_json or {},
+        "created_at": _serialize_datetime(entry.created_at),
+        "updated_at": _serialize_datetime(entry.updated_at),
     }
 
 

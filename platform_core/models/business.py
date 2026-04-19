@@ -255,6 +255,11 @@ class Employee(Base, AccountScopedMixin, TimestampMixin):
     phone: Mapped[str | None] = mapped_column(String(64), nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
     hired_at: Mapped[date | None] = mapped_column(Date, nullable=True)
+    base_salary: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
+    commission_rate_pct: Mapped[Decimal] = mapped_column(Numeric(8, 2), nullable=False, default=Decimal("0.00"))
+    kpi_bonus_amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
+    penalty_per_overdue_task: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
+    penalty_per_quality_breach: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
 
 
 class Task(Base, AccountScopedMixin, TimestampMixin):
@@ -503,6 +508,63 @@ class CommunicationReview(Base, AccountScopedMixin, TimestampMixin):
     response_delay_minutes: Mapped[int | None] = mapped_column(nullable=True)
     next_step_present: Mapped[bool] = mapped_column(nullable=False, default=False)
     follow_up_status: Mapped[str] = mapped_column(String(32), nullable=False, default="required")
+    summary_json: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False, default=dict)
+
+
+class PayrollPeriod(Base, AccountScopedMixin, TimestampMixin):
+    __tablename__ = "payroll_periods"
+    __table_args__ = (
+        UniqueConstraint("account_id", "period_kind", "period_start", "period_end"),
+        Index("ix_payroll_periods_account_status_period_start", "account_id", "status", "period_start"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    approved_by_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    period_kind: Mapped[str] = mapped_column(String(16), nullable=False, default="month")
+    period_start: Mapped[date] = mapped_column(Date, nullable=False)
+    period_end: Mapped[date] = mapped_column(Date, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="draft")
+    paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    notes_json: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False, default=dict)
+
+
+class EmployeeKPI(Base, AccountScopedMixin, TimestampMixin):
+    __tablename__ = "employee_kpis"
+    __table_args__ = (
+        UniqueConstraint("account_id", "employee_id", "period_start", "period_end", "metric_code"),
+        Index("ix_employee_kpis_account_employee_period", "account_id", "employee_id", "period_start", "period_end"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    employee_id: Mapped[int] = mapped_column(ForeignKey("employees.id", ondelete="CASCADE"), nullable=False)
+    metric_code: Mapped[str] = mapped_column(String(64), nullable=False)
+    period_start: Mapped[date] = mapped_column(Date, nullable=False)
+    period_end: Mapped[date] = mapped_column(Date, nullable=False)
+    target_value: Mapped[Decimal | None] = mapped_column(Numeric(18, 2), nullable=True)
+    actual_value: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
+    score_pct: Mapped[Decimal | None] = mapped_column(Numeric(8, 2), nullable=True)
+    source_kind: Mapped[str] = mapped_column(String(32), nullable=False, default="derived")
+    payload_json: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False, default=dict)
+
+
+class PayrollEntry(Base, AccountScopedMixin, TimestampMixin):
+    __tablename__ = "payroll_entries"
+    __table_args__ = (
+        UniqueConstraint("account_id", "payroll_period_id", "employee_id"),
+        Index("ix_payroll_entries_account_period_status", "account_id", "payroll_period_id", "status"),
+        Index("ix_payroll_entries_account_employee_period", "account_id", "employee_id", "payroll_period_id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    payroll_period_id: Mapped[int] = mapped_column(ForeignKey("payroll_periods.id", ondelete="CASCADE"), nullable=False)
+    employee_id: Mapped[int] = mapped_column(ForeignKey("employees.id", ondelete="CASCADE"), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="draft")
+    base_salary_amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
+    commission_amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
+    bonus_amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
+    penalty_amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
+    gross_amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
+    net_amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
     summary_json: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False, default=dict)
 
 

@@ -1,0 +1,318 @@
+{% extends "admin/base.html" %}
+{% block content %}
+<div class="topbar">
+  <div>
+    <h2>Payroll</h2>
+    <p class="subtle">Compensation plans, employee KPI metrics, payroll periods, approval and payment tracking.</p>
+  </div>
+  <div class="chips">
+    <span class="chip">{{ employees|length }} employees</span>
+    <span class="chip">{{ periods|length }} periods</span>
+    <a class="pill-link" href="/admin/{{ runtime.account.slug }}/people">people</a>
+  </div>
+</div>
+
+{% if not employees %}
+<section class="notice" style="margin-bottom: 16px;">
+  No employees available for payroll yet. Add employees in the People page first, then configure compensation here.
+</section>
+{% endif %}
+
+<section class="grid cols-2 integrations-layout">
+  <article class="card">
+    <div class="actions" style="justify-content: space-between;">
+      <div>
+        <h3>Employee Compensation</h3>
+        <p class="subtle">Base salary, commission, KPI bonus and penalties per employee.</p>
+      </div>
+      <span class="badge">comp plans</span>
+    </div>
+    <div class="table-wrap" style="margin-top: 14px;">
+      <table>
+        <thead><tr><th>Employee</th><th>Base</th><th>Commission %</th><th>KPI bonus</th><th>Penalties</th><th></th></tr></thead>
+        <tbody>
+          {% for employee in employees %}
+          <tr>
+            <td><strong>{{ employee.full_name }}</strong><div class="status-line">{{ employee.role_title or "—" }}</div></td>
+            <td><input id="base-{{ employee.id }}" type="number" step="0.01" value="{{ employee.base_salary }}"></td>
+            <td><input id="commission-{{ employee.id }}" type="number" step="0.01" value="{{ employee.commission_rate_pct }}"></td>
+            <td><input id="bonus-{{ employee.id }}" type="number" step="0.01" value="{{ employee.kpi_bonus_amount }}"></td>
+            <td>
+              <div class="stack">
+                <input id="penalty-overdue-{{ employee.id }}" type="number" step="0.01" value="{{ employee.penalty_per_overdue_task }}" placeholder="per overdue task">
+                <input id="penalty-quality-{{ employee.id }}" type="number" step="0.01" value="{{ employee.penalty_per_quality_breach }}" placeholder="per quality breach">
+              </div>
+            </td>
+            <td>
+              {% if can_manage_payroll %}
+              <button type="button" class="secondary save-compensation" data-employee-id="{{ employee.id }}">Save</button>
+              {% endif %}
+            </td>
+          </tr>
+          {% else %}
+          <tr><td colspan="6" class="empty">No employees yet.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <div class="subtle" id="compensation-status" style="margin-top: 12px;"></div>
+  </article>
+
+  <article class="card">
+    <div class="actions" style="justify-content: space-between;">
+      <div>
+        <h3>Payroll Periods</h3>
+        <p class="subtle">Create period, compute payroll, then approve or mark as paid.</p>
+      </div>
+      {% if selected_period %}
+      <span class="badge">{{ selected_period.status }}</span>
+      {% endif %}
+    </div>
+
+    {% if can_manage_payroll %}
+    <section class="card soft-card" style="margin-top: 14px; padding: 14px;">
+      <div class="form-grid two">
+        <label>
+          Period kind
+          <select id="period-kind">
+            {% for option in payroll_period_kind_options %}
+            <option value="{{ option }}">{{ option }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>Start<input id="period-start" type="date"></label>
+        <label>End<input id="period-end" type="date"></label>
+        <label style="grid-column: 1 / span 2;">Notes<textarea id="period-notes" rows="3" placeholder="Payroll run note"></textarea></label>
+      </div>
+      <div class="actions" style="margin-top: 14px;">
+        <button type="button" id="save-period">Create payroll period</button>
+        <span class="subtle" id="period-status"></span>
+      </div>
+    </section>
+    {% endif %}
+
+    <section class="card soft-card" style="margin-top: 16px; padding: 0;">
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Period</th><th>Status</th><th>Paid</th><th></th></tr></thead>
+          <tbody>
+            {% for period in periods %}
+            <tr>
+              <td><strong>{{ period.period_start }}</strong> → {{ period.period_end }}<div class="status-line">{{ period.period_kind }}</div></td>
+              <td>{{ period.status }}</td>
+              <td>{{ period.paid_at or "—" }}</td>
+              <td><a class="pill-link" href="/admin/{{ runtime.account.slug }}/payroll?payroll_period_id={{ period.id }}">open</a></td>
+            </tr>
+            {% else %}
+            <tr><td colspan="4" class="empty">No payroll periods yet.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </article>
+</section>
+
+{% if selected_period %}
+<section class="grid cols-2 integrations-layout" style="margin-top: 16px;">
+  <article class="card">
+    <div class="actions" style="justify-content: space-between;">
+      <div>
+        <h3>KPI Input and Derived Metrics</h3>
+        <p class="subtle">Manual revenue target/actual plus derived execution and quality metrics per employee.</p>
+      </div>
+      <span class="badge">{{ selected_period.period_start }} → {{ selected_period.period_end }}</span>
+    </div>
+    <div class="table-wrap" style="margin-top: 14px;">
+      <table>
+        <thead><tr><th>Employee</th><th>Revenue</th><th>Completed</th><th>Overdue</th><th>Quality</th><th></th></tr></thead>
+        <tbody>
+          {% for employee in employees %}
+          {% set employee_kpis = kpi_rows.get(employee.id, {}) %}
+          <tr>
+            <td>{{ employee.full_name }}</td>
+            <td>
+              <input id="kpi-actual-{{ employee.id }}" type="number" step="0.01" value="{{ employee_kpis.get('revenue_generated').actual_value if employee_kpis.get('revenue_generated') else 0 }}">
+              <div class="status-line">target <input id="kpi-target-{{ employee.id }}" type="number" step="0.01" value="{{ employee_kpis.get('revenue_generated').target_value if employee_kpis.get('revenue_generated') and employee_kpis.get('revenue_generated').target_value is not none else '' }}"></div>
+            </td>
+            <td>{{ employee_kpis.get('completed_tasks').actual_value if employee_kpis.get('completed_tasks') else 0 }}</td>
+            <td>{{ employee_kpis.get('overdue_tasks').actual_value if employee_kpis.get('overdue_tasks') else 0 }}</td>
+            <td>{{ employee_kpis.get('quality_breaches').actual_value if employee_kpis.get('quality_breaches') else 0 }}</td>
+            <td>
+              {% if can_manage_payroll %}
+              <button type="button" class="secondary save-revenue-kpi" data-employee-id="{{ employee.id }}">Save revenue KPI</button>
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <div class="subtle" id="kpi-status" style="margin-top: 12px;"></div>
+  </article>
+
+  <article class="card">
+    <div class="actions" style="justify-content: space-between;">
+      <div>
+        <h3>Payroll Entries</h3>
+        <p class="subtle">Computed from compensation config, manual revenue KPI and derived execution/quality metrics.</p>
+      </div>
+      <div class="actions">
+        {% if can_manage_payroll %}
+        <button type="button" id="compute-payroll" class="secondary">Compute</button>
+        <button type="button" id="approve-payroll" class="ghost">Approve</button>
+        <button type="button" id="pay-payroll" class="ghost">Mark paid</button>
+        {% endif %}
+      </div>
+    </div>
+    <div class="table-wrap" style="margin-top: 14px;">
+      <table>
+        <thead><tr><th>Employee</th><th>Base</th><th>Comm</th><th>Bonus</th><th>Penalty</th><th>Net</th><th>Status</th></tr></thead>
+        <tbody>
+          {% for entry in entries %}
+          {% set employee = (employees | selectattr('id', 'equalto', entry.employee_id) | list | first) %}
+          <tr>
+            <td>{{ employee.full_name if employee else entry.employee_id }}</td>
+            <td>{{ entry.base_salary_amount }}</td>
+            <td>{{ entry.commission_amount }}</td>
+            <td>{{ entry.bonus_amount }}</td>
+            <td>{{ entry.penalty_amount }}</td>
+            <td><strong>{{ entry.net_amount }}</strong></td>
+            <td>{{ entry.status }}</td>
+          </tr>
+          {% else %}
+          <tr><td colspan="7" class="empty">No payroll entries computed yet.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <div class="subtle" id="compute-status" style="margin-top: 12px;"></div>
+  </article>
+</section>
+{% endif %}
+
+<script>
+  document.querySelectorAll(".save-compensation").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const employeeId = button.dataset.employeeId;
+      const response = await adminFetch(`/admin/{{ runtime.account.slug }}/payroll/employees/${employeeId}/compensation`, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+          compensation: {
+            base_salary: document.getElementById(`base-${employeeId}`).value || 0,
+            commission_rate_pct: document.getElementById(`commission-${employeeId}`).value || 0,
+            kpi_bonus_amount: document.getElementById(`bonus-${employeeId}`).value || 0,
+            penalty_per_overdue_task: document.getElementById(`penalty-overdue-${employeeId}`).value || 0,
+            penalty_per_quality_breach: document.getElementById(`penalty-quality-${employeeId}`).value || 0,
+          }
+        }),
+      });
+      const statusNode = document.getElementById("compensation-status");
+      if (!response.ok) {
+        statusNode.textContent = await response.text();
+        return;
+      }
+      const body = await response.json();
+      statusNode.textContent = `Saved compensation for ${body.employee.full_name}.`;
+    });
+  });
+
+  const savePeriodButton = document.getElementById("save-period");
+  if (savePeriodButton) {
+    savePeriodButton.addEventListener("click", async () => {
+      const response = await adminFetch(`/admin/{{ runtime.account.slug }}/payroll/periods/save`, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+          period: {
+            period_kind: document.getElementById("period-kind").value,
+            period_start: document.getElementById("period-start").value,
+            period_end: document.getElementById("period-end").value,
+            notes: document.getElementById("period-notes").value.trim() || null,
+          }
+        }),
+      });
+      const statusNode = document.getElementById("period-status");
+      if (!response.ok) {
+        statusNode.textContent = await response.text();
+        return;
+      }
+      const body = await response.json();
+      window.location.href = `/admin/{{ runtime.account.slug }}/payroll?payroll_period_id=${body.payroll_period.id}`;
+    });
+  }
+
+  document.querySelectorAll(".save-revenue-kpi").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const employeeId = button.dataset.employeeId;
+      const response = await adminFetch(`/admin/{{ runtime.account.slug }}/payroll/kpis/save`, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+          kpi: {
+            employee_id: employeeId,
+            metric_code: "revenue_generated",
+            period_start: "{{ selected_period.period_start if selected_period else '' }}",
+            period_end: "{{ selected_period.period_end if selected_period else '' }}",
+            actual_value: document.getElementById(`kpi-actual-${employeeId}`).value || 0,
+            target_value: document.getElementById(`kpi-target-${employeeId}`).value || null,
+            source_kind: "manual",
+            note: "manual payroll UI input",
+          }
+        }),
+      });
+      const statusNode = document.getElementById("kpi-status");
+      if (!response.ok) {
+        statusNode.textContent = await response.text();
+        return;
+      }
+      const body = await response.json();
+      statusNode.textContent = `Saved ${body.kpi.metric_code} for employee #${body.kpi.employee_id}.`;
+    });
+  });
+
+  const computeButton = document.getElementById("compute-payroll");
+  if (computeButton) {
+    computeButton.addEventListener("click", async () => {
+      const response = await adminFetch(`/admin/{{ runtime.account.slug }}/payroll/periods/{{ selected_period.id if selected_period else 0 }}/compute`, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({}),
+      });
+      const statusNode = document.getElementById("compute-status");
+      if (!response.ok) {
+        statusNode.textContent = await response.text();
+        return;
+      }
+      const body = await response.json();
+      statusNode.textContent = `Computed ${body.entries.length} payroll entries.`;
+      window.location.reload();
+    });
+  }
+
+  async function updatePayrollStatus(statusCode) {
+    const response = await adminFetch(`/admin/{{ runtime.account.slug }}/payroll/periods/{{ selected_period.id if selected_period else 0 }}/status`, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({status: statusCode}),
+    });
+    const statusNode = document.getElementById("compute-status");
+    if (!response.ok) {
+      statusNode.textContent = await response.text();
+      return;
+    }
+    statusNode.textContent = `Payroll period marked ${statusCode}.`;
+    window.location.reload();
+  }
+
+  const approveButton = document.getElementById("approve-payroll");
+  if (approveButton) {
+    approveButton.addEventListener("click", async () => updatePayrollStatus("approved"));
+  }
+  const payButton = document.getElementById("pay-payroll");
+  if (payButton) {
+    payButton.addEventListener("click", async () => updatePayrollStatus("paid"));
+  }
+</script>
+{% endblock %}

@@ -169,6 +169,7 @@ Telegram-бот продолжает жить как legacy adapter, а platform
 - stage 8.6: people execution and KPI foundation
 - stage 8.7: procurement, logistics and documents foundation
 - stage 8.8: communication intelligence and owner guidance foundation
+- stage 8.9: payroll, employee KPI and compensation foundation
 - stage 7.8: productization layer
 - stage 7.9: execution brief and account actions
 - stage 8.0: delivery layer and product polish
@@ -458,6 +459,39 @@ Stage 8.8 adds:
   - `communication_intelligence` feature flag
   - `communication_reviews` soft-limit visibility
   - readiness hint when the account has no communication reviews yet
+
+Stage 8.9 adds:
+
+- account-scoped payroll page:
+  - `GET /admin/{account_slug}/payroll`
+  - `POST /admin/{account_slug}/payroll/employees/{employee_id}/compensation`
+  - `POST /admin/{account_slug}/payroll/periods/save`
+  - `POST /admin/{account_slug}/payroll/kpis/save`
+  - `POST /admin/{account_slug}/payroll/periods/{payroll_period_id}/compute`
+  - `POST /admin/{account_slug}/payroll/periods/{payroll_period_id}/status`
+- compensation plan fields on employees:
+  - base salary
+  - commission rate
+  - KPI bonus amount
+  - penalty per overdue task
+  - penalty per quality breach
+- payroll foundation tables:
+  - `payroll_periods`
+  - `employee_kpis`
+  - `payroll_entries`
+- derived KPI linkage into payroll:
+  - completed tasks
+  - overdue tasks
+  - communication quality breaches
+  - manual revenue generated metric
+- payroll approval and paid lifecycle:
+  - `draft`
+  - `approved`
+  - `paid`
+- product-layer integration:
+  - `payroll_kpi` feature flag
+  - `active_payroll_periods` soft-limit visibility
+  - readiness hints for first compensation plan and first payroll period
 
 Stage 8.1 adds:
 
