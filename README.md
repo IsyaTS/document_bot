@@ -270,6 +270,7 @@ Server-rendered admin app lives in `platform_runtime/app.py` and now includes:
   - `/admin/{account_slug}/dashboard`
   - `/admin/{account_slug}/brief`
   - `/admin/{account_slug}/delivery`
+  - `/admin/{account_slug}/knowledge`
   - `/admin/{account_slug}/integrations`
   - `/admin/{account_slug}/alerts-tasks`
   - `/admin/{account_slug}/ops-sync`
@@ -366,6 +367,26 @@ Obsidian operational note:
 - config knobs:
   - `PLATFORM_OBSIDIAN_VAULT_PATH`
   - `PLATFORM_OBSIDIAN_EXPORT_SUBDIR`
+
+Stage 8.5 adds:
+
+- account-scoped knowledge base:
+  - `GET /admin/{account_slug}/knowledge`
+  - `POST /admin/{account_slug}/knowledge/save`
+  - `POST /admin/{account_slug}/knowledge/{item_id}/status`
+  - `GET /admin/{account_slug}/knowledge/{item_id}/download`
+- canonical knowledge storage in `knowledge_items` with:
+  - notes
+  - SOPs / policies
+  - customer notes
+  - uploaded files
+  - tags and linked customer / deal context
+- read-only visibility for viewers and write flow for roles with `documents.manage`
+- product-layer integration:
+  - `knowledge_base` feature flag
+  - `active_knowledge_items` soft-limit visibility
+  - readiness next-step hint when account has no knowledge seeded
+- uploaded files are stored under `data/runtime_knowledge_uploads/`
 
 Stage 8.1 adds:
 

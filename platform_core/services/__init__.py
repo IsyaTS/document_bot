@@ -8,6 +8,7 @@ from platform_core.services.bootstrap import BootstrapResult, CoreBootstrapServi
 from platform_core.services.credentials import CredentialCrypto, CredentialCryptoError
 from platform_core.services.dashboard import DashboardCatalogService, ExecutiveDashboardService
 from platform_core.services.goals import GOAL_METRIC_DEFINITIONS, GoalMetricDefinition, GoalService
+from platform_core.services.knowledge import KnowledgeService
 from platform_core.services.user_security import AuthResult, PasswordHasher, UserSecurityService
 from platform_core.services.runtime import (
     AdminQueryService,
@@ -38,6 +39,7 @@ __all__ = [
     "GOAL_METRIC_DEFINITIONS",
     "GoalMetricDefinition",
     "GoalService",
+    "KnowledgeService",
     "AuthResult",
     "AdminQueryService",
     "PasswordHasher",

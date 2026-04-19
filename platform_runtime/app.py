@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import mimetypes
 import secrets
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -9,7 +11,8 @@ from urllib.parse import parse_qs, urlencode
 from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
+from starlette.datastructures import UploadFile
 from starlette.middleware.sessions import SessionMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -17,12 +20,12 @@ from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from platform_core.models import Account, AccountUser, Alert, Employee, Goal, GoalTarget, Role, RuntimeLease, Task, TaskEvent, User
+from platform_core.models import Account, AccountUser, Alert, Customer, Deal, Employee, Goal, GoalTarget, KnowledgeItem, Role, RuntimeLease, Task, TaskEvent, User
 from platform_core.runtime_delivery import write_delivery_bundle
 from platform_core.runtime_obsidian import export_account_delivery_note, export_portfolio_brief_note
 from platform_core.exceptions import AuthorizationError, PlatformCoreError, TenantContextError
 from platform_core.runtime_status import read_runtime_status, write_runtime_status
-from platform_core.services import AuditLogService, ExecutiveDashboardService, GOAL_METRIC_DEFINITIONS, GoalService
+from platform_core.services import AuditLogService, ExecutiveDashboardService, GOAL_METRIC_DEFINITIONS, GoalService, KnowledgeService
 from platform_core.services.accounts import AccountService, MembershipService, UserService
 from platform_core.services.user_security import UserSecurityService
 from platform_core.services.runtime import (
@@ -51,6 +54,7 @@ from platform_runtime.schemas import (
 
 def create_app() -> FastAPI:
     settings = load_platform_settings()
+    knowledge_upload_root = (Path(__file__).resolve().parent.parent / "data" / "runtime_knowledge_uploads").resolve()
     app = FastAPI(title="Platform Runtime API", version="0.1.0")
     app.add_middleware(
         SessionMiddleware,
@@ -137,11 +141,18 @@ def create_app() -> FastAPI:
         value = str((payload.get("csrf_token") or [""])[0]).strip()
         return value or None
 
+    async def _request_multipart_csrf_token(request: Request) -> str | None:
+        form = await request.form()
+        value = str(form.get("csrf_token") or "").strip()
+        return value or None
+
     async def _require_csrf(request: Request) -> None:
         expected = _ensure_session_csrf_token(request)
         supplied = _request_csrf_token(request)
         if supplied is None and request.headers.get("content-type", "").startswith("application/x-www-form-urlencoded"):
             supplied = await _request_form_csrf_token(request)
+        if supplied is None and request.headers.get("content-type", "").startswith("multipart/form-data"):
+            supplied = await _request_multipart_csrf_token(request)
         if supplied != expected:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="CSRF token mismatch.")
 
@@ -233,6 +244,7 @@ def create_app() -> FastAPI:
             "integrations": "integrations",
             "alerts_tasks": "alerts-tasks",
             "ops_sync": "ops-sync",
+            "knowledge": "knowledge",
             "goals": "goals",
             "members": "members",
             "settings": "settings",
@@ -387,6 +399,8 @@ def create_app() -> FastAPI:
                 items.append({"key": "brief", "label": "Brief", "path": "brief"})
                 items.append({"key": "delivery", "label": "Delivery", "path": "delivery"})
             items.append({"key": "dashboard", "label": "Dashboard", "path": "dashboard"})
+            if feature_access["knowledge_base"]["allowed"]:
+                items.append({"key": "knowledge", "label": "Knowledge", "path": "knowledge"})
             if feature_access["goals_tracking"]["allowed"]:
                 items.append({"key": "goals", "label": "Goals", "path": "goals"})
         if "alerts.read" in permissions or "tasks.read" in permissions or "*" in permissions:
@@ -476,6 +490,7 @@ def create_app() -> FastAPI:
             "nav_items": _admin_nav_items(runtime),
             "can_manage_integrations": "*" in runtime.permissions or "integrations.manage" in runtime.permissions,
             "can_manage_goals": "*" in runtime.permissions or "rules.manage" in runtime.permissions,
+            "can_manage_knowledge": "*" in runtime.permissions or "documents.manage" in runtime.permissions,
             "can_view_ops": "*" in runtime.permissions or {"integrations.manage", "rules.manage", "tasks.read", "alerts.read"}.issubset(runtime.permissions),
             "can_manage_members": _is_manager_role(runtime.role_code),
             "can_manage_accounts_global": _actor_can_manage_accounts(session, actor_email),
@@ -953,6 +968,7 @@ def create_app() -> FastAPI:
         return [
             {"key": "portfolio_console", "label": "Portfolio console", "description": "Owner-level portfolio visibility."},
             {"key": "owner_briefs", "label": "Owner briefs", "description": "Portfolio briefs and digest blocks."},
+            {"key": "knowledge_base", "label": "Knowledge base", "description": "Operational memory, files and SOP knowledge."},
             {"key": "goals_tracking", "label": "Goals tracking", "description": "Plan vs fact and goal workflows."},
             {"key": "integrations_setup", "label": "Integrations setup", "description": "Admin UI for integration setup and sync."},
             {"key": "ops_console", "label": "Ops console", "description": "Ops / Sync visibility and actions."},
@@ -963,25 +979,25 @@ def create_app() -> FastAPI:
             "internal": {
                 "label": "Internal",
                 "summary": "Internal operator deployment with full platform surface for live business use.",
-                "recommended_features": {"portfolio_console", "owner_briefs", "goals_tracking", "integrations_setup", "ops_console"},
+                "recommended_features": {"portfolio_console", "owner_briefs", "knowledge_base", "goals_tracking", "integrations_setup", "ops_console"},
                 "usage_note": "Best fit for active internal operations and product validation.",
             },
             "pilot": {
                 "label": "Pilot",
                 "summary": "Small rollout for one operating team with core execution and onboarding flows.",
-                "recommended_features": {"owner_briefs", "goals_tracking", "integrations_setup", "ops_console"},
+                "recommended_features": {"owner_briefs", "knowledge_base", "goals_tracking", "integrations_setup", "ops_console"},
                 "usage_note": "Good for proving value before broad rollout.",
             },
             "growth": {
                 "label": "Growth",
                 "summary": "Multi-account owner workflow with portfolio visibility and delivery flows.",
-                "recommended_features": {"portfolio_console", "owner_briefs", "goals_tracking", "integrations_setup", "ops_console"},
+                "recommended_features": {"portfolio_console", "owner_briefs", "knowledge_base", "goals_tracking", "integrations_setup", "ops_console"},
                 "usage_note": "Designed for wider operational rollout.",
             },
             "enterprise": {
                 "label": "Enterprise",
                 "summary": "Highest readiness profile with all current product surfaces enabled.",
-                "recommended_features": {"portfolio_console", "owner_briefs", "goals_tracking", "integrations_setup", "ops_console"},
+                "recommended_features": {"portfolio_console", "owner_briefs", "knowledge_base", "goals_tracking", "integrations_setup", "ops_console"},
                 "usage_note": "Suitable for fully managed multi-account environments.",
             },
         }
@@ -994,6 +1010,7 @@ def create_app() -> FastAPI:
             {"key": "active_memberships", "label": "Active members", "description": "Soft limit for active account memberships."},
             {"key": "active_integrations", "label": "Active integrations", "description": "Soft limit for non-archived integrations."},
             {"key": "active_goals", "label": "Active goals", "description": "Soft limit for active goals."},
+            {"key": "active_knowledge_items", "label": "Knowledge items", "description": "Soft limit for active knowledge entries."},
         ]
 
     def _default_account_settings() -> dict[str, object]:
@@ -1118,10 +1135,12 @@ def create_app() -> FastAPI:
             TenantContext(account_id=account.id, actor_user_id=None, source="settings", is_system=True)
         )
         goals = GoalService(session).list_goals(TenantContext(account_id=account.id, actor_user_id=None, source="settings", is_system=True))
+        knowledge_count = KnowledgeService(session).count_active_items(account.id)
         return {
             "active_memberships": sum(1 for item in memberships if item.status == "active"),
             "active_integrations": sum(1 for item in integrations if item.status != "archived"),
             "active_goals": sum(1 for item in goals if item.status != "archived"),
+            "active_knowledge_items": knowledge_count,
         }
 
     def _account_usage_rows(account: Account, session: Session) -> list[dict[str, object]]:
@@ -1166,6 +1185,8 @@ def create_app() -> FastAPI:
         next_steps: list[dict[str, str]] = []
         if onboarding["goals_count"] == 0:
             next_steps.append({"label": "Create the first goal", "href": f"/admin/{runtime.account.slug}/goals"})
+        if KnowledgeService(session).count_active_items(runtime.account.id) == 0:
+            next_steps.append({"label": "Load the first SOP or knowledge note", "href": f"/admin/{runtime.account.slug}/knowledge"})
         if len(onboarding["integration_rows"]) == 0:
             next_steps.append({"label": "Connect the first integration", "href": f"/admin/{runtime.account.slug}/integrations"})
         if onboarding["last_success"] is None and len(onboarding["integration_rows"]) > 0:
@@ -1439,6 +1460,7 @@ def create_app() -> FastAPI:
             {"label": "Default operator", "value": (brief["defaults"]["operator"].full_name or brief["defaults"]["operator"].email) if brief["defaults"]["operator"] else "not set"},
             {"label": "Integrations", "value": str(len(onboarding["integration_rows"]))},
             {"label": "Goals", "value": str(onboarding["goals_count"])},
+            {"label": "Knowledge items", "value": str(KnowledgeService(session).count_active_items(runtime.account.id))},
             {"label": "Last successful sync", "value": _serialize_datetime(onboarding["last_success"].finished_at) if onboarding["last_success"] else "not run yet"},
             {"label": "Sync health", "value": sync_health["status"]},
         ]
@@ -1531,6 +1553,36 @@ def create_app() -> FastAPI:
                 "failed_sync_jobs": readiness["failed_sync_jobs_count"],
             },
         }
+
+    def _knowledge_item_type_options() -> list[str]:
+        return ["note", "sop", "policy", "customer_note", "file", "reference"]
+
+    def _knowledge_status_options() -> list[str]:
+        return ["active", "archived"]
+
+    def _knowledge_tags(raw: str | None) -> list[str]:
+        if not raw:
+            return []
+        return [item.strip() for item in raw.split(",") if item.strip()]
+
+    def _knowledge_item_linked_customer(item: KnowledgeItem, customer_lookup: dict[int, Customer]) -> Customer | None:
+        if item.customer_id is None:
+            return None
+        return customer_lookup.get(item.customer_id)
+
+    def _knowledge_item_linked_deal(item: KnowledgeItem, deal_lookup: dict[int, Deal]) -> Deal | None:
+        if item.deal_id is None:
+            return None
+        return deal_lookup.get(item.deal_id)
+
+    def _knowledge_storage_path(account_slug: str, upload: UploadFile, content_sha256: str) -> tuple[Path, str]:
+        suffix = Path(upload.filename or "attachment.bin").suffix
+        safe_name = "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "-" for ch in Path(upload.filename or "attachment").stem)
+        safe_name = safe_name.strip("-_.") or "attachment"
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+        relative = Path(account_slug) / datetime.now(timezone.utc).strftime("%Y/%m/%d") / f"{stamp}-{content_sha256[:10]}-{safe_name}{suffix}"
+        absolute = knowledge_upload_root / relative
+        return absolute, relative.as_posix()
 
     def _account_delivery_markdown(pack: dict[str, object]) -> str:
         account = pack["account"]
@@ -3741,6 +3793,245 @@ def create_app() -> FastAPI:
             _push_flash(request, "error", f"Account settings update failed: {exc}")
         return RedirectResponse(url=f"/admin/{runtime.account.slug}/settings", status_code=status.HTTP_302_FOUND)
 
+    @app.get("/admin/{account_slug}/knowledge", response_class=HTMLResponse)
+    def admin_knowledge(
+        request: Request,
+        account_slug: str,
+        q: str | None = Query(default=None),
+        item_type: str | None = Query(default=None),
+        status_filter: str = Query(default="active"),
+        item_id: int | None = Query(default=None),
+        session: Session = Depends(get_db_session),
+    ) -> HTMLResponse:
+        user = _current_session_user(session, request)
+        if user is None:
+            request.session.clear()
+            return _login_redirect(f"/admin/{account_slug}/knowledge")
+        actor_email = user.email
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
+        request.session["admin_account_slug"] = runtime.account.slug
+        ensure_permission(runtime, "business.read")
+        _ensure_account_feature(runtime, "knowledge_base", "Knowledge base")
+        knowledge_service = KnowledgeService(session)
+        items = knowledge_service.list_items(
+            runtime.context,
+            q=q,
+            item_type=item_type or None,
+            status=status_filter or None,
+        )
+        selected_item = None
+        if item_id is not None:
+            try:
+                selected_item = knowledge_service.get_item(runtime.context, item_id)
+            except TenantContextError as exc:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        elif items:
+            selected_item = items[0]
+        customer_ids = {item.customer_id for item in items if item.customer_id is not None}
+        deal_ids = {item.deal_id for item in items if item.deal_id is not None}
+        if selected_item is not None:
+            if selected_item.customer_id is not None:
+                customer_ids.add(selected_item.customer_id)
+            if selected_item.deal_id is not None:
+                deal_ids.add(selected_item.deal_id)
+        customer_lookup = {
+            item.id: item
+            for item in session.execute(
+                select(Customer).where(Customer.account_id == runtime.account.id, Customer.id.in_(customer_ids))
+            ).scalars().all()
+        } if customer_ids else {}
+        deal_lookup = {
+            item.id: item
+            for item in session.execute(
+                select(Deal).where(Deal.account_id == runtime.account.id, Deal.id.in_(deal_ids))
+            ).scalars().all()
+        } if deal_ids else {}
+        recent_customers = session.execute(
+            select(Customer)
+            .where(Customer.account_id == runtime.account.id)
+            .order_by(Customer.updated_at.desc(), Customer.id.desc())
+            .limit(50)
+        ).scalars().all()
+        recent_deals = session.execute(
+            select(Deal)
+            .where(Deal.account_id == runtime.account.id)
+            .order_by(Deal.updated_at.desc(), Deal.id.desc())
+            .limit(50)
+        ).scalars().all()
+        return templates.TemplateResponse(
+            request,
+            "admin/knowledge.html",
+            {
+                **_admin_context(request, session, runtime, page="knowledge"),
+                "knowledge_items": items,
+                "selected_item": selected_item,
+                "customer_lookup": customer_lookup,
+                "deal_lookup": deal_lookup,
+                "recent_customers": recent_customers,
+                "recent_deals": recent_deals,
+                "knowledge_query": q or "",
+                "knowledge_item_type": item_type or "",
+                "knowledge_status_filter": status_filter or "active",
+                "knowledge_item_type_options": _knowledge_item_type_options(),
+                "knowledge_status_options": _knowledge_status_options(),
+            },
+        )
+
+    @app.post("/admin/{account_slug}/knowledge/save")
+    async def admin_save_knowledge(
+        request: Request,
+        account_slug: str,
+        session: Session = Depends(get_db_session),
+    ) -> RedirectResponse:
+        await _require_csrf(request)
+        actor = _require_admin_user(request, session)
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor.email)
+        request.session["admin_account_slug"] = runtime.account.slug
+        ensure_permission(runtime, "documents.manage")
+        _ensure_account_feature(runtime, "knowledge_base", "Knowledge base")
+        form = await request.form()
+        title = str(form.get("title") or "").strip()
+        summary = str(form.get("summary") or "").strip() or None
+        body_text = str(form.get("body_text") or "").strip() or None
+        item_type = str(form.get("item_type") or "note").strip() or "note"
+        tags = _knowledge_tags(str(form.get("tags") or ""))
+        customer_id_raw = str(form.get("customer_id") or "").strip()
+        deal_id_raw = str(form.get("deal_id") or "").strip()
+        upload = form.get("upload")
+        customer_id = int(customer_id_raw) if customer_id_raw else None
+        deal_id = int(deal_id_raw) if deal_id_raw else None
+        if item_type not in set(_knowledge_item_type_options()):
+            _push_flash(request, "error", "Unsupported knowledge item type.")
+            return RedirectResponse(url=f"/admin/{runtime.account.slug}/knowledge", status_code=status.HTTP_302_FOUND)
+        if customer_id is not None:
+            customer = session.execute(
+                select(Customer).where(Customer.account_id == runtime.account.id, Customer.id == customer_id)
+            ).scalar_one_or_none()
+            if customer is None:
+                _push_flash(request, "error", "Linked customer not found in selected account.")
+                return RedirectResponse(url=f"/admin/{runtime.account.slug}/knowledge", status_code=status.HTTP_302_FOUND)
+        if deal_id is not None:
+            deal = session.execute(
+                select(Deal).where(Deal.account_id == runtime.account.id, Deal.id == deal_id)
+            ).scalar_one_or_none()
+            if deal is None:
+                _push_flash(request, "error", "Linked deal not found in selected account.")
+                return RedirectResponse(url=f"/admin/{runtime.account.slug}/knowledge", status_code=status.HTTP_302_FOUND)
+
+        file_name = None
+        file_path = None
+        mime_type = None
+        content_size_bytes = None
+        content_sha256 = None
+        source_kind = "manual"
+        metadata: dict[str, object] = {}
+        if isinstance(upload, UploadFile) and upload.filename:
+            content = await upload.read()
+            if not content:
+                _push_flash(request, "error", "Uploaded file is empty.")
+                return RedirectResponse(url=f"/admin/{runtime.account.slug}/knowledge", status_code=status.HTTP_302_FOUND)
+            if len(content) > 10 * 1024 * 1024:
+                _push_flash(request, "error", "Uploaded file is too large. Limit is 10 MB.")
+                return RedirectResponse(url=f"/admin/{runtime.account.slug}/knowledge", status_code=status.HTTP_302_FOUND)
+            content_sha256 = hashlib.sha256(content).hexdigest()
+            absolute_path, relative_path = _knowledge_storage_path(runtime.account.slug, upload, content_sha256)
+            absolute_path.parent.mkdir(parents=True, exist_ok=True)
+            absolute_path.write_bytes(content)
+            file_name = upload.filename
+            file_path = relative_path
+            mime_type = upload.content_type or mimetypes.guess_type(upload.filename)[0] or "application/octet-stream"
+            content_size_bytes = len(content)
+            source_kind = "upload"
+            metadata = {"uploaded_at": datetime.now(timezone.utc).isoformat()}
+            if not title:
+                title = Path(upload.filename).stem or upload.filename
+            if item_type == "note":
+                item_type = "file"
+
+        if not title:
+            _push_flash(request, "error", "Knowledge item title is required.")
+            return RedirectResponse(url=f"/admin/{runtime.account.slug}/knowledge", status_code=status.HTTP_302_FOUND)
+        if not body_text and not summary and file_path is None:
+            _push_flash(request, "error", "Provide note text, summary or upload a file.")
+            return RedirectResponse(url=f"/admin/{runtime.account.slug}/knowledge", status_code=status.HTTP_302_FOUND)
+
+        try:
+            item = KnowledgeService(session).create_item(
+                runtime.context,
+                title=title,
+                summary=summary,
+                body_text=body_text,
+                item_type=item_type,
+                source_kind=source_kind,
+                customer_id=customer_id,
+                deal_id=deal_id,
+                file_name=file_name,
+                file_path=file_path,
+                mime_type=mime_type,
+                content_size_bytes=content_size_bytes,
+                content_sha256=content_sha256,
+                tags=tags,
+                metadata=metadata,
+            )
+            AuditLogService(session).log(
+                runtime.context,
+                "knowledge.item.created",
+                "knowledge_item",
+                str(item.id),
+                details={"item_type": item.item_type, "source_kind": item.source_kind, "file_name": item.file_name},
+            )
+            _push_flash(request, "success", f"Knowledge item #{item.id} saved.")
+            return RedirectResponse(url=f"/admin/{runtime.account.slug}/knowledge?item_id={item.id}", status_code=status.HTTP_302_FOUND)
+        except PlatformCoreError as exc:
+            _push_flash(request, "error", f"Knowledge item save failed: {exc}")
+            return RedirectResponse(url=f"/admin/{runtime.account.slug}/knowledge", status_code=status.HTTP_302_FOUND)
+
+    @app.post("/admin/{account_slug}/knowledge/{item_id}/status")
+    async def admin_knowledge_status(
+        request: Request,
+        account_slug: str,
+        item_id: int,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        actor = _require_admin_user(request, session)
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor.email)
+        ensure_permission(runtime, "documents.manage")
+        _ensure_account_feature(runtime, "knowledge_base", "Knowledge base")
+        payload = await request.json()
+        next_status = str(payload.get("status") or "").strip()
+        item = KnowledgeService(session).update_status(runtime.context, item_id, status=next_status)
+        AuditLogService(session).log(
+            runtime.context,
+            "knowledge.item.status",
+            "knowledge_item",
+            str(item.id),
+            details={"status": item.status},
+        )
+        return JSONResponse({"item": _serialize_knowledge_item(item)})
+
+    @app.get("/admin/{account_slug}/knowledge/{item_id}/download")
+    def admin_download_knowledge_file(
+        request: Request,
+        account_slug: str,
+        item_id: int,
+        session: Session = Depends(get_db_session),
+    ) -> FileResponse:
+        user = _current_session_user(session, request)
+        if user is None:
+            request.session.clear()
+            return _login_redirect(f"/admin/{account_slug}/knowledge")
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=user.email)
+        ensure_permission(runtime, "business.read")
+        _ensure_account_feature(runtime, "knowledge_base", "Knowledge base")
+        item = KnowledgeService(session).get_item(runtime.context, item_id)
+        if not item.file_path:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Knowledge file is not available.")
+        absolute_path = (knowledge_upload_root / item.file_path).resolve()
+        if not absolute_path.is_file() or knowledge_upload_root not in absolute_path.parents:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Knowledge file is missing.")
+        return FileResponse(path=str(absolute_path), media_type=item.mime_type or "application/octet-stream", filename=item.file_name or absolute_path.name)
+
     @app.get("/admin/{account_slug}/alerts-tasks", response_class=HTMLResponse)
     def admin_alerts_tasks(
         request: Request,
@@ -4605,6 +4896,33 @@ def _serialize_alert(alert) -> dict[str, object]:
         "related_entity_type": alert.related_entity_type,
         "related_entity_id": alert.related_entity_id,
         "last_detected_at": _serialize_datetime(alert.last_detected_at),
+    }
+
+
+def _serialize_knowledge_item(item: KnowledgeItem) -> dict[str, object]:
+    return {
+        "id": item.id,
+        "account_id": item.account_id,
+        "created_by_user_id": item.created_by_user_id,
+        "customer_id": item.customer_id,
+        "deal_id": item.deal_id,
+        "document_id": item.document_id,
+        "item_type": item.item_type,
+        "source_kind": item.source_kind,
+        "title": item.title,
+        "summary": item.summary,
+        "body_text": item.body_text,
+        "status": item.status,
+        "visibility": item.visibility,
+        "file_name": item.file_name,
+        "file_path": item.file_path,
+        "mime_type": item.mime_type,
+        "content_size_bytes": item.content_size_bytes,
+        "content_sha256": item.content_sha256,
+        "tags": list(item.tags_json or []),
+        "metadata": item.metadata_json if isinstance(item.metadata_json, dict) else {},
+        "created_at": _serialize_datetime(item.created_at),
+        "updated_at": _serialize_datetime(item.updated_at),
     }
 
 

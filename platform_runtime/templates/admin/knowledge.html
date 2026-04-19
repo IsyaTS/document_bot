@@ -1,0 +1,267 @@
+{% extends "admin/base.html" %}
+{% block content %}
+<div class="topbar">
+  <div>
+    <h2>Knowledge</h2>
+    <p class="subtle">Account-scoped notes, SOPs, files and operational memory. Platform remains source of truth; Obsidian stays optional.</p>
+  </div>
+  <div class="chips">
+    <span class="chip">{{ knowledge_items|length }} items</span>
+    <span class="chip">{{ knowledge_status_filter }}</span>
+    <a class="pill-link" href="/admin/{{ runtime.account.slug }}/delivery">delivery pack</a>
+  </div>
+</div>
+
+{% if not knowledge_items %}
+<section class="notice" style="margin-bottom: 16px;">
+  Knowledge base is empty. Next step: add the first SOP, customer note or file so the next owner/operator has working context inside the platform.
+</section>
+{% endif %}
+
+<section class="grid cols-2 integrations-layout">
+  <article class="card">
+    <div class="actions" style="justify-content: space-between;">
+      <div>
+        <h3>Intake</h3>
+        <p class="subtle">Save a note or upload a file. Link it to a customer or deal when the context matters operationally.</p>
+      </div>
+      <a class="pill-link" href="/admin/{{ runtime.account.slug }}/knowledge">reset</a>
+    </div>
+
+    {% if can_manage_knowledge %}
+    <form method="post" action="/admin/{{ runtime.account.slug }}/knowledge/save" enctype="multipart/form-data" class="stack" style="margin-top: 14px;">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <div class="form-grid two">
+        <label>
+          Type
+          <select name="item_type">
+            {% for option in knowledge_item_type_options %}
+            <option value="{{ option }}">{{ option }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>
+          Title
+          <input name="title" placeholder="Warehouse handoff SOP">
+        </label>
+        <label>
+          Customer
+          <select name="customer_id">
+            <option value="">—</option>
+            {% for customer in recent_customers %}
+            <option value="{{ customer.id }}">{{ customer.name }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>
+          Deal
+          <select name="deal_id">
+            <option value="">—</option>
+            {% for deal in recent_deals %}
+            <option value="{{ deal.id }}">{{ deal.title }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>
+          Tags
+          <input name="tags" placeholder="sop, procurement, urgent">
+          <span class="status-line">comma-separated</span>
+        </label>
+        <label>
+          Upload file
+          <input type="file" name="upload">
+          <span class="status-line">10 MB max</span>
+        </label>
+      </div>
+      <label>
+        Summary
+        <textarea name="summary" rows="3" placeholder="Short context for the next operator."></textarea>
+      </label>
+      <label>
+        Body
+        <textarea name="body_text" rows="8" placeholder="Paste SOP, negotiation context, claim template, logistics note or structured owner knowledge."></textarea>
+      </label>
+      <div class="actions">
+        <button type="submit">Save knowledge item</button>
+        <span class="subtle">Managers and operators with document permissions can write; viewers stay read-only.</span>
+      </div>
+    </form>
+    {% else %}
+    <section class="notice" style="margin-top: 14px;">
+      Read-only mode. You can review knowledge items, but creating or changing them requires document management access.
+    </section>
+    {% endif %}
+
+    <section class="card soft-card" style="margin-top: 16px; padding: 14px;">
+      <h4>Find context fast</h4>
+      <form method="get" action="/admin/{{ runtime.account.slug }}/knowledge" class="form-grid two" style="margin-top: 12px;">
+        <label>
+          Search
+          <input name="q" value="{{ knowledge_query }}" placeholder="SOP, supplier, contract, warehouse, claim">
+        </label>
+        <label>
+          Type
+          <select name="item_type">
+            <option value="">all</option>
+            {% for option in knowledge_item_type_options %}
+            <option value="{{ option }}" {{ 'selected' if knowledge_item_type == option else '' }}>{{ option }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>
+          Status
+          <select name="status_filter">
+            {% for option in knowledge_status_options %}
+            <option value="{{ option }}" {{ 'selected' if knowledge_status_filter == option else '' }}>{{ option }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <div class="actions" style="align-items: end;">
+          <button type="submit" class="secondary">Apply filters</button>
+        </div>
+      </form>
+    </section>
+
+    <section class="card soft-card" style="margin-top: 16px; padding: 0;">
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Item</th>
+              <th>Type</th>
+              <th>Context</th>
+              <th>Status</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for item in knowledge_items %}
+            {% set linked_customer = customer_lookup.get(item.customer_id) if item.customer_id else none %}
+            {% set linked_deal = deal_lookup.get(item.deal_id) if item.deal_id else none %}
+            <tr>
+              <td>
+                <a href="/admin/{{ runtime.account.slug }}/knowledge?item_id={{ item.id }}"><strong>{{ item.title }}</strong></a>
+                <div class="status-line">{{ item.created_at }} · {{ item.source_kind }}</div>
+                {% if item.tags_json %}
+                <div class="chips" style="margin-top: 6px;">
+                  {% for tag in item.tags_json %}
+                  <span class="chip">{{ tag }}</span>
+                  {% endfor %}
+                </div>
+                {% endif %}
+              </td>
+              <td>{{ item.item_type }}</td>
+              <td>
+                {% if linked_customer %}<div class="status-line">Customer: {{ linked_customer.name }}</div>{% endif %}
+                {% if linked_deal %}<div class="status-line">Deal: {{ linked_deal.title }}</div>{% endif %}
+                {% if not linked_customer and not linked_deal %}—{% endif %}
+              </td>
+              <td><span class="badge {{ 'good' if item.status == 'active' else 'warn' }}">{{ item.status }}</span></td>
+              <td>
+                <div class="actions">
+                  {% if item.file_path %}
+                  <a class="pill-link" href="/admin/{{ runtime.account.slug }}/knowledge/{{ item.id }}/download">download</a>
+                  {% endif %}
+                  {% if can_manage_knowledge %}
+                  <button type="button" class="ghost knowledge-status" data-item-id="{{ item.id }}" data-status="{{ 'archived' if item.status == 'active' else 'active' }}">
+                    {{ 'archive' if item.status == 'active' else 'restore' }}
+                  </button>
+                  {% endif %}
+                </div>
+              </td>
+            </tr>
+            {% else %}
+            <tr>
+              <td colspan="5" class="empty">No knowledge items match the current filter.</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </article>
+
+  <article class="card">
+    <div class="actions" style="justify-content: space-between;">
+      <div>
+        <h3>Selected Item</h3>
+        <p class="subtle">This view should help the next owner/operator understand what exists, what matters and what file/note to open next.</p>
+      </div>
+      {% if selected_item and selected_item.file_path %}
+      <a class="pill-link" href="/admin/{{ runtime.account.slug }}/knowledge/{{ selected_item.id }}/download">download file</a>
+      {% endif %}
+    </div>
+
+    {% if selected_item %}
+    {% set selected_customer = customer_lookup.get(selected_item.customer_id) if selected_item.customer_id else none %}
+    {% set selected_deal = deal_lookup.get(selected_item.deal_id) if selected_item.deal_id else none %}
+    <div class="chips" style="margin-top: 14px;">
+      <span class="chip">{{ selected_item.item_type }}</span>
+      <span class="chip">{{ selected_item.status }}</span>
+      <span class="chip">{{ selected_item.source_kind }}</span>
+      {% if selected_item.mime_type %}<span class="chip">{{ selected_item.mime_type }}</span>{% endif %}
+      {% if selected_item.content_size_bytes %}<span class="chip">{{ selected_item.content_size_bytes }} bytes</span>{% endif %}
+    </div>
+    <div class="stack" style="margin-top: 14px;">
+      <h3>{{ selected_item.title }}</h3>
+      {% if selected_item.summary %}
+      <div class="notice">{{ selected_item.summary }}</div>
+      {% endif %}
+      <div class="grid cols-2">
+        <div class="inline-card">
+          <strong>Created</strong>
+          <div class="status-line">{{ selected_item.created_at }}</div>
+          <div class="status-line">Updated {{ selected_item.updated_at }}</div>
+        </div>
+        <div class="inline-card">
+          <strong>Linked Context</strong>
+          <div class="status-line">Customer: {{ selected_customer.name if selected_customer else "—" }}</div>
+          <div class="status-line">Deal: {{ selected_deal.title if selected_deal else "—" }}</div>
+        </div>
+      </div>
+      {% if selected_item.body_text %}
+      <div class="card soft-card" style="padding: 14px;">
+        <h4>Body</h4>
+        <pre style="white-space: pre-wrap; font: inherit; margin: 0;">{{ selected_item.body_text }}</pre>
+      </div>
+      {% endif %}
+      {% if selected_item.file_name %}
+      <div class="card soft-card" style="padding: 14px;">
+        <h4>File</h4>
+        <div class="status-line">{{ selected_item.file_name }}</div>
+        <div class="status-line">{{ selected_item.file_path }}</div>
+      </div>
+      {% endif %}
+      {% if selected_item.tags_json %}
+      <div class="chips">
+        {% for tag in selected_item.tags_json %}
+        <span class="chip">{{ tag }}</span>
+        {% endfor %}
+      </div>
+      {% endif %}
+    </div>
+    {% else %}
+    <p class="empty" style="margin-top: 16px;">Choose a knowledge item from the left or create the first one.</p>
+    {% endif %}
+  </article>
+</section>
+
+<script>
+  for (const button of document.querySelectorAll(".knowledge-status")) {
+    button.addEventListener("click", async () => {
+      const itemId = button.dataset.itemId;
+      const nextStatus = button.dataset.status;
+      const response = await adminFetch(`/admin/{{ runtime.account.slug }}/knowledge/${itemId}/status`, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({status: nextStatus}),
+      });
+      if (!response.ok) {
+        alert(`Knowledge status update failed: ${await response.text()}`);
+        return;
+      }
+      window.location.reload();
+    });
+  }
+</script>
+{% endblock %}

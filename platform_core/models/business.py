@@ -457,3 +457,33 @@ class Document(Base, AccountScopedMixin, TimestampMixin):
     total_amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
     currency: Mapped[str] = mapped_column(String(8), nullable=False, default="RUB")
     snapshot_json: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False, default=dict)
+
+
+class KnowledgeItem(Base, AccountScopedMixin, TimestampMixin):
+    __tablename__ = "knowledge_items"
+    __table_args__ = (
+        Index("ix_knowledge_items_account_status_created_at", "account_id", "status", "created_at"),
+        Index("ix_knowledge_items_account_type_created_at", "account_id", "item_type", "created_at"),
+        Index("ix_knowledge_items_account_customer_created_at", "account_id", "customer_id", "created_at"),
+        Index("ix_knowledge_items_account_deal_created_at", "account_id", "deal_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    created_by_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    customer_id: Mapped[int | None] = mapped_column(ForeignKey("customers.id", ondelete="SET NULL"), nullable=True)
+    deal_id: Mapped[int | None] = mapped_column(ForeignKey("deals.id", ondelete="SET NULL"), nullable=True)
+    document_id: Mapped[int | None] = mapped_column(ForeignKey("documents.id", ondelete="SET NULL"), nullable=True)
+    item_type: Mapped[str] = mapped_column(String(32), nullable=False, default="note")
+    source_kind: Mapped[str] = mapped_column(String(32), nullable=False, default="manual")
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    body_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    visibility: Mapped[str] = mapped_column(String(32), nullable=False, default="internal")
+    file_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    file_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    mime_type: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    content_size_bytes: Mapped[int | None] = mapped_column(nullable=True)
+    content_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    tags_json: Mapped[list[object]] = mapped_column(JSON, nullable=False, default=list)
+    metadata_json: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False, default=dict)
