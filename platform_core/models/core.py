@@ -16,8 +16,12 @@ class Account(Base, TimestampMixin):
     slug: Mapped[str] = mapped_column(String(100), nullable=False, unique=True, index=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    plan_type: Mapped[str] = mapped_column(String(32), nullable=False, default="internal")
     default_currency: Mapped[str] = mapped_column(String(8), nullable=False, default="RUB")
     default_timezone: Mapped[str] = mapped_column(String(64), nullable=False, default="Etc/UTC")
+    settings_json: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False, default=dict)
+    feature_flags_json: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False, default=dict)
+    soft_limits_json: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False, default=dict)
 
     memberships: Mapped[list["AccountUser"]] = relationship(back_populates="account")
     audit_logs: Mapped[list["AuditLog"]] = relationship(back_populates="account")

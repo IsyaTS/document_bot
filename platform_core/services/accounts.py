@@ -42,14 +42,29 @@ class AccountService:
         *,
         name: str | None = None,
         default_timezone: str | None = None,
+        default_currency: str | None = None,
         status: str | None = None,
+        plan_type: str | None = None,
+        settings_json: dict[str, object] | None = None,
+        feature_flags_json: dict[str, object] | None = None,
+        soft_limits_json: dict[str, object] | None = None,
     ) -> Account:
         if name is not None:
             account.name = name
         if default_timezone is not None:
             account.default_timezone = default_timezone
+        if default_currency is not None:
+            account.default_currency = default_currency
         if status is not None:
             account.status = status
+        if plan_type is not None:
+            account.plan_type = plan_type
+        if settings_json is not None:
+            account.settings_json = settings_json
+        if feature_flags_json is not None:
+            account.feature_flags_json = feature_flags_json
+        if soft_limits_json is not None:
+            account.soft_limits_json = soft_limits_json
         self.session.flush()
         return account
 

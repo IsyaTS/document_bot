@@ -1,0 +1,203 @@
+{% extends "admin/base.html" %}
+{% block content %}
+<div class="topbar">
+  <div>
+    <h2>Settings</h2>
+    <p class="subtle">Account identity, defaults, commercial readiness and hand-off visibility.</p>
+  </div>
+  <div class="chips">
+    <span class="chip">{{ runtime.account.slug }}</span>
+    <span class="chip">{{ runtime.account.plan_type }}</span>
+    <span class="chip">{{ readiness.status }}</span>
+  </div>
+</div>
+
+<section class="grid cols-2">
+  <article class="card">
+    <div class="actions" style="justify-content: space-between;">
+      <div>
+        <h3>Account Settings</h3>
+        <p class="subtle">Safe product-facing settings without direct DB work.</p>
+      </div>
+      <span class="badge {{ 'good' if readiness.status == 'ready' else 'warn' if readiness.status == 'attention' else 'bad' }}">{{ readiness.status }}</span>
+    </div>
+    <form method="post" action="/admin/{{ runtime.account.slug }}/settings/save" class="stack" style="margin-top: 14px;">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <section class="card soft-card">
+        <h4>Identity</h4>
+        <div class="form-grid two">
+          <label>
+            Account name
+            <input name="account_name" value="{{ runtime.account.name }}">
+          </label>
+          <label>
+            Account slug
+            <input value="{{ runtime.account.slug }}" disabled>
+            <span class="status-line">Slug is visible product identity and remains stable after onboarding.</span>
+          </label>
+          <label>
+            Timezone
+            <input name="default_timezone" value="{{ runtime.account.default_timezone }}">
+          </label>
+          <label>
+            Currency
+            <input name="default_currency" value="{{ runtime.account.default_currency }}">
+          </label>
+        </div>
+      </section>
+
+      <section class="card soft-card">
+        <h4>Product Readiness</h4>
+        <div class="form-grid two">
+          <label>
+            Account status
+            <select name="account_status">
+              {% for item in account_status_options %}
+              <option value="{{ item }}" {{ 'selected' if runtime.account.status == item else '' }}>{{ item }}</option>
+              {% endfor %}
+            </select>
+          </label>
+          <label>
+            Plan type
+            <select name="plan_type">
+              {% for item in account_plan_options %}
+              <option value="{{ item }}" {{ 'selected' if runtime.account.plan_type == item else '' }}>{{ item }}</option>
+              {% endfor %}
+            </select>
+          </label>
+        </div>
+      </section>
+
+      <section class="card soft-card">
+        <h4>Branding And Defaults</h4>
+        <div class="form-grid two">
+          <label>
+            Branding title
+            <input name="branding_title" value="{{ account_settings.branding_title }}">
+          </label>
+          <label>
+            Branding subtitle
+            <input name="branding_subtitle" value="{{ account_settings.branding_subtitle }}">
+          </label>
+          <label>
+            Default dashboard period
+            <select name="default_dashboard_period">
+              {% for period_code in ["today", "week", "month"] %}
+              <option value="{{ period_code }}" {{ 'selected' if account_settings.default_dashboard_period == period_code else '' }}>{{ period_code }}</option>
+              {% endfor %}
+            </select>
+          </label>
+          <label>
+            Default owner
+            <select name="default_owner_user_id">
+              <option value="">not set</option>
+              {% for membership in active_memberships %}
+              <option value="{{ membership.user.id }}" {{ 'selected' if account_settings.default_owner_user_id == membership.user.id else '' }}>
+                {{ membership.user.full_name or membership.user.email }} · {{ membership.role.code }}
+              </option>
+              {% endfor %}
+            </select>
+          </label>
+          <label>
+            Default operator
+            <select name="default_operator_user_id">
+              <option value="">not set</option>
+              {% for membership in active_memberships %}
+              <option value="{{ membership.user.id }}" {{ 'selected' if account_settings.default_operator_user_id == membership.user.id else '' }}>
+                {{ membership.user.full_name or membership.user.email }} · {{ membership.role.code }}
+              </option>
+              {% endfor %}
+            </select>
+          </label>
+        </div>
+        <div class="chips" style="margin-top: 14px;">
+          <label class="inline-toggle"><input type="checkbox" name="show_owner_brief" {% if account_settings.show_owner_brief %}checked{% endif %}> show owner brief</label>
+          <label class="inline-toggle"><input type="checkbox" name="show_portfolio_on_login" {% if account_settings.show_portfolio_on_login %}checked{% endif %}> prefer portfolio on login</label>
+        </div>
+      </section>
+
+      <section class="card soft-card">
+        <h4>Feature Flags</h4>
+        <div class="stack">
+          {% for item in feature_definitions %}
+          <label class="inline-toggle">
+            <input type="checkbox" name="feature_flags" value="{{ item.key }}" {% if feature_flags[item.key] %}checked{% endif %}>
+            <span>{{ item.label }} · {{ item.description }}</span>
+          </label>
+          {% endfor %}
+        </div>
+      </section>
+
+      <section class="card soft-card">
+        <h4>Soft Limits</h4>
+        <div class="form-grid two">
+          {% for item in soft_limit_rows %}
+          <label>
+            {{ item.label }}
+            <input name="soft_limit_{{ item.key }}" type="number" min="0" value="{{ item.limit if item.limit is not none else '' }}" placeholder="unlimited">
+            <span class="status-line">{{ item.description }}</span>
+          </label>
+          {% endfor %}
+        </div>
+      </section>
+
+      <div class="actions">
+        <button type="submit">Save settings</button>
+        <a class="pill-link" href="/admin/{{ runtime.account.slug }}/dashboard">back to dashboard</a>
+      </div>
+    </form>
+  </article>
+
+  <article class="card">
+    <h3>Hand-off Readiness</h3>
+    <div class="stack">
+      <div class="inline-card">
+        <div class="actions" style="justify-content: space-between;">
+          <strong>Current status</strong>
+          <span class="badge {{ 'good' if readiness.status == 'ready' else 'warn' if readiness.status == 'attention' else 'bad' }}">{{ readiness.status }}</span>
+        </div>
+        <div class="chips">
+          <span class="chip">onboarding {{ readiness.onboarding.completed_steps }}/{{ readiness.onboarding.total_steps }}</span>
+          <span class="chip">critical alerts {{ readiness.critical_alerts_count }}</span>
+          <span class="chip">overdue tasks {{ readiness.overdue_tasks_count }}</span>
+          <span class="chip">goals at risk {{ readiness.goals_at_risk_count }}</span>
+          <span class="chip">failed sync {{ readiness.failed_sync_jobs_count }}</span>
+        </div>
+      </div>
+
+      <div class="inline-card">
+        <strong>What is configured</strong>
+        <div class="status-line">Last successful sync: {{ readiness.onboarding.last_success.finished_at if readiness.onboarding.last_success else "—" }}</div>
+        <div class="status-line">Next onboarding step: {{ readiness.onboarding.next_step }}</div>
+        <div class="status-line">Sync health: {{ readiness.sync_health.status }}</div>
+      </div>
+
+      <div class="inline-card">
+        <strong>Usage vs soft limits</strong>
+        <div class="stack" style="gap: 8px;">
+          {% for item in soft_limit_rows %}
+          <div class="actions" style="justify-content: space-between;">
+            <span>{{ item.label }}</span>
+            <span class="badge {{ 'good' if item.status == 'healthy' else 'warn' if item.status == 'warning' else 'bad' }}">
+              {{ item.current }} / {{ item.limit if item.limit is not none else "∞" }}
+            </span>
+          </div>
+          {% endfor %}
+        </div>
+      </div>
+
+      <div class="inline-card">
+        <strong>Next steps</strong>
+        <div class="stack" style="gap: 8px;">
+          {% for item in readiness.next_steps %}
+          <div class="actions" style="justify-content: space-between;">
+            <span>{{ item.label }}</span>
+            <a class="pill-link" href="{{ item.href }}">open</a>
+          </div>
+          {% endfor %}
+        </div>
+      </div>
+    </div>
+  </article>
+</section>
+{% endblock %}

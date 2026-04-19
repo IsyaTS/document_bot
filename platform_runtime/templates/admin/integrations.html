@@ -11,6 +11,12 @@
   </div>
 </div>
 
+{% if not integrations %}
+<section class="notice" style="margin-bottom: 16px;">
+  No integrations configured yet. Next step: connect the first provider, test connection and run the first sync from this page.
+</section>
+{% endif %}
+
 <section class="grid cols-2 integrations-layout">
   <article class="card">
     <div class="actions" style="justify-content: space-between;">

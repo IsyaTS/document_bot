@@ -11,6 +11,28 @@
   </div>
 </div>
 
+<section class="card" style="margin-bottom: 16px;">
+  <div class="actions" style="justify-content: space-between;">
+    <div>
+      <h3>Account Readiness</h3>
+      <p class="subtle">What is configured, what needs attention, and what the next owner/admin step should be.</p>
+    </div>
+    <span class="badge {{ 'good' if readiness.status == 'ready' else 'warn' if readiness.status == 'attention' else 'bad' }}">{{ readiness.status }}</span>
+  </div>
+  <div class="grid cols-4" style="margin-top: 14px;">
+    <div class="metric"><span class="subtle">Onboarding</span><span class="value">{{ readiness.onboarding.completed_steps }}/{{ readiness.onboarding.total_steps }}</span></div>
+    <div class="metric"><span class="subtle">Critical alerts</span><span class="value">{{ readiness.critical_alerts_count }}</span></div>
+    <div class="metric"><span class="subtle">Overdue tasks</span><span class="value">{{ readiness.overdue_tasks_count }}</span></div>
+    <div class="metric"><span class="subtle">Goals at risk</span><span class="value">{{ readiness.goals_at_risk_count }}</span></div>
+  </div>
+  <div class="actions" style="margin-top: 14px;">
+    {% for item in readiness.next_steps[:4] %}
+    <a class="pill-link" href="{{ item.href }}">{{ item.label }}</a>
+    {% endfor %}
+    <a class="pill-link" href="/admin/{{ runtime.account.slug }}/settings">settings</a>
+  </div>
+</section>
+
 <section class="card hero">
   <h3>Owner Panel</h3>
   <div class="grid cols-4">

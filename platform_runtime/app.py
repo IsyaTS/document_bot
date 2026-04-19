@@ -17,8 +17,9 @@ from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from platform_core.models import Account, AccountUser, Alert, Employee, Goal, GoalTarget, Role, Task, TaskEvent, User
+from platform_core.models import Account, AccountUser, Alert, Employee, Goal, GoalTarget, Role, RuntimeLease, Task, TaskEvent, User
 from platform_core.exceptions import AuthorizationError, PlatformCoreError, TenantContextError
+from platform_core.runtime_status import read_runtime_status
 from platform_core.services import AuditLogService, ExecutiveDashboardService, GOAL_METRIC_DEFINITIONS, GoalService
 from platform_core.services.accounts import AccountService, MembershipService, UserService
 from platform_core.services.user_security import UserSecurityService
@@ -31,6 +32,7 @@ from platform_core.services.runtime import (
     SchedulerService,
 )
 from platform_core.settings import load_platform_settings
+from platform_core.tenancy import TenantContext
 from platform_runtime.deps import get_db_session, get_runtime_context
 from platform_runtime.schemas import (
     CredentialSaveRequest,
@@ -193,6 +195,23 @@ def create_app() -> FastAPI:
                 details=details,
             )
 
+    def _push_flash(request: Request, level: str, message: str) -> None:
+        flashes = request.session.get("admin_flashes")
+        if not isinstance(flashes, list):
+            flashes = []
+        flashes.append({"level": level, "message": message})
+        request.session["admin_flashes"] = flashes[-6:]
+
+    def _pop_flashes(request: Request) -> list[dict[str, str]]:
+        flashes = request.session.pop("admin_flashes", [])
+        if not isinstance(flashes, list):
+            return []
+        return [
+            {"level": str(item.get("level") or "info"), "message": str(item.get("message") or "").strip()}
+            for item in flashes
+            if isinstance(item, dict) and str(item.get("message") or "").strip()
+        ]
+
     def _login_redirect(next_path: str | None = None) -> RedirectResponse:
         suffix = ""
         if next_path:
@@ -202,6 +221,7 @@ def create_app() -> FastAPI:
     def _admin_page_path(page: str) -> str:
         return {
             "portfolio": "portfolio",
+            "platform": "platform",
             "accounts": "accounts",
             "users": "users",
             "dashboard": "dashboard",
@@ -210,6 +230,7 @@ def create_app() -> FastAPI:
             "ops_sync": "ops-sync",
             "goals": "goals",
             "members": "members",
+            "settings": "settings",
         }.get(page, "dashboard")
 
     def _accessible_accounts(session: Session, actor_email: str) -> list[Account]:
@@ -353,6 +374,8 @@ def create_app() -> FastAPI:
             items.append({"key": "integrations", "label": "Integrations", "path": "integrations"})
         if {"integrations.manage", "rules.manage", "tasks.read", "alerts.read"}.issubset(permissions) or "*" in permissions:
             items.append({"key": "ops_sync", "label": "Ops / Sync", "path": "ops-sync"})
+        if _is_manager_role(runtime.role_code):
+            items.append({"key": "settings", "label": "Settings", "path": "settings"})
         return items
 
     def _provider_catalog() -> list[dict[str, object]]:
@@ -420,6 +443,7 @@ def create_app() -> FastAPI:
         page: str,
     ) -> dict[str, object]:
         actor_email = runtime.actor_user.email
+        account_settings = _account_product_config(runtime.account)
         return {
             "runtime": runtime,
             "page": page,
@@ -433,7 +457,11 @@ def create_app() -> FastAPI:
             "can_manage_accounts_global": _actor_can_manage_accounts(session, actor_email),
             "can_manage_users_global": _actor_can_manage_accounts(session, actor_email),
             "can_view_portfolio": _actor_can_view_portfolio(session, actor_email),
+            "can_view_platform": _actor_can_manage_accounts(session, actor_email),
             "csrf_token": _ensure_session_csrf_token(request),
+            "flashes": _pop_flashes(request),
+            "shell_brand_title": account_settings["branding_title"] or "Hermes Admin",
+            "shell_brand_subtitle": account_settings["branding_subtitle"] or "Owner / operator console",
         }
 
     def _status_weight(status_code: str | None) -> int:
@@ -808,6 +836,229 @@ def create_app() -> FastAPI:
             "integration_rows": integration_status_rows,
             "last_success": last_success,
             "status": "complete" if completed == len(steps) else "in_progress" if completed > 0 else "not_started",
+        }
+
+    def _account_status_options() -> list[str]:
+        return ["active", "disabled", "archived"]
+
+    def _account_plan_options() -> list[str]:
+        return ["internal", "pilot", "growth", "enterprise"]
+
+    def _feature_flag_definitions() -> list[dict[str, str]]:
+        return [
+            {"key": "portfolio_console", "label": "Portfolio console", "description": "Owner-level portfolio visibility."},
+            {"key": "owner_briefs", "label": "Owner briefs", "description": "Portfolio briefs and digest blocks."},
+            {"key": "goals_tracking", "label": "Goals tracking", "description": "Plan vs fact and goal workflows."},
+            {"key": "integrations_setup", "label": "Integrations setup", "description": "Admin UI for integration setup and sync."},
+            {"key": "ops_console", "label": "Ops console", "description": "Ops / Sync visibility and actions."},
+        ]
+
+    def _default_feature_flags() -> dict[str, bool]:
+        return {item["key"]: True for item in _feature_flag_definitions()}
+
+    def _soft_limit_definitions() -> list[dict[str, str]]:
+        return [
+            {"key": "active_memberships", "label": "Active members", "description": "Soft limit for active account memberships."},
+            {"key": "active_integrations", "label": "Active integrations", "description": "Soft limit for non-archived integrations."},
+            {"key": "active_goals", "label": "Active goals", "description": "Soft limit for active goals."},
+        ]
+
+    def _default_account_settings() -> dict[str, object]:
+        return {
+            "branding_title": "",
+            "branding_subtitle": "",
+            "default_dashboard_period": "today",
+            "show_owner_brief": True,
+            "show_portfolio_on_login": False,
+            "default_owner_user_id": None,
+            "default_operator_user_id": None,
+        }
+
+    def _account_product_config(account: Account) -> dict[str, object]:
+        settings_payload = dict(_default_account_settings())
+        raw = account.settings_json if isinstance(account.settings_json, dict) else {}
+        for key, value in raw.items():
+            settings_payload[key] = value
+        return settings_payload
+
+    def _account_feature_flags(account: Account) -> dict[str, bool]:
+        flags = _default_feature_flags()
+        raw = account.feature_flags_json if isinstance(account.feature_flags_json, dict) else {}
+        for item in _feature_flag_definitions():
+            key = item["key"]
+            if key in raw:
+                flags[key] = bool(raw[key])
+        return flags
+
+    def _account_soft_limits(account: Account) -> dict[str, int | None]:
+        limits: dict[str, int | None] = {item["key"]: None for item in _soft_limit_definitions()}
+        raw = account.soft_limits_json if isinstance(account.soft_limits_json, dict) else {}
+        for item in _soft_limit_definitions():
+            key = item["key"]
+            value = raw.get(key)
+            if value in {None, ""}:
+                limits[key] = None
+                continue
+            limits[key] = max(0, int(value))
+        return limits
+
+    def _account_usage_snapshot(account: Account, session: Session) -> dict[str, int]:
+        memberships = _membership_rows(account, session)
+        integrations = RuntimeIntegrationService(session).list_integrations(
+            TenantContext(account_id=account.id, actor_user_id=None, source="settings", is_system=True)
+        )
+        goals = GoalService(session).list_goals(TenantContext(account_id=account.id, actor_user_id=None, source="settings", is_system=True))
+        return {
+            "active_memberships": sum(1 for item in memberships if item.status == "active"),
+            "active_integrations": sum(1 for item in integrations if item.status != "archived"),
+            "active_goals": sum(1 for item in goals if item.status != "archived"),
+        }
+
+    def _account_usage_rows(account: Account, session: Session) -> list[dict[str, object]]:
+        usage = _account_usage_snapshot(account, session)
+        limits = _account_soft_limits(account)
+        rows: list[dict[str, object]] = []
+        for item in _soft_limit_definitions():
+            key = item["key"]
+            current = int(usage.get(key, 0))
+            limit = limits.get(key)
+            if limit is None:
+                status_code = "healthy"
+                remaining = None
+            else:
+                remaining = limit - current
+                if current > limit:
+                    status_code = "critical"
+                elif remaining <= 1:
+                    status_code = "warning"
+                else:
+                    status_code = "healthy"
+            rows.append(
+                {
+                    "key": key,
+                    "label": item["label"],
+                    "description": item["description"],
+                    "current": current,
+                    "limit": limit,
+                    "remaining": remaining,
+                    "status": status_code,
+                }
+            )
+        return rows
+
+    def _account_product_readiness(runtime: ResolvedRuntimeContext, session: Session) -> dict[str, object]:
+        onboarding = _account_onboarding_status(runtime.account, session)
+        ops = AdminQueryService(session).ops_summary(runtime.account.id)
+        sync_health = _portfolio_sync_health(ops["integration_sync_status"])
+        goal_snapshots = GoalService(session).get_dashboard_goal_snapshot(runtime.context)
+        goals_at_risk = [item for item in goal_snapshots if item["summary"]["status"] != "on_track"]
+        settings_payload = _account_product_config(runtime.account)
+        next_steps: list[dict[str, str]] = []
+        if onboarding["goals_count"] == 0:
+            next_steps.append({"label": "Create the first goal", "href": f"/admin/{runtime.account.slug}/goals"})
+        if len(onboarding["integration_rows"]) == 0:
+            next_steps.append({"label": "Connect the first integration", "href": f"/admin/{runtime.account.slug}/integrations"})
+        if onboarding["last_success"] is None and len(onboarding["integration_rows"]) > 0:
+            next_steps.append({"label": "Run the first sync", "href": f"/admin/{runtime.account.slug}/integrations"})
+        if not settings_payload.get("default_owner_user_id"):
+            next_steps.append({"label": "Set default owner", "href": f"/admin/{runtime.account.slug}/settings"})
+        if not settings_payload.get("default_operator_user_id") and onboarding["active_memberships"]:
+            next_steps.append({"label": "Set default operator", "href": f"/admin/{runtime.account.slug}/settings"})
+        if sync_health["status"] != "healthy":
+            next_steps.append({"label": "Review sync health", "href": f"/admin/{runtime.account.slug}/ops-sync"})
+        if goals_at_risk:
+            next_steps.append({"label": "Review goal deviations", "href": f"/admin/{runtime.account.slug}/goals?risk_only=1"})
+        if ops["active_critical_alerts"]:
+            next_steps.append({"label": "Work through critical alerts", "href": f"/admin/{runtime.account.slug}/alerts-tasks?severity=critical"})
+        if not next_steps:
+            next_steps.append({"label": "Account is product-ready for daily use", "href": f"/admin/{runtime.account.slug}/dashboard"})
+        if onboarding["completed_steps"] < onboarding["total_steps"]:
+            status_code = "setup_required"
+        elif sync_health["status"] == "critical" or goals_at_risk or ops["active_critical_alerts"]:
+            status_code = "attention"
+        else:
+            status_code = "ready"
+        return {
+            "status": status_code,
+            "onboarding": onboarding,
+            "sync_health": sync_health,
+            "critical_alerts_count": len(ops["active_critical_alerts"]),
+            "overdue_tasks_count": len(ops["overdue_tasks"]),
+            "goals_at_risk_count": len(goals_at_risk),
+            "failed_sync_jobs_count": len(ops["recent_failed_sync_jobs"]),
+            "usage_rows": _account_usage_rows(runtime.account, session),
+            "next_steps": next_steps[:6],
+        }
+
+    def _runtime_visibility(session: Session) -> dict[str, object]:
+        db_ok = True
+        db_error = None
+        revision = None
+        try:
+            session.execute(text("select 1"))
+            revision = session.execute(text("select version_num from alembic_version")).scalar_one_or_none()
+        except Exception as exc:
+            db_ok = False
+            db_error = str(exc)
+        worker_status = read_runtime_status("worker_status")
+        backup_status = read_runtime_status("backup_status")
+        smoke_status = read_runtime_status("smoke_status")
+        verify_status = read_runtime_status("verify_status")
+        now = datetime.now(timezone.utc)
+        worker_health = "unknown"
+        worker_age_seconds = None
+        if worker_status is not None:
+            timestamp = worker_status.get("finished_at") or worker_status.get("written_at")
+            if isinstance(timestamp, str):
+                parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                worker_age_seconds = int((now - parsed.astimezone(timezone.utc)).total_seconds())
+            if worker_status.get("status") == "error":
+                worker_health = "critical"
+            elif worker_age_seconds is not None and worker_age_seconds <= settings.worker_poll_interval_seconds * 3:
+                worker_health = "healthy"
+            else:
+                worker_health = "warning"
+        lease_rows = session.execute(select(Account.id, RuntimeLease.lease_key, RuntimeLease.owner, RuntimeLease.heartbeat_at)).all()
+        warnings: list[str] = []
+        if not db_ok:
+            warnings.append("Database connectivity check failed.")
+        if worker_status is None:
+            warnings.append("Worker status has not been recorded yet.")
+        elif worker_health != "healthy":
+            warnings.append("Worker heartbeat looks stale or unhealthy.")
+        if backup_status is None:
+            warnings.append("Backup status has not been recorded yet.")
+        if smoke_status is None:
+            warnings.append("Smoke runtime check has not been recorded yet.")
+        if verify_status is None:
+            warnings.append("DB verification status has not been recorded yet.")
+        return {
+            "app_version": settings.app_version,
+            "environment": settings.environment,
+            "database_url": settings.database_url,
+            "database_backend": settings.database_url.split(":", 1)[0],
+            "database_status": "ok" if db_ok else "error",
+            "database_error": db_error,
+            "current_revision": revision,
+            "worker_status": worker_status,
+            "worker_health": worker_health,
+            "worker_age_seconds": worker_age_seconds,
+            "worker_id": settings.worker_id,
+            "runtime_leases": [
+                {
+                    "account_id": account_id,
+                    "lease_key": lease_key,
+                    "owner": owner,
+                    "heartbeat_at": _serialize_datetime(heartbeat_at),
+                }
+                for account_id, lease_key, owner, heartbeat_at in lease_rows
+            ],
+            "backup_status": backup_status,
+            "smoke_status": smoke_status,
+            "verify_status": verify_status,
+            "warnings": warnings,
         }
 
     def _goal_period_defaults(period_kind: str, runtime: ResolvedRuntimeContext) -> tuple[date, date]:
@@ -1736,13 +1987,48 @@ def create_app() -> FastAPI:
                 "page_path": "portfolio",
                 "actor_email": actor_email,
                 "csrf_token": _ensure_session_csrf_token(request),
+                "flashes": _pop_flashes(request),
                 "can_manage_accounts_global": _actor_can_manage_accounts(session, actor_email),
                 "can_manage_users_global": _actor_can_manage_accounts(session, actor_email),
                 "can_view_portfolio": True,
+                "can_view_platform": _actor_can_manage_accounts(session, actor_email),
+                "shell_brand_title": "Hermes Admin",
+                "shell_brand_subtitle": "Cross-account owner console",
                 "portfolio_rows": portfolio_rows,
                 "portfolio": portfolio,
                 "brief": brief,
                 "human_sync_error": _human_sync_error,
+            },
+        )
+
+    @app.get("/admin/platform", response_class=HTMLResponse)
+    def admin_platform_page(
+        request: Request,
+        session: Session = Depends(get_db_session),
+    ) -> HTMLResponse:
+        user = _current_session_user(session, request)
+        if user is None:
+            request.session.clear()
+            return _login_redirect("/admin/platform")
+        actor_email = user.email
+        if not _actor_can_manage_accounts(session, actor_email):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Owner or admin access is required.")
+        return templates.TemplateResponse(
+            request,
+            "admin/platform.html",
+            {
+                "page": "platform",
+                "page_path": "platform",
+                "actor_email": actor_email,
+                "csrf_token": _ensure_session_csrf_token(request),
+                "flashes": _pop_flashes(request),
+                "can_manage_accounts_global": True,
+                "can_manage_users_global": True,
+                "can_view_portfolio": _actor_can_view_portfolio(session, actor_email),
+                "can_view_platform": True,
+                "shell_brand_title": "Hermes Admin",
+                "shell_brand_subtitle": "Runtime and environment visibility",
+                "runtime_visibility": _runtime_visibility(session),
             },
         )
 
@@ -1794,7 +2080,11 @@ def create_app() -> FastAPI:
                 "can_manage_accounts_global": True,
                 "can_manage_users_global": True,
                 "can_view_portfolio": _actor_can_view_portfolio(session, actor_email),
+                "can_view_platform": True,
                 "csrf_token": _ensure_session_csrf_token(request),
+                "flashes": _pop_flashes(request),
+                "shell_brand_title": "Hermes Admin",
+                "shell_brand_subtitle": "Global onboarding and account setup",
             },
         )
 
@@ -1876,7 +2166,11 @@ def create_app() -> FastAPI:
                 "can_manage_accounts_global": True,
                 "can_manage_users_global": True,
                 "can_view_portfolio": _actor_can_view_portfolio(session, actor_email),
+                "can_view_platform": True,
                 "csrf_token": _ensure_session_csrf_token(request),
+                "flashes": _pop_flashes(request),
+                "shell_brand_title": "Hermes Admin",
+                "shell_brand_subtitle": "Global user lifecycle and access management",
                 "user_rows": user_rows,
                 "selected_user": selected_user,
                 "accounts": accounts,
@@ -2032,6 +2326,7 @@ def create_app() -> FastAPI:
             )
             for item in goals
         ]
+        readiness = _account_product_readiness(runtime, session)
         return templates.TemplateResponse(
             request,
             "admin/dashboard.html",
@@ -2042,6 +2337,7 @@ def create_app() -> FastAPI:
                 "goal_snapshots": goal_snapshots,
                 "critical_alerts": alerts,
                 "overdue_tasks": overdue_tasks,
+                "readiness": readiness,
             },
         )
 
@@ -2126,6 +2422,90 @@ def create_app() -> FastAPI:
                 "onboarding": _account_onboarding_status(runtime.account, session),
             },
         )
+
+    @app.get("/admin/{account_slug}/settings", response_class=HTMLResponse)
+    def admin_account_settings(
+        request: Request,
+        account_slug: str,
+        session: Session = Depends(get_db_session),
+    ) -> HTMLResponse:
+        user = _current_session_user(session, request)
+        if user is None:
+            request.session.clear()
+            return _login_redirect(f"/admin/{account_slug}/settings")
+        actor_email = user.email
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
+        request.session["admin_account_slug"] = runtime.account.slug
+        _require_account_manager(runtime)
+        active_memberships = [item for item in _membership_rows(runtime.account, session) if item.status == "active"]
+        account_settings = _account_product_config(runtime.account)
+        return templates.TemplateResponse(
+            request,
+            "admin/settings.html",
+            {
+                **_admin_context(request, session, runtime, page="settings"),
+                "account_settings": account_settings,
+                "feature_flags": _account_feature_flags(runtime.account),
+                "feature_definitions": _feature_flag_definitions(),
+                "soft_limit_rows": _account_usage_rows(runtime.account, session),
+                "soft_limit_definitions": _soft_limit_definitions(),
+                "readiness": _account_product_readiness(runtime, session),
+                "active_memberships": active_memberships,
+                "account_status_options": _account_status_options(),
+                "account_plan_options": _account_plan_options(),
+            },
+        )
+
+    @app.post("/admin/{account_slug}/settings/save")
+    async def admin_save_account_settings(
+        request: Request,
+        account_slug: str,
+        session: Session = Depends(get_db_session),
+    ) -> RedirectResponse:
+        await _require_csrf(request)
+        actor_email = _require_admin_user(request, session).email
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
+        request.session["admin_account_slug"] = runtime.account.slug
+        _require_account_manager(runtime)
+        payload = parse_qs((await request.body()).decode("utf-8"), keep_blank_values=True)
+
+        def _value(name: str, default: str = "") -> str:
+            return str((payload.get(name) or [default])[0]).strip()
+
+        feature_flags_selected = {str(item).strip() for item in payload.get("feature_flags", []) if str(item).strip()}
+        feature_flags = {
+            item["key"]: item["key"] in feature_flags_selected
+            for item in _feature_flag_definitions()
+        }
+        soft_limits: dict[str, int | None] = {}
+        for item in _soft_limit_definitions():
+            raw = _value(f"soft_limit_{item['key']}")
+            soft_limits[item["key"]] = None if raw == "" else max(0, int(raw))
+        updated_settings = {
+            "branding_title": _value("branding_title"),
+            "branding_subtitle": _value("branding_subtitle"),
+            "default_dashboard_period": _value("default_dashboard_period", "today") or "today",
+            "show_owner_brief": bool(payload.get("show_owner_brief")),
+            "show_portfolio_on_login": bool(payload.get("show_portfolio_on_login")),
+            "default_owner_user_id": int(_value("default_owner_user_id")) if _value("default_owner_user_id") else None,
+            "default_operator_user_id": int(_value("default_operator_user_id")) if _value("default_operator_user_id") else None,
+        }
+        try:
+            AccountService(session).update_account(
+                runtime.account,
+                name=_value("account_name") or runtime.account.name,
+                default_timezone=_value("default_timezone") or runtime.account.default_timezone,
+                default_currency=_value("default_currency") or runtime.account.default_currency,
+                status=_value("account_status") or runtime.account.status,
+                plan_type=_value("plan_type") or runtime.account.plan_type,
+                settings_json=updated_settings,
+                feature_flags_json=feature_flags,
+                soft_limits_json=soft_limits,
+            )
+            _push_flash(request, "success", "Account settings updated.")
+        except (PlatformCoreError, IntegrityError, ValueError) as exc:
+            _push_flash(request, "error", f"Account settings update failed: {exc}")
+        return RedirectResponse(url=f"/admin/{runtime.account.slug}/settings", status_code=status.HTTP_302_FOUND)
 
     @app.get("/admin/{account_slug}/alerts-tasks", response_class=HTMLResponse)
     def admin_alerts_tasks(
@@ -2728,8 +3108,12 @@ def _serialize_account(account: Account) -> dict[str, object]:
         "slug": account.slug,
         "name": account.name,
         "status": account.status,
+        "plan_type": account.plan_type,
         "default_timezone": account.default_timezone,
         "default_currency": account.default_currency,
+        "settings": account.settings_json if isinstance(account.settings_json, dict) else {},
+        "feature_flags": account.feature_flags_json if isinstance(account.feature_flags_json, dict) else {},
+        "soft_limits": account.soft_limits_json if isinstance(account.soft_limits_json, dict) else {},
         "created_at": _serialize_datetime(account.created_at),
         "updated_at": _serialize_datetime(account.updated_at),
     }

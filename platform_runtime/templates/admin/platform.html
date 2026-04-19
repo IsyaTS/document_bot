@@ -1,0 +1,116 @@
+{% extends "admin/base.html" %}
+{% block content %}
+<div class="topbar">
+  <div>
+    <h2>Platform</h2>
+    <p class="subtle">Product-facing runtime visibility: version, environment, DB, worker and latest operational checks.</p>
+  </div>
+  <div class="chips">
+    <span class="chip">version {{ runtime_visibility.app_version }}</span>
+    <span class="chip">{{ runtime_visibility.environment }}</span>
+    <span class="chip">{{ runtime_visibility.database_backend }}</span>
+  </div>
+</div>
+
+<section class="grid cols-4">
+  <article class="card metric"><span class="subtle">DB status</span><span class="value">{{ runtime_visibility.database_status }}</span></article>
+  <article class="card metric"><span class="subtle">Revision</span><span class="value">{{ runtime_visibility.current_revision or "—" }}</span></article>
+  <article class="card metric"><span class="subtle">Worker</span><span class="value">{{ runtime_visibility.worker_health }}</span></article>
+  <article class="card metric"><span class="subtle">Runtime leases</span><span class="value">{{ runtime_visibility.runtime_leases|length }}</span></article>
+</section>
+
+<section class="grid cols-2" style="margin-top: 16px;">
+  <article class="card">
+    <h3>Environment Visibility</h3>
+    <div class="stack">
+      <div class="inline-card">
+        <strong>App version</strong>
+        <div class="status-line">{{ runtime_visibility.app_version }}</div>
+      </div>
+      <div class="inline-card">
+        <strong>Runtime environment</strong>
+        <div class="status-line">{{ runtime_visibility.environment }}</div>
+      </div>
+      <div class="inline-card">
+        <strong>Database</strong>
+        <div class="status-line">{{ runtime_visibility.database_backend }} · {{ runtime_visibility.database_status }}</div>
+        {% if runtime_visibility.database_error %}
+        <div class="status-line">{{ runtime_visibility.database_error }}</div>
+        {% endif %}
+      </div>
+      <div class="inline-card">
+        <strong>Worker</strong>
+        <div class="status-line">{{ runtime_visibility.worker_id }} · {{ runtime_visibility.worker_health }}</div>
+        <div class="status-line">age {{ runtime_visibility.worker_age_seconds if runtime_visibility.worker_age_seconds is not none else "—" }} sec</div>
+      </div>
+    </div>
+  </article>
+
+  <article class="card">
+    <h3>Checks And Backups</h3>
+    <div class="stack">
+      <div class="inline-card">
+        <strong>DB verify</strong>
+        {% if runtime_visibility.verify_status %}
+        <div class="status-line">{{ runtime_visibility.verify_status.status }} · rev {{ runtime_visibility.verify_status.revision }}</div>
+        <div class="status-line">{{ runtime_visibility.verify_status.written_at or "—" }}</div>
+        {% else %}
+        <p class="empty">Verify status not recorded yet.</p>
+        {% endif %}
+      </div>
+      <div class="inline-card">
+        <strong>Smoke runtime</strong>
+        {% if runtime_visibility.smoke_status %}
+        <div class="status-line">{{ runtime_visibility.smoke_status.status }} · account {{ runtime_visibility.smoke_status.account.slug }}</div>
+        <div class="status-line">{{ runtime_visibility.smoke_status.written_at or "—" }}</div>
+        {% else %}
+        <p class="empty">Smoke status not recorded yet.</p>
+        {% endif %}
+      </div>
+      <div class="inline-card">
+        <strong>Last backup</strong>
+        {% if runtime_visibility.backup_status %}
+        <div class="status-line">{{ runtime_visibility.backup_status.backup_path }}</div>
+        <div class="status-line">{{ runtime_visibility.backup_status.written_at or "—" }}</div>
+        {% else %}
+        <p class="empty">Backup status not recorded yet.</p>
+        {% endif %}
+      </div>
+    </div>
+  </article>
+</section>
+
+<section class="grid cols-2" style="margin-top: 16px;">
+  <article class="card">
+    <h3>Operational Warnings</h3>
+    <div class="stack">
+      {% for warning in runtime_visibility.warnings %}
+      <div class="notice bad">{{ warning }}</div>
+      {% else %}
+      <p class="empty">Platform visibility checks look healthy.</p>
+      {% endfor %}
+    </div>
+  </article>
+
+  <article class="card">
+    <h3>Active Runtime Leases</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Account</th><th>Lease key</th><th>Owner</th><th>Heartbeat</th></tr></thead>
+        <tbody>
+          {% for lease in runtime_visibility.runtime_leases %}
+          <tr>
+            <td>{{ lease.account_id }}</td>
+            <td>{{ lease.lease_key }}</td>
+            <td>{{ lease.owner }}</td>
+            <td>{{ lease.heartbeat_at or "—" }}</td>
+          </tr>
+          {% else %}
+          <tr><td colspan="4" class="empty">No active runtime leases right now.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </article>
+</section>
+{% endblock %}

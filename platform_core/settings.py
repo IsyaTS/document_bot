@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -12,6 +13,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 @dataclass(frozen=True)
 class PlatformSettings:
+    app_version: str
     environment: str
     database_url: str
     secret_key: str
@@ -31,6 +33,20 @@ def _default_database_url() -> str:
     return f"sqlite+pysqlite:///{path.as_posix()}"
 
 
+def _default_app_version() -> str:
+    try:
+        value = subprocess.check_output(
+            ["git", "-C", str(BASE_DIR), "rev-parse", "--short", "HEAD"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+        if value:
+            return f"0.1.0+{value}"
+    except Exception:
+        pass
+    return "0.1.0"
+
+
 def load_platform_settings() -> PlatformSettings:
     load_dotenv(BASE_DIR / ".env")
 
@@ -40,6 +56,7 @@ def load_platform_settings() -> PlatformSettings:
         raise RuntimeError("PLATFORM_SECRET_KEY must be set explicitly in production.")
 
     return PlatformSettings(
+        app_version=os.getenv("PLATFORM_APP_VERSION", _default_app_version()).strip() or _default_app_version(),
         environment=environment,
         database_url=os.getenv("PLATFORM_DATABASE_URL", _default_database_url()).strip() or _default_database_url(),
         secret_key=secret_key,

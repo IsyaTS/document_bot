@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="csrf-token" content="{{ csrf_token or '' }}">
-  <title>{{ title or "Hermes Admin" }}</title>
+  <title>{{ shell_brand_title or title or "Hermes Admin" }}</title>
   <link rel="stylesheet" href="{{ url_for('admin-static', path='admin.css') }}">
   <script>
     window.adminCsrfToken = document.querySelector('meta[name="csrf-token"]')?.content || "";
@@ -23,8 +23,8 @@
   <div class="shell">
     <aside class="sidebar">
       <div class="brand">
-        <h1>Hermes Admin</h1>
-        <p>Owner / operator console</p>
+        <h1>{{ shell_brand_title or "Hermes Admin" }}</h1>
+        <p>{{ shell_brand_subtitle or "Owner / operator console" }}</p>
       </div>
       {% if runtime is defined %}
       <div class="stack">
@@ -54,6 +54,9 @@
         {% if can_manage_accounts_global %}
         <a class="{{ 'active' if page == 'accounts' else '' }}" href="/admin/accounts">Accounts</a>
         {% endif %}
+        {% if can_view_platform %}
+        <a class="{{ 'active' if page == 'platform' else '' }}" href="/admin/platform">Platform</a>
+        {% endif %}
         {% if can_manage_users_global %}
         <a class="{{ 'active' if page == 'users' else '' }}" href="/admin/users">Users</a>
         {% endif %}
@@ -69,12 +72,14 @@
         </form>
       </div>
       {% endif %}
-      {% if page in ['portfolio', 'accounts', 'users'] %}
+      {% if page in ['portfolio', 'platform', 'accounts', 'users'] %}
       <div class="stack">
         <p class="meta">{{ actor_email }}</p>
         <p class="meta">
           {% if page == 'portfolio' %}
           Cross-account owner console
+          {% elif page == 'platform' %}
+          Runtime, environment and delivery visibility
           {% elif page == 'accounts' %}
           Global onboarding and account setup
           {% else %}
@@ -87,6 +92,9 @@
         <a class="{{ 'active' if page == 'portfolio' else '' }}" href="/admin/portfolio">Portfolio</a>
         {% endif %}
         <a class="{{ 'active' if page == 'accounts' else '' }}" href="/admin/accounts">Accounts</a>
+        {% if can_view_platform %}
+        <a class="{{ 'active' if page == 'platform' else '' }}" href="/admin/platform">Platform</a>
+        {% endif %}
         {% if can_manage_users_global %}
         <a class="{{ 'active' if page == 'users' else '' }}" href="/admin/users">Users</a>
         {% endif %}
@@ -101,6 +109,13 @@
       {% endif %}
     </aside>
     <main class="content">
+      {% if flashes %}
+      <div class="stack" style="margin-bottom: 16px;">
+        {% for flash in flashes %}
+        <div class="notice flash {{ 'good' if flash.level == 'success' else 'bad' if flash.level == 'error' else '' }}">{{ flash.message }}</div>
+        {% endfor %}
+      </div>
+      {% endif %}
       {% block content %}{% endblock %}
     </main>
   </div>

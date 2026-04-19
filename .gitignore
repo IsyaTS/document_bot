@@ -16,4 +16,5 @@ backups/
 data/*.sqlite3
 data/backups/
 data/postgres/
+data/runtime_status/
 =3.1,

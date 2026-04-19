@@ -24,6 +24,7 @@ from platform_core.models import (
     LeadEvent,
     User,
 )
+from platform_core.runtime_status import write_runtime_status
 from platform_core.services.dashboard import ExecutiveDashboardService
 from platform_core.services.runtime import RuntimeAutomationService, RuntimeIntegrationService
 from platform_core.settings import load_platform_settings
@@ -108,25 +109,28 @@ def main() -> None:
     if same_job.id != job.id or created_second:
         raise SystemExit("Duplicate prevention failed: idempotency key did not reuse the same sync job.")
 
+    payload = {
+        "status": "ok",
+        "database_url": settings.database_url,
+        "account": {"id": account.id, "slug": account.slug, "actor_email": actor.email},
+        "integration": {"id": integration.id, "provider_name": integration.provider_name, "external_ref": integration.external_ref},
+        "dashboard": {
+            "advertising": advertising_summary,
+            "leads_sales": leads_sales_summary,
+        },
+        "rule_codes": rule_codes,
+        "sync_job": {
+            "id": job.id,
+            "created": created,
+            "status": first_run.status,
+            "idempotency_reused": same_job.id == job.id and not created_second,
+        },
+        "counts": {"before": before_counts, "after": after_counts},
+    }
+    write_runtime_status("smoke_status", payload)
     print(
         json.dumps(
-            {
-                "database_url": settings.database_url,
-                "account": {"id": account.id, "slug": account.slug, "actor_email": actor.email},
-                "integration": {"id": integration.id, "provider_name": integration.provider_name, "external_ref": integration.external_ref},
-                "dashboard": {
-                    "advertising": advertising_summary,
-                    "leads_sales": leads_sales_summary,
-                },
-                "rule_codes": rule_codes,
-                "sync_job": {
-                    "id": job.id,
-                    "created": created,
-                    "status": first_run.status,
-                    "idempotency_reused": same_job.id == job.id and not created_second,
-                },
-                "counts": {"before": before_counts, "after": after_counts},
-            },
+            payload,
             ensure_ascii=False,
             indent=2,
         )

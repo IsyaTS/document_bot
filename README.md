@@ -165,6 +165,7 @@ Telegram-бот продолжает жить как legacy adapter, а platform
 - stage 6: executive dashboard query layer
 - stage 6.5: runtime surface + scheduler foundation
 - provider hardening foundation
+- stage 7.8: productization layer
 
 ### What is already working
 
@@ -196,18 +197,18 @@ Telegram-бот продолжает жить как legacy adapter, а platform
 Сейчас это canonical runtime DB для локального запуска. Она должна использоваться по умолчанию через:
 
 ```bash
-PLATFORM_DATABASE_URL=sqlite+pysqlite:////opt/aidar/document_bot/data/platform.sqlite3
+PLATFORM_DATABASE_URL=postgresql+psycopg://hermes:${POSTGRES_PASSWORD}@127.0.0.1:5433/hermes_platform
 ```
 
 Почему так:
 
-- runtime code по умолчанию смотрит именно в `data/platform.sqlite3`
-- latest working Avito/provider-hardened state был промоутнут в этот файл
+- PostgreSQL является canonical runtime target после hardening cutover
+- SQLite snapshots остаются как fallback / historical checkpoints
 - acceptance snapshot больше не должен быть default runtime target
 
 ### Snapshot SQLite files
 
-- `data/platform.sqlite3`: canonical local runtime DB
+- `data/platform.sqlite3`: legacy SQLite snapshot / fallback
 - `data/platform_avito_acceptance_v2.sqlite3`: latest Avito acceptance snapshot before promotion
 - `data/platform_provider_acceptance.sqlite3`: provider-hardening acceptance snapshot
 - `data/platform_stage3_acceptance.sqlite3`
@@ -251,6 +252,32 @@ PLATFORM_DATABASE_URL=sqlite+pysqlite:////opt/aidar/document_bot/data/platform.s
 5. `docker compose up -d api worker`
 6. `bash -lc 'set -a; source .env; set +a; ./.venv/bin/python scripts/verify_runtime_db.py'`
 7. `bash -lc 'set -a; source .env; set +a; ./.venv/bin/python scripts/smoke_runtime.py'`
+
+### Admin App Product Surface
+
+Server-rendered admin app lives in `platform_runtime/app.py` and now includes:
+
+- global pages:
+  - `/admin/portfolio`
+  - `/admin/accounts`
+  - `/admin/users`
+  - `/admin/platform`
+- account-scoped pages:
+  - `/admin/{account_slug}/dashboard`
+  - `/admin/{account_slug}/integrations`
+  - `/admin/{account_slug}/alerts-tasks`
+  - `/admin/{account_slug}/ops-sync`
+  - `/admin/{account_slug}/goals`
+  - `/admin/{account_slug}/members`
+  - `/admin/{account_slug}/settings`
+
+Stage 7.8 adds:
+
+- account settings for name/timezone/currency/branding/defaults
+- account status / plan type / feature flags / soft limits foundation
+- platform runtime visibility for app version, revision, DB, worker, backup, verify and smoke status
+- hand-off-ready readiness blocks and next-step hints
+- runtime status files in `data/runtime_status/`
 
 For stage 6.9 operational hardening:
 
