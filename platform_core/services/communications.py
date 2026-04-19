@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from platform_core.exceptions import PlatformCoreError, TenantContextError
-from platform_core.models import CommunicationReview, Customer, Employee, Lead, Task, TaskEvent
+from platform_core.models import CommunicationImportBatch, CommunicationReview, Customer, Employee, Lead, Task, TaskEvent
 from platform_core.tenancy import TenantContext, require_account_id
 
 
@@ -30,6 +31,14 @@ class CommunicationService:
             select(CommunicationReview)
             .where(CommunicationReview.account_id == account_id)
             .order_by(CommunicationReview.created_at.desc(), CommunicationReview.id.desc())
+        ).scalars().all()
+
+    def list_import_batches(self, context: TenantContext) -> list[CommunicationImportBatch]:
+        account_id = require_account_id(context)
+        return self.session.execute(
+            select(CommunicationImportBatch)
+            .where(CommunicationImportBatch.account_id == account_id)
+            .order_by(CommunicationImportBatch.created_at.desc(), CommunicationImportBatch.id.desc())
         ).scalars().all()
 
     def get_review(self, context: TenantContext, review_id: int) -> CommunicationReview:
@@ -57,6 +66,7 @@ class CommunicationService:
         title: str,
         transcript_text: str,
         response_delay_minutes: int | None,
+        source_kind: str = "manual",
     ) -> CommunicationReview:
         account_id = require_account_id(context)
         cleaned_title = title.strip()
@@ -84,7 +94,7 @@ class CommunicationService:
             direction=(direction or "inbound").strip() or "inbound",
             title=cleaned_title,
             transcript_text=cleaned_transcript,
-            source_kind="manual",
+            source_kind=(source_kind or "manual").strip() or "manual",
             quality_status=analysis.quality_status,
             sentiment=analysis.sentiment,
             response_delay_minutes=response_delay_minutes,
@@ -95,6 +105,69 @@ class CommunicationService:
         self.session.add(review)
         self.session.flush()
         return review
+
+    def import_reviews(
+        self,
+        context: TenantContext,
+        *,
+        created_by_user_id: int | None,
+        source_kind: str,
+        batch_ref: str | None,
+        payload_items: list[dict[str, Any]],
+    ) -> tuple[CommunicationImportBatch, list[CommunicationReview]]:
+        account_id = require_account_id(context)
+        normalized_source = (source_kind or "import").strip() or "import"
+        reviews: list[CommunicationReview] = []
+        critical_count = 0
+        cleaned_batch_ref = (batch_ref or "").strip() or None
+        batch = CommunicationImportBatch(
+            account_id=account_id,
+            created_by_user_id=created_by_user_id,
+            source_kind=normalized_source,
+            batch_ref=cleaned_batch_ref,
+            status="completed",
+            payload_json={"items_count": len(payload_items)},
+        )
+        self.session.add(batch)
+        self.session.flush()
+        for index, raw_item in enumerate(payload_items, start=1):
+            if not isinstance(raw_item, dict):
+                raise PlatformCoreError("Each imported communication item must be an object.")
+            title = str(raw_item.get("title") or "").strip() or f"{normalized_source} import #{index}"
+            transcript_text = str(raw_item.get("transcript_text") or raw_item.get("text") or "").strip()
+            if not transcript_text:
+                raise PlatformCoreError("Imported communication item is missing transcript_text.")
+            review = self.create_review(
+                context,
+                created_by_user_id=created_by_user_id,
+                customer_id=int(raw_item["customer_id"]) if raw_item.get("customer_id") else None,
+                lead_id=int(raw_item["lead_id"]) if raw_item.get("lead_id") else None,
+                employee_id=int(raw_item["employee_id"]) if raw_item.get("employee_id") else None,
+                channel=str(raw_item.get("channel") or "message"),
+                direction=str(raw_item.get("direction") or "inbound"),
+                title=title,
+                transcript_text=transcript_text,
+                response_delay_minutes=int(raw_item["response_delay_minutes"]) if raw_item.get("response_delay_minutes") not in {None, ""} else None,
+                source_kind=normalized_source,
+            )
+            review.summary_json = {
+                **(review.summary_json or {}),
+                "import_batch_id": batch.id,
+                "batch_ref": cleaned_batch_ref,
+                "import_index": index,
+            }
+            if review.quality_status == "critical":
+                critical_count += 1
+            reviews.append(review)
+        batch.imported_count = len(reviews)
+        batch.critical_count = critical_count
+        batch.payload_json = {
+            "items_count": len(payload_items),
+            "critical_count": critical_count,
+            "channels": sorted({review.channel for review in reviews}),
+        }
+        self.session.flush()
+        return batch, reviews
 
     def create_follow_up_task(
         self,

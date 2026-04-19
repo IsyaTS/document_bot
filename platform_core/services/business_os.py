@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
+from pathlib import Path
+import re
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -14,6 +16,7 @@ from platform_core.models import (
     Document,
     InstallationRequest,
     NotificationEvent,
+    NotificationDispatch,
     Product,
     Purchase,
     StockItem,
@@ -198,6 +201,13 @@ class BusinessOSService:
             select(NotificationEvent).where(NotificationEvent.account_id == runtime.account.id).order_by(NotificationEvent.created_at.desc())
         ).scalars().all()
 
+    def list_dispatches(self, runtime: ResolvedRuntimeContext) -> list[NotificationDispatch]:
+        return self.session.execute(
+            select(NotificationDispatch)
+            .where(NotificationDispatch.account_id == runtime.account.id)
+            .order_by(NotificationDispatch.created_at.desc(), NotificationDispatch.id.desc())
+        ).scalars().all()
+
     def generate_notification(self, runtime: ResolvedRuntimeContext, *, channel: str, event_type: str, title: str, body_text: str, created_by_user_id: int | None) -> NotificationEvent:
         event = NotificationEvent(
             account_id=runtime.account.id,
@@ -246,6 +256,80 @@ class BusinessOSService:
         ]
         return events
 
+    def dispatch_notification(
+        self,
+        runtime: ResolvedRuntimeContext,
+        *,
+        notification_event_id: int,
+        dispatched_by_user_id: int | None,
+        channel: str | None = None,
+        target_ref: str | None = None,
+    ) -> NotificationDispatch:
+        event = self.session.execute(
+            select(NotificationEvent).where(
+                NotificationEvent.account_id == runtime.account.id,
+                NotificationEvent.id == notification_event_id,
+            )
+        ).scalar_one()
+        dispatch_channel = (channel or event.channel or "internal").strip() or "internal"
+        generated_at = datetime.now(timezone.utc)
+        delivery_path = self._write_notification_artifact(
+            runtime.account.slug,
+            channel=dispatch_channel,
+            event=event,
+            generated_at=generated_at,
+        )
+        relative_path = delivery_path.relative_to(self._project_root())
+        dispatch = NotificationDispatch(
+            account_id=runtime.account.id,
+            notification_event_id=event.id,
+            dispatched_by_user_id=dispatched_by_user_id,
+            channel=dispatch_channel,
+            target_ref=(target_ref or "").strip() or None,
+            status="delivered",
+            dispatched_at=generated_at,
+            delivery_path=str(relative_path),
+            payload_json={
+                "event_type": event.event_type,
+                "original_channel": event.channel,
+                "target_ref": (target_ref or "").strip() or None,
+            },
+        )
+        self.session.add(dispatch)
+        event.status = "delivered"
+        event.payload_json = {
+            **(event.payload_json or {}),
+            "last_dispatch_path": str(relative_path),
+            "last_dispatch_channel": dispatch_channel,
+            "last_dispatched_at": generated_at.isoformat(),
+        }
+        self.session.flush()
+        return dispatch
+
+    def dispatch_default_digests(
+        self,
+        runtime: ResolvedRuntimeContext,
+        *,
+        created_by_user_id: int | None,
+        channels: list[str] | None = None,
+    ) -> list[NotificationDispatch]:
+        events = self.generate_default_digests(runtime, created_by_user_id=created_by_user_id)
+        normalized_channels = [item.strip() for item in (channels or []) if item and item.strip()]
+        if not normalized_channels:
+            normalized_channels = []
+        dispatches: list[NotificationDispatch] = []
+        for event in events:
+            dispatch_channel = normalized_channels[0] if len(normalized_channels) == 1 else None
+            dispatches.append(
+                self.dispatch_notification(
+                    runtime,
+                    notification_event_id=event.id,
+                    dispatched_by_user_id=created_by_user_id,
+                    channel=dispatch_channel,
+                )
+            )
+        return dispatches
+
     def advisor_items(self, runtime: ResolvedRuntimeContext) -> list[dict[str, object]]:
         automation = RuntimeAutomationService(self.session)
         alerts = [item for item in automation.list_alerts(runtime.context) if item.status == "open"]
@@ -289,3 +373,35 @@ class BusinessOSService:
                 "action": f"/admin/{runtime.account.slug}/dashboard",
             })
         return items
+
+    def _write_notification_artifact(
+        self,
+        account_slug: str,
+        *,
+        channel: str,
+        event: NotificationEvent,
+        generated_at: datetime,
+    ) -> Path:
+        root = (self._project_root() / "data" / "runtime_notifications" / account_slug / channel).resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        timestamp = generated_at.strftime("%Y%m%dT%H%M%SZ")
+        slug = re.sub(r"[^a-z0-9]+", "-", event.title.lower()).strip("-") or f"event-{event.id}"
+        path = root / f"{timestamp}-{slug}.txt"
+        lines = [
+            f"title: {event.title}",
+            f"channel: {channel}",
+            f"event_type: {event.event_type}",
+            f"generated_at: {generated_at.isoformat()}",
+            "",
+            event.body_text,
+            "",
+            "payload:",
+            str(event.payload_json or {}),
+        ]
+        path.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
+        latest_path = root / "latest.txt"
+        latest_path.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+        return path
+
+    def _project_root(self) -> Path:
+        return Path(__file__).resolve().parent.parent.parent

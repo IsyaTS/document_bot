@@ -511,6 +511,23 @@ class CommunicationReview(Base, AccountScopedMixin, TimestampMixin):
     summary_json: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False, default=dict)
 
 
+class CommunicationImportBatch(Base, AccountScopedMixin, TimestampMixin):
+    __tablename__ = "communication_import_batches"
+    __table_args__ = (
+        Index("ix_communication_import_batches_account_status_created_at", "account_id", "status", "created_at"),
+        Index("ix_communication_import_batches_account_source_created_at", "account_id", "source_kind", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    created_by_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    source_kind: Mapped[str] = mapped_column(String(32), nullable=False, default="import")
+    batch_ref: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="completed")
+    imported_count: Mapped[int] = mapped_column(nullable=False, default=0)
+    critical_count: Mapped[int] = mapped_column(nullable=False, default=0)
+    payload_json: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False, default=dict)
+
+
 class PayrollPeriod(Base, AccountScopedMixin, TimestampMixin):
     __tablename__ = "payroll_periods"
     __table_args__ = (
@@ -582,6 +599,24 @@ class NotificationEvent(Base, AccountScopedMixin, TimestampMixin):
     title: Mapped[str] = mapped_column(String(255), nullable=False)
     body_text: Mapped[str] = mapped_column(Text, nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="generated")
+    payload_json: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False, default=dict)
+
+
+class NotificationDispatch(Base, AccountScopedMixin, TimestampMixin):
+    __tablename__ = "notification_dispatches"
+    __table_args__ = (
+        Index("ix_notification_dispatches_account_channel_created_at", "account_id", "channel", "created_at"),
+        Index("ix_notification_dispatches_account_status_created_at", "account_id", "status", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    notification_event_id: Mapped[int] = mapped_column(ForeignKey("notification_events.id", ondelete="CASCADE"), nullable=False)
+    dispatched_by_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    channel: Mapped[str] = mapped_column(String(32), nullable=False, default="internal")
+    target_ref: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="delivered")
+    dispatched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    delivery_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
     payload_json: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False, default=dict)
 
 

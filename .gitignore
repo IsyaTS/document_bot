@@ -18,6 +18,7 @@ data/backups/
 data/postgres/
 data/runtime_status/
 data/runtime_delivery/
+data/runtime_notifications/
 data/runtime_obsidian_vault/
 data/runtime_knowledge_uploads/
 =3.1,

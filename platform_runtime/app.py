@@ -24,6 +24,7 @@ from platform_core.models import (
     Account,
     AccountUser,
     Alert,
+    CommunicationImportBatch,
     CommunicationReview,
     Customer,
     Deal,
@@ -36,6 +37,7 @@ from platform_core.models import (
     KnowledgeItem,
     Lead,
     NotificationEvent,
+    NotificationDispatch,
     PayrollEntry,
     PayrollPeriod,
     Product,
@@ -1074,8 +1076,10 @@ def create_app() -> FastAPI:
             {"key": "open_installation_requests", "label": "Open installation requests", "description": "Soft limit for open logistics / installation requests."},
             {"key": "open_purchase_requests", "label": "Open purchase requests", "description": "Soft limit for requested purchases awaiting receiving."},
             {"key": "communication_reviews", "label": "Communication reviews", "description": "Soft limit for stored transcript reviews."},
+            {"key": "communication_import_batches", "label": "Communication import batches", "description": "Soft limit for imported transcript batches."},
             {"key": "active_payroll_periods", "label": "Active payroll periods", "description": "Soft limit for non-paid payroll periods."},
             {"key": "notification_events", "label": "Notification events", "description": "Soft limit for generated notification events."},
+            {"key": "notification_dispatches", "label": "Notification dispatches", "description": "Soft limit for delivered notification artifacts."},
         ]
 
     def _default_account_settings() -> dict[str, object]:
@@ -1220,6 +1224,9 @@ def create_app() -> FastAPI:
         communication_reviews = session.execute(
             select(func.count()).select_from(CommunicationReview).where(CommunicationReview.account_id == account.id)
         ).scalar_one()
+        communication_import_batches = session.execute(
+            select(func.count()).select_from(CommunicationImportBatch).where(CommunicationImportBatch.account_id == account.id)
+        ).scalar_one()
         active_payroll_periods = session.execute(
             select(func.count()).select_from(PayrollPeriod).where(
                 PayrollPeriod.account_id == account.id,
@@ -1228,6 +1235,9 @@ def create_app() -> FastAPI:
         ).scalar_one()
         notification_events = session.execute(
             select(func.count()).select_from(NotificationEvent).where(NotificationEvent.account_id == account.id)
+        ).scalar_one()
+        notification_dispatches = session.execute(
+            select(func.count()).select_from(NotificationDispatch).where(NotificationDispatch.account_id == account.id)
         ).scalar_one()
         return {
             "active_memberships": sum(1 for item in memberships if item.status == "active"),
@@ -1239,8 +1249,10 @@ def create_app() -> FastAPI:
             "open_installation_requests": int(open_installations or 0),
             "open_purchase_requests": int(open_purchase_requests or 0),
             "communication_reviews": int(communication_reviews or 0),
+            "communication_import_batches": int(communication_import_batches or 0),
             "active_payroll_periods": int(active_payroll_periods or 0),
             "notification_events": int(notification_events or 0),
+            "notification_dispatches": int(notification_dispatches or 0),
         }
 
     def _account_usage_rows(account: Account, session: Session) -> list[dict[str, object]]:
@@ -1302,6 +1314,11 @@ def create_app() -> FastAPI:
         ).scalar_one()
         if review_count == 0:
             next_steps.append({"label": "Review the first message or call transcript", "href": f"/admin/{runtime.account.slug}/communications"})
+        import_batch_count = session.execute(
+            select(func.count()).select_from(CommunicationImportBatch).where(CommunicationImportBatch.account_id == runtime.account.id)
+        ).scalar_one()
+        if review_count > 0 and import_batch_count == 0:
+            next_steps.append({"label": "Import the first communication batch", "href": f"/admin/{runtime.account.slug}/communications"})
         payroll_period_count = session.execute(
             select(func.count()).select_from(PayrollPeriod).where(PayrollPeriod.account_id == runtime.account.id)
         ).scalar_one()
@@ -1320,6 +1337,11 @@ def create_app() -> FastAPI:
             next_steps.append({"label": "Connect the first integration", "href": f"/admin/{runtime.account.slug}/integrations"})
         if onboarding["last_success"] is None and len(onboarding["integration_rows"]) > 0:
             next_steps.append({"label": "Run the first sync", "href": f"/admin/{runtime.account.slug}/integrations"})
+        notification_dispatch_count = session.execute(
+            select(func.count()).select_from(NotificationDispatch).where(NotificationDispatch.account_id == runtime.account.id)
+        ).scalar_one()
+        if notification_dispatch_count == 0:
+            next_steps.append({"label": "Dispatch the first digest", "href": f"/admin/{runtime.account.slug}/notifications"})
         if not settings_payload.get("default_owner_user_id"):
             next_steps.append({"label": "Set default owner", "href": f"/admin/{runtime.account.slug}/settings"})
         if not settings_payload.get("default_operator_user_id") and onboarding["active_memberships"]:
@@ -1733,6 +1755,9 @@ def create_app() -> FastAPI:
 
     def _communication_direction_options() -> list[str]:
         return ["inbound", "outbound"]
+
+    def _notification_channel_options() -> list[str]:
+        return ["internal", "telegram", "email", "webhook"]
 
     def _payroll_period_kind_options() -> list[str]:
         return ["month", "week", "custom"]
@@ -4630,6 +4655,7 @@ def create_app() -> FastAPI:
         _ensure_account_feature(runtime, "business_os", "Notifications")
         service = BusinessOSService(session)
         notifications = service.list_notifications(runtime)
+        dispatches = service.list_dispatches(runtime)
         purchases = OperationsService(session).list_purchases(runtime.context)
         documents = OperationsService(session).list_documents(runtime.context)
         installations = OperationsService(session).list_installation_requests(runtime.context)
@@ -4642,10 +4668,12 @@ def create_app() -> FastAPI:
             {
                 **_admin_context(request, session, runtime, page="notifications"),
                 "notifications": notifications,
+                "dispatches": dispatches,
                 "purchases": purchases,
                 "documents": documents,
                 "installations": installations,
                 "document_previews": document_previews,
+                "notification_channel_options": _notification_channel_options(),
                 "can_manage_business_os": _is_manager_role(runtime.role_code) or "*" in runtime.permissions or "business.write" in runtime.permissions,
             },
         )
@@ -4670,6 +4698,102 @@ def create_app() -> FastAPI:
             details={"count": len(events)},
         )
         return JSONResponse({"events": [_serialize_notification_event(item) for item in events]})
+
+    @app.post("/admin/{account_slug}/notifications/generate-and-dispatch")
+    async def admin_generate_and_dispatch_notifications(
+        request: Request,
+        account_slug: str,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        payload = await request.json()
+        actor = _require_admin_user(request, session)
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor.email)
+        ensure_permission(runtime, "dashboard.read")
+        _ensure_account_feature(runtime, "business_os", "Notifications")
+        channels = payload.get("channels") or []
+        if channels and not isinstance(channels, list):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="channels must be a list.")
+        dispatches = BusinessOSService(session).dispatch_default_digests(
+            runtime,
+            created_by_user_id=runtime.actor_user.id,
+            channels=[str(item).strip() for item in channels if str(item).strip()],
+        )
+        AuditLogService(session).log(
+            runtime.context,
+            "business_os.notifications.generated_and_dispatched",
+            "notification_dispatch",
+            str(dispatches[0].id if dispatches else 0),
+            details={"count": len(dispatches)},
+        )
+        return JSONResponse({"dispatches": [_serialize_notification_dispatch(item) for item in dispatches]})
+
+    @app.post("/admin/{account_slug}/notifications/{event_id}/dispatch")
+    async def admin_dispatch_notification(
+        request: Request,
+        account_slug: str,
+        event_id: int,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        payload = await request.json()
+        actor = _require_admin_user(request, session)
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor.email)
+        ensure_permission(runtime, "dashboard.read")
+        _ensure_account_feature(runtime, "business_os", "Notifications")
+        dispatch = BusinessOSService(session).dispatch_notification(
+            runtime,
+            notification_event_id=event_id,
+            dispatched_by_user_id=runtime.actor_user.id,
+            channel=str(payload.get("channel") or "").strip() or None,
+            target_ref=str(payload.get("target_ref") or "").strip() or None,
+        )
+        AuditLogService(session).log(
+            runtime.context,
+            "business_os.notification.dispatched",
+            "notification_dispatch",
+            str(dispatch.id),
+            details={"event_id": event_id, "channel": dispatch.channel},
+        )
+        return JSONResponse({"dispatch": _serialize_notification_dispatch(dispatch)})
+
+    @app.post("/internal/accounts/{account_slug}/notifications/dispatch-default")
+    async def internal_dispatch_default_notifications(
+        request: Request,
+        account_slug: str,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        _require_internal_api_token(request)
+        payload = await request.json()
+        channels = payload.get("channels") or []
+        if channels and not isinstance(channels, list):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="channels must be a list.")
+        account = session.execute(select(Account).where(Account.slug == account_slug)).scalar_one_or_none()
+        if account is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Account not found.")
+        membership = next(
+            (
+                item for item in _membership_rows(account, session)
+                if item.status == "active" and item.user is not None and item.role is not None and item.role.code in {"owner", "admin"}
+            ),
+            None,
+        )
+        if membership is None or membership.user is None:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Account has no active owner/admin for dispatch context.")
+        runtime = RuntimeContextService(session).resolve(
+            account_id=account.id,
+            account_slug=account.slug,
+            actor_user_id=None,
+            actor_email=membership.user.email,
+            source="internal-notifications-dispatch",
+            request_id=request.headers.get("x-request-id"),
+        )
+        dispatches = BusinessOSService(session).dispatch_default_digests(
+            runtime,
+            created_by_user_id=None,
+            channels=[str(item).strip() for item in channels if str(item).strip()],
+        )
+        return JSONResponse({"dispatches_count": len(dispatches)})
 
     @app.post("/admin/{account_slug}/operations/purchases/{purchase_id}/status")
     async def admin_update_purchase_status(
@@ -5097,6 +5221,7 @@ def create_app() -> FastAPI:
         _ensure_account_feature(runtime, "communication_intelligence", "Communications")
         service = CommunicationService(session)
         reviews = service.list_reviews(runtime.context)
+        import_batches = service.list_import_batches(runtime.context)
         selected_review = None
         if review_id is not None:
             try:
@@ -5137,6 +5262,7 @@ def create_app() -> FastAPI:
             {
                 **_admin_context(request, session, runtime, page="communications"),
                 "reviews": reviews,
+                "import_batches": import_batches,
                 "selected_review": selected_review,
                 "recent_customers": recent_customers,
                 "recent_leads": recent_leads,
@@ -5185,6 +5311,104 @@ def create_app() -> FastAPI:
         except (PlatformCoreError, TenantContextError, ValueError, IntegrityError) as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
         return JSONResponse({"review": _serialize_communication_review(review)})
+
+    @app.post("/admin/{account_slug}/communications/import")
+    async def admin_import_communications(
+        request: Request,
+        account_slug: str,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        payload = await request.json()
+        actor = _require_admin_user(request, session)
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor.email)
+        ensure_permission(runtime, "business.write")
+        _ensure_account_feature(runtime, "communication_intelligence", "Communications")
+        body = _parse_admin_payload(payload, "batch")
+        items = body.get("items") or []
+        if not isinstance(items, list) or not items:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Import batch items are required.")
+        auto_create_tasks = bool(body.get("auto_create_tasks"))
+        defaults = _default_account_users(runtime, session)
+        default_operator = defaults["operator"]
+        try:
+            batch, reviews = CommunicationService(session).import_reviews(
+                runtime.context,
+                created_by_user_id=runtime.actor_user.id,
+                source_kind=str(body.get("source_kind") or "import").strip() or "import",
+                batch_ref=str(body.get("batch_ref") or "").strip() or None,
+                payload_items=items,
+            )
+            created_tasks: list[Task] = []
+            if auto_create_tasks:
+                for review in reviews:
+                    if review.quality_status != "critical":
+                        continue
+                    created_tasks.append(
+                        CommunicationService(session).create_follow_up_task(
+                            runtime.context,
+                            review_id=review.id,
+                            created_by_user_id=runtime.actor_user.id,
+                            assignee_user_id=default_operator.id if default_operator is not None else None,
+                            assignee_employee_id=review.employee_id,
+                            due_at=None,
+                        )
+                    )
+            AuditLogService(session).log(
+                runtime.context,
+                "communications.batch.imported",
+                "communication_import_batch",
+                str(batch.id),
+                details={"imported_count": batch.imported_count, "critical_count": batch.critical_count, "auto_tasks": len(created_tasks)},
+            )
+        except (PlatformCoreError, TenantContextError, ValueError, IntegrityError) as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        return JSONResponse(
+            {
+                "batch": _serialize_communication_import_batch(batch),
+                "reviews": [_serialize_communication_review(item) for item in reviews],
+                "tasks": [_serialize_task(item) for item in created_tasks],
+            }
+        )
+
+    @app.post("/internal/accounts/{account_slug}/communications/import")
+    async def internal_import_communications(
+        request: Request,
+        account_slug: str,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        _require_internal_api_token(request)
+        payload = await request.json()
+        body = _parse_admin_payload(payload, "batch")
+        items = body.get("items") or []
+        if not isinstance(items, list) or not items:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Import batch items are required.")
+        account = session.execute(select(Account).where(Account.slug == account_slug)).scalar_one_or_none()
+        if account is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Account not found.")
+        context = TenantContext(account_id=account.id, actor_user_id=None, source="internal-communications-import", is_system=True)
+        batch, reviews = CommunicationService(session).import_reviews(
+            context,
+            created_by_user_id=None,
+            source_kind=str(body.get("source_kind") or "import").strip() or "import",
+            batch_ref=str(body.get("batch_ref") or "").strip() or None,
+            payload_items=items,
+        )
+        created_tasks = 0
+        if bool(body.get("auto_create_tasks")):
+            for review in reviews:
+                if review.quality_status != "critical":
+                    continue
+                CommunicationService(session).create_follow_up_task(
+                    context,
+                    review_id=review.id,
+                    created_by_user_id=None,
+                    assignee_user_id=None,
+                    assignee_employee_id=review.employee_id,
+                    due_at=None,
+                )
+                created_tasks += 1
+        return JSONResponse({"batch": _serialize_communication_import_batch(batch), "reviews_count": len(reviews), "tasks_count": created_tasks})
 
     @app.post("/admin/{account_slug}/communications/reviews/{review_id}/task")
     async def admin_create_communication_task(
@@ -6131,6 +6355,23 @@ def _serialize_notification_event(event: NotificationEvent) -> dict[str, object]
     }
 
 
+def _serialize_notification_dispatch(dispatch: NotificationDispatch) -> dict[str, object]:
+    return {
+        "id": dispatch.id,
+        "account_id": dispatch.account_id,
+        "notification_event_id": dispatch.notification_event_id,
+        "dispatched_by_user_id": dispatch.dispatched_by_user_id,
+        "channel": dispatch.channel,
+        "target_ref": dispatch.target_ref,
+        "status": dispatch.status,
+        "dispatched_at": _serialize_datetime(dispatch.dispatched_at),
+        "delivery_path": dispatch.delivery_path,
+        "payload_json": dispatch.payload_json or {},
+        "created_at": _serialize_datetime(dispatch.created_at),
+        "updated_at": _serialize_datetime(dispatch.updated_at),
+    }
+
+
 def _serialize_onboarding(onboarding: dict[str, object]) -> dict[str, object]:
     last_success = onboarding["last_success"]
     return {
@@ -6290,6 +6531,22 @@ def _serialize_communication_review(review: CommunicationReview) -> dict[str, ob
         "summary_json": review.summary_json or {},
         "created_at": _serialize_datetime(review.created_at),
         "updated_at": _serialize_datetime(review.updated_at),
+    }
+
+
+def _serialize_communication_import_batch(batch: CommunicationImportBatch) -> dict[str, object]:
+    return {
+        "id": batch.id,
+        "account_id": batch.account_id,
+        "created_by_user_id": batch.created_by_user_id,
+        "source_kind": batch.source_kind,
+        "batch_ref": batch.batch_ref,
+        "status": batch.status,
+        "imported_count": batch.imported_count,
+        "critical_count": batch.critical_count,
+        "payload_json": batch.payload_json or {},
+        "created_at": _serialize_datetime(batch.created_at),
+        "updated_at": _serialize_datetime(batch.updated_at),
     }
 
 

@@ -7,6 +7,7 @@
   </div>
   <div class="chips">
     <span class="chip">{{ reviews|length }} reviews</span>
+    <span class="chip">{{ import_batches|length }} imports</span>
     {% if default_users.owner %}<span class="chip">owner {{ default_users.owner.full_name or default_users.owner.email }}</span>{% endif %}
     {% if default_users.operator %}<span class="chip">operator {{ default_users.operator.full_name or default_users.operator.email }}</span>{% endif %}
     <a class="pill-link" href="/admin/{{ runtime.account.slug }}/brief">brief</a>
@@ -87,6 +88,32 @@
         <span class="subtle" id="review-status"></span>
       </div>
     </section>
+
+    <section class="card soft-card" style="margin-top: 14px; padding: 14px;">
+      <div class="actions" style="justify-content: space-between;">
+        <div>
+          <h4>Batch Import</h4>
+          <p class="subtle">Paste a JSON array of transcripts to auto-create reviews and optionally generate follow-up tasks for critical items.</p>
+        </div>
+        <span class="badge">import</span>
+      </div>
+      <div class="form-grid two" style="margin-top: 12px;">
+        <label>Source kind<input id="import-source-kind" value="telegram_export"></label>
+        <label>Batch ref<input id="import-batch-ref" placeholder="tg-2026-04-19-morning"></label>
+      </div>
+      <label style="margin-top: 12px;">
+        Batch JSON
+        <textarea id="import-batch-json" rows="8" placeholder='[{"title":"Client asked for invoice","channel":"message","direction":"inbound","transcript_text":"..."},{"title":"Missed callback","channel":"call","response_delay_minutes":180,"transcript_text":"..."}]'></textarea>
+      </label>
+      <label style="margin-top: 10px; display:flex; align-items:center; gap:8px;">
+        <input id="import-auto-create-tasks" type="checkbox" style="width:auto;">
+        Auto-create follow-up tasks for critical reviews
+      </label>
+      <div class="actions" style="margin-top: 14px;">
+        <button type="button" id="import-reviews">Import batch</button>
+        <span class="subtle" id="import-status"></span>
+      </div>
+    </section>
     {% endif %}
 
     <section class="card soft-card" style="margin-top: 16px; padding: 0;">
@@ -107,6 +134,27 @@
             </tr>
             {% else %}
             <tr><td colspan="5" class="empty">No transcript reviews yet.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="card soft-card" style="margin-top: 16px; padding: 0;">
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Batch</th><th>Source</th><th>Imported</th><th>Critical</th><th>Status</th></tr></thead>
+          <tbody>
+            {% for batch in import_batches %}
+            <tr>
+              <td><strong>{{ batch.batch_ref or ("batch-" ~ batch.id) }}</strong><div class="status-line">{{ batch.created_at }}</div></td>
+              <td>{{ batch.source_kind }}</td>
+              <td>{{ batch.imported_count }}</td>
+              <td>{{ batch.critical_count }}</td>
+              <td>{{ batch.status }}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="5" class="empty">No import batches yet.</td></tr>
             {% endfor %}
           </tbody>
         </table>
@@ -220,6 +268,40 @@
       const body = await response.json();
       statusNode.textContent = `Saved review #${body.review.id}`;
       window.location.href = `/admin/{{ runtime.account.slug }}/communications?review_id=${body.review.id}`;
+    });
+  }
+
+  const importButton = document.getElementById("import-reviews");
+  if (importButton) {
+    importButton.addEventListener("click", async () => {
+      const statusNode = document.getElementById("import-status");
+      statusNode.textContent = "Importing...";
+      let items;
+      try {
+        items = JSON.parse(document.getElementById("import-batch-json").value.trim() || "[]");
+      } catch (error) {
+        statusNode.textContent = "Batch JSON is invalid.";
+        return;
+      }
+      const response = await adminFetch(`/admin/{{ runtime.account.slug }}/communications/import`, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+          batch: {
+            source_kind: document.getElementById("import-source-kind").value.trim() || "import",
+            batch_ref: document.getElementById("import-batch-ref").value.trim() || null,
+            auto_create_tasks: document.getElementById("import-auto-create-tasks").checked,
+            items,
+          }
+        }),
+      });
+      if (!response.ok) {
+        statusNode.textContent = await response.text();
+        return;
+      }
+      const body = await response.json();
+      statusNode.textContent = `Imported ${body.reviews.length} reviews.`;
+      window.location.href = `/admin/{{ runtime.account.slug }}/communications?review_id=${body.reviews[0]?.id || ""}`;
     });
   }
 
