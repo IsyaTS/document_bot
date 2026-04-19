@@ -11,6 +11,7 @@
     {% endif %}
     <a class="pill-link" href="/admin/{{ runtime.account.slug }}/goals?risk_only=1">goal deviations</a>
     <a class="pill-link" href="/admin/{{ runtime.account.slug }}/brief">execution brief</a>
+    <a class="pill-link" href="/admin/{{ runtime.account.slug }}/delivery">delivery pack</a>
   </div>
 </div>
 
@@ -107,7 +108,7 @@
         <p class="subtle">{{ goal.period_kind }} · {{ goal.period_start }} — {{ goal.period_end }} · {{ goal.status }}</p>
       </a>
       {% else %}
-      <p class="empty">{{ 'No goal deviations for the current filter.' if risk_only else 'Goals пока не созданы.' }}</p>
+      <p class="empty">{{ 'No goal deviations for the current filter.' if risk_only else 'Goals пока не созданы. Следующий шаг: создать первый goal, чтобы dashboard, brief и delivery pack показывали plan vs fact.' }}</p>
       {% endfor %}
     </div>
   </article>

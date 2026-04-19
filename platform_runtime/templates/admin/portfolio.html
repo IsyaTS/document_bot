@@ -256,6 +256,7 @@
           <td>{{ row.goals_at_risk_count }}</td>
           <td>
             <div class="actions">
+              <a class="pill-link" href="/admin/switch-account/{{ row.account.slug }}?next=/admin/{{ row.account.slug }}/delivery">delivery</a>
               <a class="pill-link" href="/admin/switch-account/{{ row.account.slug }}?next=/admin/{{ row.account.slug }}/dashboard">dashboard</a>
               <a class="pill-link" href="/admin/switch-account/{{ row.account.slug }}?next=/admin/{{ row.account.slug }}/alerts-tasks?severity=critical">alerts</a>
               <a class="pill-link" href="/admin/switch-account/{{ row.account.slug }}?next=/admin/{{ row.account.slug }}/alerts-tasks?overdue=1">tasks</a>

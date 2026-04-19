@@ -7,8 +7,15 @@
   </div>
   <div class="chips">
     <a class="pill-link" href="/admin/{{ runtime.account.slug }}/brief">execution brief</a>
+    <a class="pill-link" href="/admin/{{ runtime.account.slug }}/delivery">delivery pack</a>
   </div>
 </div>
+
+{% if not ops.recent_failed_sync_jobs and not ops.recent_failed_rule_runs %}
+<section class="notice" style="margin-bottom: 16px;">
+  No recent failed sync or rule runs. If integrations still need first-time setup, go to Integrations and run the first sync from there.
+</section>
+{% endif %}
 
 <form class="card filters" method="get">
   <label>

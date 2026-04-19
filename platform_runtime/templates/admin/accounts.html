@@ -8,6 +8,7 @@
   <div class="chips">
     <span class="chip">{{ account_rows|length }} accessible accounts</span>
     <span class="chip">Owner/admin only</span>
+    <a class="pill-link" href="/admin/platform">platform status</a>
   </div>
 </div>
 
@@ -87,6 +88,7 @@
         <a class="pill-link" href="/admin/switch-account/{{ selected_onboarding.account.slug }}?next=/admin/{{ selected_onboarding.account.slug }}/members">members</a>
         <a class="pill-link" href="/admin/switch-account/{{ selected_onboarding.account.slug }}?next=/admin/{{ selected_onboarding.account.slug }}/goals">goals</a>
         <a class="pill-link" href="/admin/switch-account/{{ selected_onboarding.account.slug }}?next=/admin/{{ selected_onboarding.account.slug }}/integrations">integrations</a>
+        <a class="pill-link" href="/admin/switch-account/{{ selected_onboarding.account.slug }}?next=/admin/{{ selected_onboarding.account.slug }}/delivery">delivery</a>
         <a class="pill-link" href="/admin/switch-account/{{ selected_onboarding.account.slug }}?next=/admin/{{ selected_onboarding.account.slug }}/dashboard">dashboard</a>
       </div>
       <p class="subtle">Next step: {{ selected_onboarding.next_step }}</p>
@@ -130,6 +132,7 @@
               <a class="pill-link" href="/admin/switch-account/{{ row.account.slug }}?next=/admin/{{ row.account.slug }}/members">Members</a>
               <a class="pill-link" href="/admin/switch-account/{{ row.account.slug }}?next=/admin/{{ row.account.slug }}/integrations">Setup</a>
               <a class="pill-link" href="/admin/switch-account/{{ row.account.slug }}?next=/admin/{{ row.account.slug }}/settings">Settings</a>
+              <a class="pill-link" href="/admin/switch-account/{{ row.account.slug }}?next=/admin/{{ row.account.slug }}/delivery">Delivery</a>
               <a class="pill-link" href="/admin/switch-account/{{ row.account.slug }}?next=/admin/{{ row.account.slug }}/dashboard">Open</a>
             </div>
           </td>

@@ -9,7 +9,7 @@ from urllib.parse import parse_qs, urlencode
 from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from starlette.middleware.sessions import SessionMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -225,6 +225,7 @@ def create_app() -> FastAPI:
             "accounts": "accounts",
             "users": "users",
             "brief": "brief",
+            "delivery": "delivery",
             "dashboard": "dashboard",
             "integrations": "integrations",
             "alerts_tasks": "alerts-tasks",
@@ -366,6 +367,7 @@ def create_app() -> FastAPI:
         items: list[dict[str, str]] = []
         if "dashboard.read" in permissions or "*" in permissions:
             items.append({"key": "brief", "label": "Brief", "path": "brief"})
+            items.append({"key": "delivery", "label": "Delivery", "path": "delivery"})
             items.append({"key": "dashboard", "label": "Dashboard", "path": "dashboard"})
             items.append({"key": "goals", "label": "Goals", "path": "goals"})
         if "alerts.read" in permissions or "tasks.read" in permissions or "*" in permissions:
@@ -1101,6 +1103,182 @@ def create_app() -> FastAPI:
             "top_problems": widgets.get("owner_panel", {}).get("top_problems", []),
             "attention_zones": widgets.get("owner_panel", {}).get("attention_zones", []),
         }
+
+    def _account_delivery_pack(runtime: ResolvedRuntimeContext, session: Session) -> dict[str, object]:
+        settings_payload = _account_product_config(runtime.account)
+        readiness = _account_product_readiness(runtime, session)
+        brief = _account_brief_digest(runtime, session)
+        onboarding = readiness["onboarding"]
+        sync_health = readiness["sync_health"]
+        integrations_needing_attention: list[dict[str, object]] = []
+        for row in onboarding["integration_rows"]:
+            state = _portfolio_sync_health([row])
+            if state["status"] == "healthy":
+                continue
+            integrations_needing_attention.append(
+                {
+                    "integration": row["integration"],
+                    "sync_state": state["status"],
+                    "latest_success": row["latest_success"],
+                    "latest_failure": row["latest_failure"],
+                    "last_error": _human_sync_error(row["latest_failure"]),
+                }
+            )
+        configured_now = [
+            {"label": "Account status", "value": runtime.account.status},
+            {"label": "Plan type", "value": runtime.account.plan_type},
+            {"label": "Timezone", "value": runtime.account.default_timezone},
+            {"label": "Currency", "value": runtime.account.default_currency},
+            {"label": "Default owner", "value": (brief["defaults"]["owner"].full_name or brief["defaults"]["owner"].email) if brief["defaults"]["owner"] else "not set"},
+            {"label": "Default operator", "value": (brief["defaults"]["operator"].full_name or brief["defaults"]["operator"].email) if brief["defaults"]["operator"] else "not set"},
+            {"label": "Integrations", "value": str(len(onboarding["integration_rows"]))},
+            {"label": "Goals", "value": str(onboarding["goals_count"])},
+            {"label": "Last successful sync", "value": _serialize_datetime(onboarding["last_success"].finished_at) if onboarding["last_success"] else "not run yet"},
+            {"label": "Sync health", "value": sync_health["status"]},
+        ]
+        setup_gaps = [
+            {"label": item["label"], "href": item["href"]}
+            for item in readiness["next_steps"]
+            if "product-ready" not in item["label"].lower()
+        ]
+        if not setup_gaps:
+            setup_gaps.append({"label": "No blocking setup gaps. Account is ready for daily execution.", "href": f"/admin/{runtime.account.slug}/dashboard"})
+        health_problems: list[dict[str, object]] = []
+        for item in brief["critical_alerts"][:4]:
+            health_problems.append(
+                {
+                    "type": "alert",
+                    "title": item.title,
+                    "detail": f"{item.code} · {item.severity}",
+                    "href": f"/admin/{runtime.account.slug}/alerts-tasks?severity=critical",
+                }
+            )
+        for item in brief["failed_sync_jobs"][:4]:
+            health_problems.append(
+                {
+                    "type": "sync",
+                    "title": f"Sync job #{item.id}",
+                    "detail": _human_sync_error(item) or item.provider_name,
+                    "href": f"/admin/{runtime.account.slug}/ops-sync?sync_state=critical",
+                }
+            )
+        for item in brief["goals_at_risk"][:3]:
+            blocker = item["blockers"][0]["metric"]["label"] if item["blockers"] else "goal deviation"
+            health_problems.append(
+                {
+                    "type": "goal",
+                    "title": item["goal"].title,
+                    "detail": f"{item['summary']['status']} · {blocker}",
+                    "href": f"/admin/{runtime.account.slug}/goals?goal_id={item['goal'].id}",
+                }
+            )
+        owner_actions = [
+            {"title": item["title"], "context": item["context"], "href": item["href"], "status": item["status"], "type": item["type"]}
+            for item in brief["must_do_now"][:6]
+        ]
+        operator_checklist: list[dict[str, object]] = []
+        for item in brief["overdue_tasks"][:4]:
+            operator_checklist.append(
+                {
+                    "title": item.title,
+                    "context": f"Task · due {item.due_at or '—'}",
+                    "href": f"/admin/{runtime.account.slug}/alerts-tasks?overdue=1",
+                }
+            )
+        for item in integrations_needing_attention[:3]:
+            operator_checklist.append(
+                {
+                    "title": item["integration"].external_ref or item["integration"].display_name,
+                    "context": f"Integration · {item['sync_state']}",
+                    "href": f"/admin/{runtime.account.slug}/ops-sync?sync_state={item['sync_state']}",
+                }
+            )
+        if not operator_checklist:
+            operator_checklist.append(
+                {
+                    "title": "No operator blockers detected",
+                    "context": "Current account state looks healthy for routine execution.",
+                    "href": f"/admin/{runtime.account.slug}/dashboard",
+                }
+            )
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "account": runtime.account,
+            "settings": settings_payload,
+            "readiness": readiness,
+            "brief": brief,
+            "configured_now": configured_now,
+            "setup_gaps": setup_gaps,
+            "health_problems": health_problems[:8],
+            "integrations_needing_attention": integrations_needing_attention[:6],
+            "owner_actions": owner_actions,
+            "operator_checklist": operator_checklist[:8],
+            "handoff_summary": {
+                "status": readiness["status"],
+                "onboarding": f"{onboarding['completed_steps']}/{onboarding['total_steps']}",
+                "account_status": runtime.account.status,
+                "plan_type": runtime.account.plan_type,
+                "sync_health": sync_health["status"],
+                "goals_at_risk": readiness["goals_at_risk_count"],
+                "critical_alerts": readiness["critical_alerts_count"],
+                "overdue_tasks": readiness["overdue_tasks_count"],
+                "failed_sync_jobs": readiness["failed_sync_jobs_count"],
+            },
+        }
+
+    def _account_delivery_markdown(pack: dict[str, object]) -> str:
+        account = pack["account"]
+        lines = [
+            f"# {account.name} Delivery Brief",
+            "",
+            f"- Generated: {pack['generated_at']}",
+            f"- Account: {account.slug}",
+            f"- Status: {pack['handoff_summary']['status']}",
+            f"- Plan: {pack['handoff_summary']['plan_type']}",
+            f"- Sync health: {pack['handoff_summary']['sync_health']}",
+            "",
+            "## Configured Now",
+        ]
+        lines.extend(f"- {item['label']}: {item['value']}" for item in pack["configured_now"])
+        lines.append("")
+        lines.append("## What Needs Setup")
+        lines.extend(f"- {item['label']}" for item in pack["setup_gaps"])
+        lines.append("")
+        lines.append("## Health Problems")
+        if pack["health_problems"]:
+            lines.extend(f"- {item['type']}: {item['title']} ({item['detail']})" for item in pack["health_problems"])
+        else:
+            lines.append("- No critical health problems right now.")
+        lines.append("")
+        lines.append("## Owner Actions")
+        lines.extend(f"- {item['title']} ({item['type']} · {item['context']})" for item in pack["owner_actions"])
+        lines.append("")
+        lines.append("## Operator Checklist")
+        lines.extend(f"- {item['title']} ({item['context']})" for item in pack["operator_checklist"])
+        return "\n".join(lines).strip() + "\n"
+
+    def _account_delivery_text(pack: dict[str, object]) -> str:
+        account = pack["account"]
+        lines = [
+            f"{account.name} delivery brief",
+            f"generated: {pack['generated_at']}",
+            f"account: {account.slug}",
+            f"status: {pack['handoff_summary']['status']}",
+            f"sync health: {pack['handoff_summary']['sync_health']}",
+            "",
+            "configured now:",
+        ]
+        lines.extend(f"- {item['label']}: {item['value']}" for item in pack["configured_now"])
+        lines.append("")
+        lines.append("what to do first:")
+        lines.extend(f"- {item['label']}" for item in pack["setup_gaps"])
+        lines.append("")
+        lines.append("owner actions:")
+        lines.extend(f"- {item['title']} ({item['context']})" for item in pack["owner_actions"])
+        lines.append("")
+        lines.append("operator checklist:")
+        lines.extend(f"- {item['title']} ({item['context']})" for item in pack["operator_checklist"])
+        return "\n".join(lines).strip() + "\n"
 
     def _runtime_visibility(session: Session) -> dict[str, object]:
         db_ok = True
@@ -2467,6 +2645,92 @@ def create_app() -> FastAPI:
             ],
             "must_do_now": brief["must_do_now"],
         }
+
+    @app.get("/admin/{account_slug}/delivery", response_class=HTMLResponse)
+    def admin_delivery(
+        request: Request,
+        account_slug: str,
+        session: Session = Depends(get_db_session),
+    ) -> HTMLResponse:
+        user = _current_session_user(session, request)
+        if user is None:
+            request.session.clear()
+            return _login_redirect(f"/admin/{account_slug}/delivery")
+        actor_email = user.email
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
+        request.session["admin_account_slug"] = runtime.account.slug
+        ensure_permission(runtime, "dashboard.read")
+        pack = _account_delivery_pack(runtime, session)
+        return templates.TemplateResponse(
+            request,
+            "admin/delivery.html",
+            {
+                **_admin_context(request, session, runtime, page="delivery"),
+                "delivery_pack": pack,
+                "human_sync_error": _human_sync_error,
+            },
+        )
+
+    @app.get("/admin/{account_slug}/delivery.json")
+    def admin_delivery_json(
+        request: Request,
+        account_slug: str,
+        session: Session = Depends(get_db_session),
+    ) -> dict[str, object]:
+        actor = _require_admin_user(request, session)
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor.email)
+        ensure_permission(runtime, "dashboard.read")
+        pack = _account_delivery_pack(runtime, session)
+        return {
+            "generated_at": pack["generated_at"],
+            "account": _serialize_account(runtime.account),
+            "handoff_summary": pack["handoff_summary"],
+            "configured_now": pack["configured_now"],
+            "setup_gaps": pack["setup_gaps"],
+            "health_problems": pack["health_problems"],
+            "owner_actions": pack["owner_actions"],
+            "operator_checklist": pack["operator_checklist"],
+            "integrations_needing_attention": [
+                {
+                    "integration": {
+                        "id": item["integration"].id,
+                        "external_ref": item["integration"].external_ref,
+                        "display_name": item["integration"].display_name,
+                        "provider_name": item["integration"].provider_name,
+                        "status": item["integration"].status,
+                    },
+                    "sync_state": item["sync_state"],
+                    "last_error": item["last_error"],
+                    "latest_success": _serialize_sync_job(item["latest_success"]) if item["latest_success"] is not None else None,
+                    "latest_failure": _serialize_sync_job(item["latest_failure"]) if item["latest_failure"] is not None else None,
+                }
+                for item in pack["integrations_needing_attention"]
+            ],
+        }
+
+    @app.get("/admin/{account_slug}/delivery.md", response_class=PlainTextResponse)
+    def admin_delivery_markdown(
+        request: Request,
+        account_slug: str,
+        session: Session = Depends(get_db_session),
+    ) -> PlainTextResponse:
+        actor = _require_admin_user(request, session)
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor.email)
+        ensure_permission(runtime, "dashboard.read")
+        pack = _account_delivery_pack(runtime, session)
+        return PlainTextResponse(_account_delivery_markdown(pack), media_type="text/markdown; charset=utf-8")
+
+    @app.get("/admin/{account_slug}/delivery.txt", response_class=PlainTextResponse)
+    def admin_delivery_text(
+        request: Request,
+        account_slug: str,
+        session: Session = Depends(get_db_session),
+    ) -> PlainTextResponse:
+        actor = _require_admin_user(request, session)
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor.email)
+        ensure_permission(runtime, "dashboard.read")
+        pack = _account_delivery_pack(runtime, session)
+        return PlainTextResponse(_account_delivery_text(pack), media_type="text/plain; charset=utf-8")
 
     @app.get("/admin/{account_slug}/dashboard", response_class=HTMLResponse)
     def admin_dashboard(

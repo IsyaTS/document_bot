@@ -11,6 +11,7 @@
     {% if show_owner_brief %}
     <a class="pill-link" href="/admin/{{ runtime.account.slug }}/brief">execution brief</a>
     {% endif %}
+    <a class="pill-link" href="/admin/{{ runtime.account.slug }}/delivery">delivery pack</a>
   </div>
 </div>
 
@@ -32,6 +33,7 @@
     {% for item in readiness.next_steps[:4] %}
     <a class="pill-link" href="{{ item.href }}">{{ item.label }}</a>
     {% endfor %}
+    <a class="pill-link" href="/admin/{{ runtime.account.slug }}/delivery">handoff view</a>
     <a class="pill-link" href="/admin/{{ runtime.account.slug }}/settings">settings</a>
   </div>
 </section>

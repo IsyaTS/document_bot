@@ -31,6 +31,11 @@
         <p class="meta">{{ runtime.account.name }} · {{ runtime.account.slug }}</p>
         <p class="meta">{{ runtime.actor_user.full_name or runtime.actor_user.email }}</p>
         <p class="meta">Role: {{ runtime.role_code }}</p>
+        <div class="chips">
+          <span class="chip">{{ runtime.account.status }}</span>
+          <span class="chip">{{ runtime.account.plan_type }}</span>
+          <span class="chip">{{ runtime.account.default_timezone }}</span>
+        </div>
       </div>
       {% if accessible_accounts %}
       <div class="account-switcher">

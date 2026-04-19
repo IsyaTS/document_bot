@@ -166,6 +166,8 @@ Telegram-бот продолжает жить как legacy adapter, а platform
 - stage 6.5: runtime surface + scheduler foundation
 - provider hardening foundation
 - stage 7.8: productization layer
+- stage 7.9: execution brief and account actions
+- stage 8.0: delivery layer and product polish
 
 ### What is already working
 
@@ -265,6 +267,7 @@ Server-rendered admin app lives in `platform_runtime/app.py` and now includes:
 - account-scoped pages:
   - `/admin/{account_slug}/dashboard`
   - `/admin/{account_slug}/brief`
+  - `/admin/{account_slug}/delivery`
   - `/admin/{account_slug}/integrations`
   - `/admin/{account_slug}/alerts-tasks`
   - `/admin/{account_slug}/ops-sync`
@@ -294,6 +297,26 @@ Stage 7.9 adds:
 - account drilldown links from dashboard, goals, alerts/tasks and ops pages into the execution brief
 - execution-oriented account summary built from existing dashboard, ops, alerts/tasks and goals data, without new runtime framework
 
+Stage 8.0 adds:
+
+- account delivery and hand-off surface:
+  - `GET /admin/{account_slug}/delivery`
+  - `GET /admin/{account_slug}/delivery.json`
+  - `GET /admin/{account_slug}/delivery.md`
+  - `GET /admin/{account_slug}/delivery.txt`
+- delivery pack derived from existing settings, readiness, brief, goals and ops data
+- hand-off visibility for:
+  - what is configured now
+  - what still needs setup
+  - health problems
+  - integrations needing attention
+  - owner actions
+  - operator checklist
+- product polish across the admin app:
+  - cleaner active account context in sidebar
+  - stronger empty-state hints
+  - delivery links across dashboard, goals, integrations, alerts/tasks, ops, accounts and portfolio
+
 For stage 6.9 operational hardening:
 
 - Hermes daily operator checklist is documented
@@ -315,6 +338,7 @@ Main pages:
 - `/admin/users`
 - `/admin/{account_slug}/dashboard`
 - `/admin/{account_slug}/brief`
+- `/admin/{account_slug}/delivery`
 - `/admin/{account_slug}/members`
 - `/admin/{account_slug}/integrations`
 - `/admin/{account_slug}/alerts-tasks`
@@ -424,6 +448,22 @@ Current account execution behavior:
   - what matters now
   - who should react
   - where to go next
+
+Current delivery behavior:
+
+- account delivery page is available at:
+  - `GET /admin/{account_slug}/delivery`
+  - `GET /admin/{account_slug}/delivery.json`
+  - `GET /admin/{account_slug}/delivery.md`
+  - `GET /admin/{account_slug}/delivery.txt`
+- delivery page is intended for owner/admin hand-off and daily clarity
+- delivery pack answers:
+  - what is already configured
+  - what is still missing
+  - what is unhealthy right now
+  - which integrations need attention
+  - what the owner should do next
+  - what the operator should work through next
 
 Current account onboarding and lifecycle behavior:
 

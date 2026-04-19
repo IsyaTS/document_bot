@@ -8,6 +8,7 @@
   <div class="chips">
     <span class="chip">{{ integrations|length }} integrations</span>
     <span class="chip">Account-scoped setup</span>
+    <a class="pill-link" href="/admin/{{ runtime.account.slug }}/delivery">delivery pack</a>
   </div>
 </div>
 
@@ -16,6 +17,19 @@
   No integrations configured yet. Next step: connect the first provider, test connection and run the first sync from this page.
 </section>
 {% endif %}
+
+<section class="card" style="margin-bottom: 16px;">
+  <div class="actions" style="justify-content: space-between;">
+    <div>
+      <h3>Setup Flow</h3>
+      <p class="subtle">Create integration, save credentials, test connection, then run the first sync. Delivery and dashboard views will reflect the result automatically.</p>
+    </div>
+    <div class="actions">
+      <a class="pill-link" href="/admin/{{ runtime.account.slug }}/settings">defaults</a>
+      <a class="pill-link" href="/admin/{{ runtime.account.slug }}/ops-sync">ops health</a>
+    </div>
+  </div>
+</section>
 
 <section class="grid cols-2 integrations-layout">
   <article class="card">

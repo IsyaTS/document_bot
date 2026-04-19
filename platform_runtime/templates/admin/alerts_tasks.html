@@ -7,6 +7,7 @@
   </div>
   <div class="chips">
     <a class="pill-link" href="/admin/{{ runtime.account.slug }}/brief">execution brief</a>
+    <a class="pill-link" href="/admin/{{ runtime.account.slug }}/delivery">delivery pack</a>
     {% if default_users.owner %}
     <span class="chip">owner {{ default_users.owner.full_name or default_users.owner.email }}</span>
     {% endif %}
@@ -15,6 +16,12 @@
     {% endif %}
   </div>
 </div>
+
+{% if not alerts and not tasks %}
+<section class="notice" style="margin-bottom: 16px;">
+  No open alerts or tasks right now. Use the execution brief and dashboard to confirm the account is actually healthy, not just quiet.
+</section>
+{% endif %}
 
 <form class="card filters" method="get">
   <label>
