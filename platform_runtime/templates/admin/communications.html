@@ -1,0 +1,250 @@
+{% extends "admin/base.html" %}
+{% block content %}
+<div class="topbar">
+  <div>
+    <h2>Communications</h2>
+    <p class="subtle">Review message and call transcripts, detect quality risks and turn them into owner/operator follow-up actions.</p>
+  </div>
+  <div class="chips">
+    <span class="chip">{{ reviews|length }} reviews</span>
+    {% if default_users.owner %}<span class="chip">owner {{ default_users.owner.full_name or default_users.owner.email }}</span>{% endif %}
+    {% if default_users.operator %}<span class="chip">operator {{ default_users.operator.full_name or default_users.operator.email }}</span>{% endif %}
+    <a class="pill-link" href="/admin/{{ runtime.account.slug }}/brief">brief</a>
+  </div>
+</div>
+
+{% if not reviews %}
+<section class="notice" style="margin-bottom: 16px;">
+  No communication reviews yet. Next step: paste a real message or call transcript, link it to the right lead/customer, and let the system surface follow-up risk.
+</section>
+{% endif %}
+
+<section class="grid cols-2 integrations-layout">
+  <article class="card">
+    <div class="actions" style="justify-content: space-between;">
+      <div>
+        <h3>Transcript Intake</h3>
+        <p class="subtle">Manual transcript foundation for messages and calls until direct provider ingestion is added.</p>
+      </div>
+      <span class="badge">quality + owner guidance</span>
+    </div>
+
+    {% if can_manage_communications %}
+    <section class="card soft-card" style="margin-top: 14px; padding: 14px;">
+      <div class="form-grid two">
+        <label>Title<input id="review-title" placeholder="Client complained about delivery delay"></label>
+        <label>
+          Channel
+          <select id="review-channel">
+            {% for option in communication_channel_options %}
+            <option value="{{ option }}">{{ option }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>
+          Direction
+          <select id="review-direction">
+            {% for option in communication_direction_options %}
+            <option value="{{ option }}">{{ option }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>Response delay (minutes)<input id="review-response-delay" type="number" min="0" placeholder="120"></label>
+        <label>
+          Customer
+          <select id="review-customer-id">
+            <option value="">—</option>
+            {% for customer in recent_customers %}
+            <option value="{{ customer.id }}">{{ customer.name }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>
+          Lead
+          <select id="review-lead-id">
+            <option value="">—</option>
+            {% for lead in recent_leads %}
+            <option value="{{ lead.id }}">{{ lead.title }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>
+          Employee owner
+          <select id="review-employee-id">
+            <option value="">—</option>
+            {% for employee in active_employees %}
+            <option value="{{ employee.id }}">{{ employee.full_name }}</option>
+            {% endfor %}
+          </select>
+        </label>
+      </div>
+      <label style="margin-top: 12px;">
+        Transcript
+        <textarea id="review-transcript" rows="10" placeholder="Paste the real exchange here. The review will look for delay pressure, unresolved questions, missing next steps and negative tone."></textarea>
+      </label>
+      <div class="actions" style="margin-top: 14px;">
+        <button type="button" id="save-review">Analyze transcript</button>
+        <span class="subtle" id="review-status"></span>
+      </div>
+    </section>
+    {% endif %}
+
+    <section class="card soft-card" style="margin-top: 16px; padding: 0;">
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Review</th><th>Status</th><th>Sentiment</th><th>Follow-up</th><th></th></tr></thead>
+          <tbody>
+            {% for review in reviews %}
+            <tr>
+              <td>
+                <strong>{{ review.title }}</strong>
+                <div class="status-line">{{ review.channel }} · {{ review.direction }}</div>
+              </td>
+              <td><span class="badge {{ 'bad' if review.quality_status == 'critical' else 'warn' if review.quality_status == 'warning' else 'good' }}">{{ review.quality_status }}</span></td>
+              <td>{{ review.sentiment }}</td>
+              <td>{{ review.follow_up_status }}</td>
+              <td><a class="pill-link" href="/admin/{{ runtime.account.slug }}/communications?review_id={{ review.id }}">open</a></td>
+            </tr>
+            {% else %}
+            <tr><td colspan="5" class="empty">No transcript reviews yet.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </article>
+
+  <article class="card">
+    <div class="actions" style="justify-content: space-between;">
+      <div>
+        <h3>Review Result</h3>
+        <p class="subtle">Quality signal, reasons and the next action the owner/operator should take.</p>
+      </div>
+      {% if selected_review %}
+      <span class="badge {{ 'bad' if selected_review.quality_status == 'critical' else 'warn' if selected_review.quality_status == 'warning' else 'good' }}">{{ selected_review.quality_status }}</span>
+      {% endif %}
+    </div>
+
+    {% if selected_review %}
+    {% set summary = selected_review.summary_json or {} %}
+    <section class="grid cols-2" style="margin-top: 14px;">
+      <article class="card metric"><span class="subtle">Sentiment</span><span class="value">{{ selected_review.sentiment }}</span></article>
+      <article class="card metric"><span class="subtle">Response delay</span><span class="value">{{ selected_review.response_delay_minutes if selected_review.response_delay_minutes is not none else "—" }}</span></article>
+      <article class="card metric"><span class="subtle">Next step present</span><span class="value">{{ "yes" if selected_review.next_step_present else "no" }}</span></article>
+      <article class="card metric"><span class="subtle">Follow-up</span><span class="value">{{ selected_review.follow_up_status }}</span></article>
+    </section>
+
+    <section class="card soft-card" style="margin-top: 16px; padding: 14px;">
+      <h4>Owner Guidance</h4>
+      <ul style="margin-top: 10px;">
+        {% for recommendation in summary.get("recommendations", []) %}
+        <li>{{ recommendation }}</li>
+        {% else %}
+        <li>No explicit recommendation generated.</li>
+        {% endfor %}
+      </ul>
+      <div class="chips" style="margin-top: 12px;">
+        {% for marker in summary.get("negative_hits", []) %}
+        <span class="chip">{{ marker }}</span>
+        {% endfor %}
+        {% for marker in summary.get("next_step_hits", []) %}
+        <span class="chip">{{ marker }}</span>
+        {% endfor %}
+      </div>
+    </section>
+
+    <section class="card soft-card" style="margin-top: 16px; padding: 14px;">
+      <h4>Transcript</h4>
+      <pre style="white-space: pre-wrap;">{{ selected_review.transcript_text }}</pre>
+    </section>
+
+    <section class="card soft-card" style="margin-top: 16px; padding: 14px;">
+      <div class="actions" style="justify-content: space-between;">
+        <div>
+          <h4>Create Follow-up Task</h4>
+          <p class="subtle">Turn the review into a tracked action when the conversation quality is not acceptable.</p>
+        </div>
+        {% if linked_task %}
+        <a class="pill-link" href="/admin/{{ runtime.account.slug }}/alerts-tasks">open task #{{ linked_task.id }}</a>
+        {% endif %}
+      </div>
+      <div class="form-grid two" style="margin-top: 12px;">
+        <label>
+          Assign employee
+          <select id="review-task-employee-id">
+            <option value="{{ selected_review.employee_id if selected_review.employee_id else '' }}">{{ 'linked employee' if selected_review.employee_id else '—' }}</option>
+            {% for employee in active_employees %}
+            <option value="{{ employee.id }}">{{ employee.full_name }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>Due at (UTC ISO)<input id="review-task-due-at" placeholder="2026-04-19T18:00:00+00:00"></label>
+      </div>
+      <div class="actions" style="margin-top: 14px;">
+        <button type="button" id="create-review-task">Create follow-up task</button>
+        <span class="subtle" id="review-task-status"></span>
+      </div>
+    </section>
+    {% else %}
+    <p class="empty" style="margin-top: 16px;">Select a review from the left or create the first one.</p>
+    {% endif %}
+  </article>
+</section>
+
+<script>
+  const saveReviewButton = document.getElementById("save-review");
+  if (saveReviewButton) {
+    saveReviewButton.addEventListener("click", async () => {
+      const statusNode = document.getElementById("review-status");
+      statusNode.textContent = "Analyzing...";
+      const response = await adminFetch(`/admin/{{ runtime.account.slug }}/communications/reviews/save`, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+          review: {
+            title: document.getElementById("review-title").value.trim(),
+            channel: document.getElementById("review-channel").value,
+            direction: document.getElementById("review-direction").value,
+            response_delay_minutes: document.getElementById("review-response-delay").value || null,
+            customer_id: document.getElementById("review-customer-id").value || null,
+            lead_id: document.getElementById("review-lead-id").value || null,
+            employee_id: document.getElementById("review-employee-id").value || null,
+            transcript_text: document.getElementById("review-transcript").value.trim(),
+          }
+        }),
+      });
+      if (!response.ok) {
+        statusNode.textContent = await response.text();
+        return;
+      }
+      const body = await response.json();
+      statusNode.textContent = `Saved review #${body.review.id}`;
+      window.location.href = `/admin/{{ runtime.account.slug }}/communications?review_id=${body.review.id}`;
+    });
+  }
+
+  const createReviewTaskButton = document.getElementById("create-review-task");
+  if (createReviewTaskButton) {
+    createReviewTaskButton.addEventListener("click", async () => {
+      const statusNode = document.getElementById("review-task-status");
+      statusNode.textContent = "Creating...";
+      const response = await adminFetch(`/admin/{{ runtime.account.slug }}/communications/reviews/{{ selected_review.id if selected_review else 0 }}/task`, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+          task: {
+            assignee_employee_id: document.getElementById("review-task-employee-id")?.value || null,
+            due_at: document.getElementById("review-task-due-at")?.value.trim() || null,
+          }
+        }),
+      });
+      if (!response.ok) {
+        statusNode.textContent = await response.text();
+        return;
+      }
+      const body = await response.json();
+      statusNode.textContent = `Created task #${body.task.id}`;
+    });
+  }
+</script>
+{% endblock %}

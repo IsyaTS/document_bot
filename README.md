@@ -168,6 +168,7 @@ Telegram-бот продолжает жить как legacy adapter, а platform
 - stage 8.5: knowledge base and document intake foundation
 - stage 8.6: people execution and KPI foundation
 - stage 8.7: procurement, logistics and documents foundation
+- stage 8.8: communication intelligence and owner guidance foundation
 - stage 7.8: productization layer
 - stage 7.9: execution brief and account actions
 - stage 8.0: delivery layer and product polish
@@ -433,6 +434,30 @@ Stage 8.7 adds:
   - `operations_workflows` feature flag
   - `active_documents`, `open_installation_requests`, `open_purchase_requests` soft-limit visibility
   - readiness hint when the account has no product/warehouse setup
+
+Stage 8.8 adds:
+
+- account-scoped communications page:
+  - `GET /admin/{account_slug}/communications`
+  - `POST /admin/{account_slug}/communications/reviews/save`
+  - `POST /admin/{account_slug}/communications/reviews/{review_id}/task`
+- transcript review foundation for:
+  - messages
+  - calls
+  - chats
+  - email transcripts
+- heuristic communication analysis tied to account data:
+  - quality status
+  - sentiment
+  - follow-up required / clear
+  - response-delay risk
+  - lead first-response risk linkage
+  - owner guidance recommendations
+- direct follow-up task creation from communication reviews
+- product-layer integration:
+  - `communication_intelligence` feature flag
+  - `communication_reviews` soft-limit visibility
+  - readiness hint when the account has no communication reviews yet
 
 Stage 8.1 adds:
 

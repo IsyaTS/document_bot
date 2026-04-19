@@ -24,6 +24,7 @@ from platform_core.models import (
     Account,
     AccountUser,
     Alert,
+    CommunicationReview,
     Customer,
     Deal,
     Document,
@@ -32,6 +33,7 @@ from platform_core.models import (
     GoalTarget,
     InstallationRequest,
     KnowledgeItem,
+    Lead,
     Product,
     Purchase,
     Role,
@@ -47,6 +49,7 @@ from platform_core.exceptions import AuthorizationError, PlatformCoreError, Tena
 from platform_core.runtime_status import read_runtime_status, write_runtime_status
 from platform_core.services import (
     AuditLogService,
+    CommunicationService,
     EmployeeSnapshot,
     ExecutiveDashboardService,
     GOAL_METRIC_DEFINITIONS,
@@ -435,6 +438,8 @@ def create_app() -> FastAPI:
                 items.append({"key": "people", "label": "People", "path": "people"})
             if feature_access["operations_workflows"]["allowed"]:
                 items.append({"key": "operations", "label": "Operations", "path": "operations"})
+            if feature_access["communication_intelligence"]["allowed"]:
+                items.append({"key": "communications", "label": "Communications", "path": "communications"})
             if feature_access["goals_tracking"]["allowed"]:
                 items.append({"key": "goals", "label": "Goals", "path": "goals"})
         if "alerts.read" in permissions or "tasks.read" in permissions or "*" in permissions:
@@ -1005,6 +1010,7 @@ def create_app() -> FastAPI:
             {"key": "knowledge_base", "label": "Knowledge base", "description": "Operational memory, files and SOP knowledge."},
             {"key": "people_execution", "label": "People execution", "description": "Employee registry, workload and KPI view."},
             {"key": "operations_workflows", "label": "Operations workflows", "description": "Purchases, receiving, logistics requests and documents."},
+            {"key": "communication_intelligence", "label": "Communication intelligence", "description": "Transcript reviews, quality signals and owner guidance."},
             {"key": "goals_tracking", "label": "Goals tracking", "description": "Plan vs fact and goal workflows."},
             {"key": "integrations_setup", "label": "Integrations setup", "description": "Admin UI for integration setup and sync."},
             {"key": "ops_console", "label": "Ops console", "description": "Ops / Sync visibility and actions."},
@@ -1015,25 +1021,25 @@ def create_app() -> FastAPI:
             "internal": {
                 "label": "Internal",
                 "summary": "Internal operator deployment with full platform surface for live business use.",
-                "recommended_features": {"portfolio_console", "owner_briefs", "knowledge_base", "people_execution", "operations_workflows", "goals_tracking", "integrations_setup", "ops_console"},
+                "recommended_features": {"portfolio_console", "owner_briefs", "knowledge_base", "people_execution", "operations_workflows", "communication_intelligence", "goals_tracking", "integrations_setup", "ops_console"},
                 "usage_note": "Best fit for active internal operations and product validation.",
             },
             "pilot": {
                 "label": "Pilot",
                 "summary": "Small rollout for one operating team with core execution and onboarding flows.",
-                "recommended_features": {"owner_briefs", "knowledge_base", "people_execution", "operations_workflows", "goals_tracking", "integrations_setup", "ops_console"},
+                "recommended_features": {"owner_briefs", "knowledge_base", "people_execution", "operations_workflows", "communication_intelligence", "goals_tracking", "integrations_setup", "ops_console"},
                 "usage_note": "Good for proving value before broad rollout.",
             },
             "growth": {
                 "label": "Growth",
                 "summary": "Multi-account owner workflow with portfolio visibility and delivery flows.",
-                "recommended_features": {"portfolio_console", "owner_briefs", "knowledge_base", "people_execution", "operations_workflows", "goals_tracking", "integrations_setup", "ops_console"},
+                "recommended_features": {"portfolio_console", "owner_briefs", "knowledge_base", "people_execution", "operations_workflows", "communication_intelligence", "goals_tracking", "integrations_setup", "ops_console"},
                 "usage_note": "Designed for wider operational rollout.",
             },
             "enterprise": {
                 "label": "Enterprise",
                 "summary": "Highest readiness profile with all current product surfaces enabled.",
-                "recommended_features": {"portfolio_console", "owner_briefs", "knowledge_base", "people_execution", "operations_workflows", "goals_tracking", "integrations_setup", "ops_console"},
+                "recommended_features": {"portfolio_console", "owner_briefs", "knowledge_base", "people_execution", "operations_workflows", "communication_intelligence", "goals_tracking", "integrations_setup", "ops_console"},
                 "usage_note": "Suitable for fully managed multi-account environments.",
             },
         }
@@ -1051,6 +1057,7 @@ def create_app() -> FastAPI:
             {"key": "active_documents", "label": "Active documents", "description": "Soft limit for active document records."},
             {"key": "open_installation_requests", "label": "Open installation requests", "description": "Soft limit for open logistics / installation requests."},
             {"key": "open_purchase_requests", "label": "Open purchase requests", "description": "Soft limit for requested purchases awaiting receiving."},
+            {"key": "communication_reviews", "label": "Communication reviews", "description": "Soft limit for stored transcript reviews."},
         ]
 
     def _default_account_settings() -> dict[str, object]:
@@ -1192,6 +1199,9 @@ def create_app() -> FastAPI:
                 Purchase.status.in_(["draft", "requested", "ordered"]),
             )
         ).scalar_one()
+        communication_reviews = session.execute(
+            select(func.count()).select_from(CommunicationReview).where(CommunicationReview.account_id == account.id)
+        ).scalar_one()
         return {
             "active_memberships": sum(1 for item in memberships if item.status == "active"),
             "active_integrations": sum(1 for item in integrations if item.status != "archived"),
@@ -1201,6 +1211,7 @@ def create_app() -> FastAPI:
             "active_documents": int(documents_count or 0),
             "open_installation_requests": int(open_installations or 0),
             "open_purchase_requests": int(open_purchase_requests or 0),
+            "communication_reviews": int(communication_reviews or 0),
         }
 
     def _account_usage_rows(account: Account, session: Session) -> list[dict[str, object]]:
@@ -1257,6 +1268,11 @@ def create_app() -> FastAPI:
         ).scalar_one()
         if product_count == 0 or warehouse_count == 0:
             next_steps.append({"label": "Set up the first product and warehouse", "href": f"/admin/{runtime.account.slug}/operations"})
+        review_count = session.execute(
+            select(func.count()).select_from(CommunicationReview).where(CommunicationReview.account_id == runtime.account.id)
+        ).scalar_one()
+        if review_count == 0:
+            next_steps.append({"label": "Review the first message or call transcript", "href": f"/admin/{runtime.account.slug}/communications"})
         if len(onboarding["integration_rows"]) == 0:
             next_steps.append({"label": "Connect the first integration", "href": f"/admin/{runtime.account.slug}/integrations"})
         if onboarding["last_success"] is None and len(onboarding["integration_rows"]) > 0:
@@ -1668,6 +1684,12 @@ def create_app() -> FastAPI:
 
     def _installation_status_options() -> list[str]:
         return ["open", "scheduled", "done", "cancelled"]
+
+    def _communication_channel_options() -> list[str]:
+        return ["message", "call", "chat", "email"]
+
+    def _communication_direction_options() -> list[str]:
+        return ["inbound", "outbound"]
 
     def _account_delivery_markdown(pack: dict[str, object]) -> str:
         account = pack["account"]
@@ -4605,6 +4627,155 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
         return JSONResponse({"installation_request": _serialize_installation_request(installation), "task": _serialize_task(created_task) if created_task else None})
 
+    @app.get("/admin/{account_slug}/communications", response_class=HTMLResponse)
+    def admin_communications(
+        request: Request,
+        account_slug: str,
+        review_id: int | None = Query(default=None),
+        session: Session = Depends(get_db_session),
+    ) -> HTMLResponse:
+        user = _current_session_user(session, request)
+        if user is None:
+            request.session.clear()
+            return _login_redirect(f"/admin/{account_slug}/communications")
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=user.email)
+        request.session["admin_account_slug"] = runtime.account.slug
+        ensure_permission(runtime, "business.read")
+        _ensure_account_feature(runtime, "communication_intelligence", "Communications")
+        service = CommunicationService(session)
+        reviews = service.list_reviews(runtime.context)
+        selected_review = None
+        if review_id is not None:
+            try:
+                selected_review = service.get_review(runtime.context, review_id)
+            except TenantContextError as exc:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        elif reviews:
+            selected_review = reviews[0]
+        recent_customers = session.execute(
+            select(Customer)
+            .where(Customer.account_id == runtime.account.id)
+            .order_by(Customer.updated_at.desc(), Customer.id.desc())
+            .limit(50)
+        ).scalars().all()
+        recent_leads = session.execute(
+            select(Lead)
+            .where(Lead.account_id == runtime.account.id)
+            .order_by(Lead.updated_at.desc(), Lead.id.desc())
+            .limit(50)
+        ).scalars().all()
+        active_employees = session.execute(
+            select(Employee)
+            .where(Employee.account_id == runtime.account.id, Employee.status == "active")
+            .order_by(Employee.full_name.asc(), Employee.id.asc())
+        ).scalars().all()
+        linked_task = None
+        if selected_review is not None:
+            linked_task = session.execute(
+                select(Task).where(
+                    Task.account_id == runtime.account.id,
+                    Task.related_entity_type == "communication_review",
+                    Task.related_entity_id == str(selected_review.id),
+                )
+            ).scalar_one_or_none()
+        return templates.TemplateResponse(
+            request,
+            "admin/communications.html",
+            {
+                **_admin_context(request, session, runtime, page="communications"),
+                "reviews": reviews,
+                "selected_review": selected_review,
+                "recent_customers": recent_customers,
+                "recent_leads": recent_leads,
+                "active_employees": active_employees,
+                "linked_task": linked_task,
+                "communication_channel_options": _communication_channel_options(),
+                "communication_direction_options": _communication_direction_options(),
+                "default_users": _default_account_users(runtime, session),
+                "can_manage_communications": _is_manager_role(runtime.role_code) or "*" in runtime.permissions or "business.write" in runtime.permissions,
+            },
+        )
+
+    @app.post("/admin/{account_slug}/communications/reviews/save")
+    async def admin_save_communication_review(
+        request: Request,
+        account_slug: str,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        payload = await request.json()
+        actor = _require_admin_user(request, session)
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor.email)
+        ensure_permission(runtime, "business.write")
+        _ensure_account_feature(runtime, "communication_intelligence", "Communications")
+        body = payload.get("review") or {}
+        try:
+            review = CommunicationService(session).create_review(
+                runtime.context,
+                created_by_user_id=runtime.actor_user.id,
+                customer_id=int(body["customer_id"]) if body.get("customer_id") else None,
+                lead_id=int(body["lead_id"]) if body.get("lead_id") else None,
+                employee_id=int(body["employee_id"]) if body.get("employee_id") else None,
+                channel=str(body.get("channel") or "message").strip() or "message",
+                direction=str(body.get("direction") or "inbound").strip() or "inbound",
+                title=str(body.get("title") or "").strip(),
+                transcript_text=str(body.get("transcript_text") or "").strip(),
+                response_delay_minutes=int(body["response_delay_minutes"]) if body.get("response_delay_minutes") not in {None, ""} else None,
+            )
+            AuditLogService(session).log(
+                runtime.context,
+                "communications.review.created",
+                "communication_review",
+                str(review.id),
+                details={"quality_status": review.quality_status, "sentiment": review.sentiment},
+            )
+        except (PlatformCoreError, TenantContextError, ValueError, IntegrityError) as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        return JSONResponse({"review": _serialize_communication_review(review)})
+
+    @app.post("/admin/{account_slug}/communications/reviews/{review_id}/task")
+    async def admin_create_communication_task(
+        request: Request,
+        account_slug: str,
+        review_id: int,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        payload = await request.json()
+        actor = _require_admin_user(request, session)
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor.email)
+        ensure_permission(runtime, "tasks.manage")
+        _ensure_account_feature(runtime, "communication_intelligence", "Communications")
+        body = payload.get("task") or {}
+        due_at_raw = str(body.get("due_at") or "").strip()
+        due_at = datetime.fromisoformat(due_at_raw) if due_at_raw else None
+        if due_at is not None and due_at.tzinfo is None:
+            due_at = due_at.replace(tzinfo=timezone.utc)
+        assignee_employee_id = int(body["assignee_employee_id"]) if body.get("assignee_employee_id") else None
+        assignee_user_id = int(body["assignee_user_id"]) if body.get("assignee_user_id") else None
+        try:
+            if assignee_employee_id is not None and assignee_user_id is None:
+                employee = PeopleService(session).get_employee(runtime.context, assignee_employee_id)
+                assignee_user_id = employee.user_id
+            task = CommunicationService(session).create_follow_up_task(
+                runtime.context,
+                review_id=review_id,
+                created_by_user_id=runtime.actor_user.id,
+                assignee_user_id=assignee_user_id,
+                assignee_employee_id=assignee_employee_id,
+                due_at=due_at,
+            )
+            AuditLogService(session).log(
+                runtime.context,
+                "communications.task.created",
+                "task",
+                str(task.id),
+                details={"review_id": review_id, "assignee_employee_id": assignee_employee_id, "assignee_user_id": assignee_user_id},
+            )
+        except (PlatformCoreError, TenantContextError, ValueError) as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        return JSONResponse({"task": _serialize_task(task)})
+
     @app.get("/admin/{account_slug}/alerts-tasks", response_class=HTMLResponse)
     def admin_alerts_tasks(
         request: Request,
@@ -5570,6 +5741,30 @@ def _serialize_installation_request(request_item: InstallationRequest) -> dict[s
         "notes_json": request_item.notes_json or {},
         "created_at": _serialize_datetime(request_item.created_at),
         "updated_at": _serialize_datetime(request_item.updated_at),
+    }
+
+
+def _serialize_communication_review(review: CommunicationReview) -> dict[str, object]:
+    return {
+        "id": review.id,
+        "account_id": review.account_id,
+        "created_by_user_id": review.created_by_user_id,
+        "customer_id": review.customer_id,
+        "lead_id": review.lead_id,
+        "employee_id": review.employee_id,
+        "channel": review.channel,
+        "direction": review.direction,
+        "title": review.title,
+        "transcript_text": review.transcript_text,
+        "source_kind": review.source_kind,
+        "quality_status": review.quality_status,
+        "sentiment": review.sentiment,
+        "response_delay_minutes": review.response_delay_minutes,
+        "next_step_present": review.next_step_present,
+        "follow_up_status": review.follow_up_status,
+        "summary_json": review.summary_json or {},
+        "created_at": _serialize_datetime(review.created_at),
+        "updated_at": _serialize_datetime(review.updated_at),
     }
 
 

@@ -479,6 +479,33 @@ class InstallationRequest(Base, AccountScopedMixin, TimestampMixin):
     notes_json: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False, default=dict)
 
 
+class CommunicationReview(Base, AccountScopedMixin, TimestampMixin):
+    __tablename__ = "communication_reviews"
+    __table_args__ = (
+        Index("ix_communication_reviews_account_status_created_at", "account_id", "quality_status", "created_at"),
+        Index("ix_communication_reviews_account_customer_created_at", "account_id", "customer_id", "created_at"),
+        Index("ix_communication_reviews_account_lead_created_at", "account_id", "lead_id", "created_at"),
+        Index("ix_communication_reviews_account_employee_created_at", "account_id", "employee_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    created_by_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    customer_id: Mapped[int | None] = mapped_column(ForeignKey("customers.id", ondelete="SET NULL"), nullable=True)
+    lead_id: Mapped[int | None] = mapped_column(ForeignKey("leads.id", ondelete="SET NULL"), nullable=True)
+    employee_id: Mapped[int | None] = mapped_column(ForeignKey("employees.id", ondelete="SET NULL"), nullable=True)
+    channel: Mapped[str] = mapped_column(String(32), nullable=False, default="message")
+    direction: Mapped[str] = mapped_column(String(16), nullable=False, default="inbound")
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    transcript_text: Mapped[str] = mapped_column(Text, nullable=False)
+    source_kind: Mapped[str] = mapped_column(String(32), nullable=False, default="manual")
+    quality_status: Mapped[str] = mapped_column(String(32), nullable=False, default="warning")
+    sentiment: Mapped[str] = mapped_column(String(16), nullable=False, default="neutral")
+    response_delay_minutes: Mapped[int | None] = mapped_column(nullable=True)
+    next_step_present: Mapped[bool] = mapped_column(nullable=False, default=False)
+    follow_up_status: Mapped[str] = mapped_column(String(32), nullable=False, default="required")
+    summary_json: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False, default=dict)
+
+
 class KnowledgeItem(Base, AccountScopedMixin, TimestampMixin):
     __tablename__ = "knowledge_items"
     __table_args__ = (
