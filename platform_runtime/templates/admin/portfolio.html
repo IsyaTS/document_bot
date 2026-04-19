@@ -12,6 +12,7 @@
     <a class="pill-link" href="/admin/portfolio/brief.md">markdown</a>
     <a class="pill-link" href="/admin/portfolio/brief.txt">text</a>
     <button type="button" class="ghost" id="generate-portfolio-brief">generate snapshot</button>
+    <button type="button" class="ghost" id="export-portfolio-obsidian">export to obsidian</button>
   </div>
 </div>
 
@@ -368,6 +369,7 @@
   }
 
   const portfolioGenerateButton = document.getElementById("generate-portfolio-brief");
+  const portfolioObsidianButton = document.getElementById("export-portfolio-obsidian");
   if (portfolioGenerateButton) {
     portfolioGenerateButton.addEventListener("click", async () => {
       portfolioGenerateButton.disabled = true;
@@ -379,6 +381,22 @@
       if (!response.ok) {
         portfolioGenerateButton.disabled = false;
         alert(`Portfolio brief snapshot failed: ${await response.text()}`);
+        return;
+      }
+      window.location.reload();
+    });
+  }
+  if (portfolioObsidianButton) {
+    portfolioObsidianButton.addEventListener("click", async () => {
+      portfolioObsidianButton.disabled = true;
+      const response = await adminFetch("/admin/portfolio/brief/generate", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({export_obsidian: true}),
+      });
+      if (!response.ok) {
+        portfolioObsidianButton.disabled = false;
+        alert(`Portfolio Obsidian export failed: ${await response.text()}`);
         return;
       }
       window.location.reload();

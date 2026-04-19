@@ -21,6 +21,8 @@ class PlatformSettings:
     default_timezone: str
     internal_api_token: str
     admin_access_code: str
+    obsidian_vault_path: str
+    obsidian_export_subdir: str
     api_host: str
     api_port: int
     worker_id: str
@@ -64,6 +66,9 @@ def load_platform_settings() -> PlatformSettings:
         default_timezone=os.getenv("PLATFORM_DEFAULT_TIMEZONE", "Etc/UTC").strip() or "Etc/UTC",
         internal_api_token=os.getenv("PLATFORM_INTERNAL_API_TOKEN", secret_key).strip() or secret_key,
         admin_access_code=os.getenv("PLATFORM_ADMIN_ACCESS_CODE", secret_key).strip() or secret_key,
+        obsidian_vault_path=os.getenv("PLATFORM_OBSIDIAN_VAULT_PATH", str((BASE_DIR / "data" / "runtime_obsidian_vault").resolve())).strip()
+        or str((BASE_DIR / "data" / "runtime_obsidian_vault").resolve()),
+        obsidian_export_subdir=os.getenv("PLATFORM_OBSIDIAN_EXPORT_SUBDIR", "Hermes Platform").strip() or "Hermes Platform",
         api_host=os.getenv("PLATFORM_API_HOST", "0.0.0.0").strip() or "0.0.0.0",
         api_port=max(1, int(os.getenv("PLATFORM_API_PORT", "8000"))),
         worker_id=os.getenv("PLATFORM_WORKER_ID", "worker-default").strip() or "worker-default",

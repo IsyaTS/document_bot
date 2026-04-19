@@ -20,6 +20,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--account-slug", help="Generate account delivery snapshot for this account slug.")
     parser.add_argument("--actor-email", required=True, help="Actor email used for account or portfolio visibility.")
     parser.add_argument("--portfolio", action="store_true", help="Generate portfolio brief snapshot.")
+    parser.add_argument("--obsidian", action="store_true", help="Also export the generated markdown into the configured Obsidian vault.")
     return parser.parse_args()
 
 
@@ -36,14 +37,14 @@ def main() -> None:
         response = session.post(
             f"{args.api_base}/internal/reports/accounts/{args.account_slug}/delivery",
             headers=headers,
-            json={"actor_email": args.actor_email},
+            json={"actor_email": args.actor_email, "export_obsidian": args.obsidian},
             timeout=60,
         )
     else:
         response = session.post(
             f"{args.api_base}/internal/reports/portfolio/brief",
             headers=headers,
-            json={"actor_email": args.actor_email},
+            json={"actor_email": args.actor_email, "export_obsidian": args.obsidian},
             timeout=60,
         )
     if not response.ok:

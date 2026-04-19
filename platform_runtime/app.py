@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session
 
 from platform_core.models import Account, AccountUser, Alert, Employee, Goal, GoalTarget, Role, RuntimeLease, Task, TaskEvent, User
 from platform_core.runtime_delivery import write_delivery_bundle
+from platform_core.runtime_obsidian import export_account_delivery_note, export_portfolio_brief_note
 from platform_core.exceptions import AuthorizationError, PlatformCoreError, TenantContextError
 from platform_core.runtime_status import read_runtime_status, write_runtime_status
 from platform_core.services import AuditLogService, ExecutiveDashboardService, GOAL_METRIC_DEFINITIONS, GoalService
@@ -1600,6 +1601,7 @@ def create_app() -> FastAPI:
         smoke_status = read_runtime_status("smoke_status")
         verify_status = read_runtime_status("verify_status")
         delivery_status = read_runtime_status("delivery_status")
+        obsidian_status = read_runtime_status("obsidian_status")
         now = datetime.now(timezone.utc)
         worker_health = "unknown"
         worker_age_seconds = None
@@ -1657,8 +1659,83 @@ def create_app() -> FastAPI:
             "smoke_status": smoke_status,
             "verify_status": verify_status,
             "delivery_status": delivery_status,
+            "obsidian_status": obsidian_status,
             "warnings": warnings,
         }
+
+    def _write_account_obsidian_export(
+        *,
+        actor_email: str,
+        account_slug: str,
+        account_name: str,
+        generated_at: str,
+        markdown_text: str,
+    ) -> dict[str, str]:
+        try:
+            paths = export_account_delivery_note(
+                account_slug=account_slug,
+                account_name=account_name,
+                generated_at=generated_at,
+                markdown_text=markdown_text,
+                settings=settings,
+            )
+        except Exception as exc:
+            write_runtime_status(
+                "obsidian_status",
+                {
+                    "status": "error",
+                    "scope": "account",
+                    "account_slug": account_slug,
+                    "actor_email": actor_email,
+                    "error": str(exc),
+                },
+            )
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Obsidian export failed: {exc}") from exc
+        write_runtime_status(
+            "obsidian_status",
+            {
+                "status": "ok",
+                "scope": "account",
+                "account_slug": account_slug,
+                "actor_email": actor_email,
+                "paths": paths,
+            },
+        )
+        return paths
+
+    def _write_portfolio_obsidian_export(
+        *,
+        actor_email: str,
+        generated_at: str,
+        markdown_text: str,
+    ) -> dict[str, str]:
+        try:
+            paths = export_portfolio_brief_note(
+                generated_at=generated_at,
+                markdown_text=markdown_text,
+                settings=settings,
+            )
+        except Exception as exc:
+            write_runtime_status(
+                "obsidian_status",
+                {
+                    "status": "error",
+                    "scope": "portfolio",
+                    "actor_email": actor_email,
+                    "error": str(exc),
+                },
+            )
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Obsidian export failed: {exc}") from exc
+        write_runtime_status(
+            "obsidian_status",
+            {
+                "status": "ok",
+                "scope": "portfolio",
+                "actor_email": actor_email,
+                "paths": paths,
+            },
+        )
+        return paths
 
     def _goal_period_defaults(period_kind: str, runtime: ResolvedRuntimeContext) -> tuple[date, date]:
         try:
@@ -2848,6 +2925,8 @@ def create_app() -> FastAPI:
         await _require_csrf(request)
         actor = _require_admin_user(request, session)
         actor_email = actor.email
+        payload = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+        export_obsidian = bool(payload.get("export_obsidian"))
         _require_portfolio_owner(session, actor_email)
         owner_rows = _owner_accounts_for_portfolio(session, actor_email)
         portfolio_rows = [_portfolio_account_row(session, actor_email, item["account"]) for item in owner_rows]
@@ -2869,7 +2948,14 @@ def create_app() -> FastAPI:
             "paths": paths,
         }
         write_runtime_status("delivery_status", status_payload)
-        return JSONResponse({"brief": brief, "paths": paths, "status": status_payload})
+        obsidian_paths = None
+        if export_obsidian:
+            obsidian_paths = _write_portfolio_obsidian_export(
+                actor_email=actor_email,
+                generated_at=brief["generated_at"],
+                markdown_text=_portfolio_brief_markdown(brief),
+            )
+        return JSONResponse({"brief": brief, "paths": paths, "status": status_payload, "obsidian": obsidian_paths})
 
     @app.get("/admin/accounts", response_class=HTMLResponse)
     def admin_accounts_page(
@@ -3283,6 +3369,8 @@ def create_app() -> FastAPI:
     ) -> JSONResponse:
         await _require_csrf(request)
         actor = _require_admin_user(request, session)
+        payload = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+        export_obsidian = bool(payload.get("export_obsidian"))
         runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor.email)
         ensure_permission(runtime, "dashboard.read")
         _ensure_account_feature(runtime, "owner_briefs", "Delivery pack")
@@ -3324,7 +3412,16 @@ def create_app() -> FastAPI:
             "handoff_summary": pack["handoff_summary"],
         }
         write_runtime_status("delivery_status", status_payload)
-        return JSONResponse({"paths": paths, "status": status_payload})
+        obsidian_paths = None
+        if export_obsidian:
+            obsidian_paths = _write_account_obsidian_export(
+                actor_email=actor.email,
+                account_slug=runtime.account.slug,
+                account_name=runtime.account.name,
+                generated_at=pack["generated_at"],
+                markdown_text=_account_delivery_markdown(pack),
+            )
+        return JSONResponse({"paths": paths, "status": status_payload, "obsidian": obsidian_paths})
 
     @app.post("/internal/reports/accounts/{account_slug}/delivery")
     async def internal_generate_account_delivery(
@@ -3335,6 +3432,7 @@ def create_app() -> FastAPI:
         _require_internal_api_token(request)
         payload = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
         actor_email = str(payload.get("actor_email") or "").strip().lower()
+        export_obsidian = bool(payload.get("export_obsidian"))
         if not actor_email:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="actor_email is required.")
         runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
@@ -3366,7 +3464,16 @@ def create_app() -> FastAPI:
             "handoff_summary": pack["handoff_summary"],
         }
         write_runtime_status("delivery_status", status_payload)
-        return JSONResponse({"paths": paths, "status": status_payload})
+        obsidian_paths = None
+        if export_obsidian:
+            obsidian_paths = _write_account_obsidian_export(
+                actor_email=actor_email,
+                account_slug=runtime.account.slug,
+                account_name=runtime.account.name,
+                generated_at=pack["generated_at"],
+                markdown_text=_account_delivery_markdown(pack),
+            )
+        return JSONResponse({"paths": paths, "status": status_payload, "obsidian": obsidian_paths})
 
     @app.post("/internal/reports/portfolio/brief")
     async def internal_generate_portfolio_brief(
@@ -3376,6 +3483,7 @@ def create_app() -> FastAPI:
         _require_internal_api_token(request)
         payload = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
         actor_email = str(payload.get("actor_email") or "").strip().lower()
+        export_obsidian = bool(payload.get("export_obsidian"))
         if not actor_email:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="actor_email is required.")
         _require_portfolio_owner(session, actor_email)
@@ -3399,7 +3507,14 @@ def create_app() -> FastAPI:
             "paths": paths,
         }
         write_runtime_status("delivery_status", status_payload)
-        return JSONResponse({"brief": brief, "paths": paths, "status": status_payload})
+        obsidian_paths = None
+        if export_obsidian:
+            obsidian_paths = _write_portfolio_obsidian_export(
+                actor_email=actor_email,
+                generated_at=brief["generated_at"],
+                markdown_text=_portfolio_brief_markdown(brief),
+            )
+        return JSONResponse({"brief": brief, "paths": paths, "status": status_payload, "obsidian": obsidian_paths})
 
     @app.get("/admin/{account_slug}/dashboard", response_class=HTMLResponse)
     def admin_dashboard(

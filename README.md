@@ -342,6 +342,31 @@ Stage 8.3 adds:
   - `platform.account.feature_flags_changed`
   - `platform.account.soft_limits_changed`
 
+Stage 8.4 adds:
+
+- thin Obsidian bridge on top of existing delivery/brief markdown
+- account export from UI:
+  - `POST /admin/{account_slug}/delivery/generate` with `export_obsidian=true`
+- portfolio export from UI:
+  - `POST /admin/portfolio/brief/generate` with `export_obsidian=true`
+- internal/CLI generation also supports Obsidian export:
+  - `python scripts/generate_runtime_delivery.py --account-slug hermes --actor-email owner@hermes.local --obsidian`
+  - `python scripts/generate_runtime_delivery.py --portfolio --actor-email portfolio.owner@platform.local --obsidian`
+- exported notes are written into a vault-compatible directory:
+  - default: `data/runtime_obsidian_vault/Hermes Platform/`
+  - account delivery notes: `Accounts/<slug>/`
+  - portfolio notes: `Portfolio/`
+- `Platform` page now shows the latest Obsidian export status
+
+Obsidian operational note:
+
+- runtime source of truth remains PostgreSQL + runtime API
+- Obsidian receives markdown exports only
+- easiest setup is to open `data/runtime_obsidian_vault/` as an Obsidian vault or link that folder into an existing vault
+- config knobs:
+  - `PLATFORM_OBSIDIAN_VAULT_PATH`
+  - `PLATFORM_OBSIDIAN_EXPORT_SUBDIR`
+
 Stage 8.1 adds:
 
 - generated delivery snapshots for accounts and portfolio

@@ -148,6 +148,16 @@
         <p class="empty">Delivery snapshot not recorded yet.</p>
         {% endif %}
       </div>
+      <div class="inline-card">
+        <strong>Last Obsidian export</strong>
+        {% if runtime_visibility.obsidian_status %}
+        <div class="status-line">{{ runtime_visibility.obsidian_status.scope }} · {{ runtime_visibility.obsidian_status.status }}</div>
+        <div class="status-line">{{ runtime_visibility.obsidian_status.account_slug or runtime_visibility.obsidian_status.actor_email or "—" }}</div>
+        <div class="status-line">{{ runtime_visibility.obsidian_status.written_at or "—" }}</div>
+        {% else %}
+        <p class="empty">Obsidian export not recorded yet.</p>
+        {% endif %}
+      </div>
     </div>
   </article>
 </section>
