@@ -77,6 +77,16 @@
         <p class="empty">Backup status not recorded yet.</p>
         {% endif %}
       </div>
+      <div class="inline-card">
+        <strong>Last delivery snapshot</strong>
+        {% if runtime_visibility.delivery_status %}
+        <div class="status-line">{{ runtime_visibility.delivery_status.scope }} · {{ runtime_visibility.delivery_status.status }}</div>
+        <div class="status-line">{{ runtime_visibility.delivery_status.account_slug or runtime_visibility.delivery_status.actor_email or "—" }}</div>
+        <div class="status-line">{{ runtime_visibility.delivery_status.written_at or "—" }}</div>
+        {% else %}
+        <p class="empty">Delivery snapshot not recorded yet.</p>
+        {% endif %}
+      </div>
     </div>
   </article>
 </section>

@@ -11,6 +11,7 @@
     <a class="pill-link" href="/admin/{{ runtime.account.slug }}/delivery.json">json</a>
     <a class="pill-link" href="/admin/{{ runtime.account.slug }}/delivery.md">markdown</a>
     <a class="pill-link" href="/admin/{{ runtime.account.slug }}/delivery.txt">text</a>
+    <button type="button" class="ghost" id="generate-delivery">generate snapshot</button>
   </div>
 </div>
 
@@ -137,4 +138,26 @@
     </div>
   </article>
 </section>
+<script>
+  const deliveryGenerateButton = document.getElementById("generate-delivery");
+  if (deliveryGenerateButton) {
+    deliveryGenerateButton.addEventListener("click", async () => {
+      deliveryGenerateButton.disabled = true;
+      try {
+        const response = await adminFetch(`/admin/{{ runtime.account.slug }}/delivery/generate`, {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({}),
+        });
+        if (!response.ok) {
+          throw new Error(await response.text());
+        }
+        window.location.reload();
+      } catch (error) {
+        deliveryGenerateButton.disabled = false;
+        alert(`Delivery snapshot failed: ${error}`);
+      }
+    });
+  }
+</script>
 {% endblock %}

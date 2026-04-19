@@ -168,6 +168,7 @@ Telegram-бот продолжает жить как legacy adapter, а platform
 - stage 7.8: productization layer
 - stage 7.9: execution brief and account actions
 - stage 8.0: delivery layer and product polish
+- stage 8.1: daily delivery and internal digest generation
 
 ### What is already working
 
@@ -317,6 +318,24 @@ Stage 8.0 adds:
   - stronger empty-state hints
   - delivery links across dashboard, goals, integrations, alerts/tasks, ops, accounts and portfolio
 
+Stage 8.1 adds:
+
+- generated delivery snapshots for accounts and portfolio
+- internal-token-protected report generation routes:
+  - `POST /internal/reports/accounts/{account_slug}/delivery`
+  - `POST /internal/reports/portfolio/brief`
+- session-authenticated snapshot generation routes:
+  - `POST /admin/{account_slug}/delivery/generate`
+  - `POST /admin/portfolio/brief/generate`
+- export routes for portfolio brief:
+  - `GET /admin/portfolio/brief.md`
+  - `GET /admin/portfolio/brief.txt`
+- runtime delivery artifacts written to `data/runtime_delivery/`
+- last delivery generation status recorded in `data/runtime_status/delivery_status.json`
+- CLI generator:
+  - `python scripts/generate_runtime_delivery.py --account-slug hermes --actor-email owner@hermes.local`
+  - `python scripts/generate_runtime_delivery.py --portfolio --actor-email portfolio.owner@platform.local`
+
 For stage 6.9 operational hardening:
 
 - Hermes daily operator checklist is documented
@@ -455,7 +474,7 @@ Current delivery behavior:
   - `GET /admin/{account_slug}/delivery`
   - `GET /admin/{account_slug}/delivery.json`
   - `GET /admin/{account_slug}/delivery.md`
-  - `GET /admin/{account_slug}/delivery.txt`
+- `GET /admin/{account_slug}/delivery.txt`
 - delivery page is intended for owner/admin hand-off and daily clarity
 - delivery pack answers:
   - what is already configured
@@ -464,6 +483,14 @@ Current delivery behavior:
   - which integrations need attention
   - what the owner should do next
   - what the operator should work through next
+
+Current delivery generation behavior:
+
+- account delivery page can generate a saved snapshot from the UI
+- portfolio page can generate a saved owner brief snapshot from the UI
+- internal automation can generate the same snapshots through `PLATFORM_INTERNAL_API_TOKEN`
+- generated artifacts are saved as `json`, `md` and `txt`
+- platform visibility now shows the latest delivery snapshot status
 
 Current account onboarding and lifecycle behavior:
 

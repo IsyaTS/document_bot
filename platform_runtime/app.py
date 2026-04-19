@@ -18,8 +18,9 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from platform_core.models import Account, AccountUser, Alert, Employee, Goal, GoalTarget, Role, RuntimeLease, Task, TaskEvent, User
+from platform_core.runtime_delivery import write_delivery_bundle
 from platform_core.exceptions import AuthorizationError, PlatformCoreError, TenantContextError
-from platform_core.runtime_status import read_runtime_status
+from platform_core.runtime_status import read_runtime_status, write_runtime_status
 from platform_core.services import AuditLogService, ExecutiveDashboardService, GOAL_METRIC_DEFINITIONS, GoalService
 from platform_core.services.accounts import AccountService, MembershipService, UserService
 from platform_core.services.user_security import UserSecurityService
@@ -350,6 +351,19 @@ def create_app() -> FastAPI:
         if actor_email is None:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Admin session is required.")
         return actor_email
+
+    def _require_internal_api_token(request: Request) -> None:
+        supplied = (
+            request.headers.get("x-internal-api-token")
+            or request.headers.get("x-platform-internal-token")
+            or ""
+        ).strip()
+        if not supplied:
+            auth_header = (request.headers.get("authorization") or "").strip()
+            if auth_header.lower().startswith("bearer "):
+                supplied = auth_header[7:].strip()
+        if supplied != settings.internal_api_token:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Valid internal API token is required.")
 
     def _require_admin_user(request: Request, session: Session) -> User:
         actor_email = _require_admin_email(request)
@@ -786,6 +800,84 @@ def create_app() -> FastAPI:
                 for item in portfolio["top_attention_items"]
             ],
         }
+
+    def _portfolio_brief_markdown(brief: dict[str, object]) -> str:
+        lines = [
+            "# Portfolio Brief",
+            "",
+            f"- Generated: {brief['generated_at']}",
+            f"- Accounts: {brief['headline']['accounts_count']}",
+            f"- Need action: {brief['headline']['accounts_needing_action']}",
+            f"- Critical accounts: {brief['headline']['critical_accounts']}",
+            "",
+            "## Daily Brief",
+        ]
+        lines.extend(
+            f"- {item['account_name']} ({item['account_slug']}): risk {item['risk_score']} · {item['health_status']} · sync {item['sync_health']}"
+            for item in brief["daily_brief"]
+        )
+        lines.append("")
+        lines.append("## Critical Alerts Digest")
+        if brief["critical_alerts_digest"]:
+            lines.extend(
+                f"- {item['account_name']}: {item['title']} ({item['code']})"
+                for item in brief["critical_alerts_digest"]
+            )
+        else:
+            lines.append("- No critical alerts across portfolio.")
+        lines.append("")
+        lines.append("## Failed Sync Digest")
+        if brief["failed_sync_digest"]:
+            lines.extend(
+                f"- {item['account_name']}: job #{item['job_id']} · {item['provider_name']} · {item['error'] or item['status']}"
+                for item in brief["failed_sync_digest"]
+            )
+        else:
+            lines.append("- No failed sync jobs across portfolio.")
+        lines.append("")
+        lines.append("## Goals At Risk Digest")
+        if brief["goals_at_risk_digest"]:
+            lines.extend(
+                f"- {item['account_name']}: {item['goal_title']} ({item['status']})"
+                for item in brief["goals_at_risk_digest"]
+            )
+        else:
+            lines.append("- No goals at risk across portfolio.")
+        return "\n".join(lines).strip() + "\n"
+
+    def _portfolio_brief_text(brief: dict[str, object]) -> str:
+        lines = [
+            "portfolio brief",
+            f"generated: {brief['generated_at']}",
+            f"accounts: {brief['headline']['accounts_count']}",
+            f"need action: {brief['headline']['accounts_needing_action']}",
+            f"critical accounts: {brief['headline']['critical_accounts']}",
+            "",
+            "daily brief:",
+        ]
+        lines.extend(
+            f"- {item['account_name']} ({item['account_slug']}): risk {item['risk_score']} · {item['health_status']} · sync {item['sync_health']}"
+            for item in brief["daily_brief"]
+        )
+        lines.append("")
+        lines.append("critical alerts digest:")
+        if brief["critical_alerts_digest"]:
+            lines.extend(f"- {item['account_name']}: {item['title']} ({item['code']})" for item in brief["critical_alerts_digest"])
+        else:
+            lines.append("- none")
+        lines.append("")
+        lines.append("failed sync digest:")
+        if brief["failed_sync_digest"]:
+            lines.extend(f"- {item['account_name']}: {item['provider_name']} · {item['error'] or item['status']}" for item in brief["failed_sync_digest"])
+        else:
+            lines.append("- none")
+        lines.append("")
+        lines.append("goals at risk digest:")
+        if brief["goals_at_risk_digest"]:
+            lines.extend(f"- {item['account_name']}: {item['goal_title']} ({item['status']})" for item in brief["goals_at_risk_digest"])
+        else:
+            lines.append("- none")
+        return "\n".join(lines).strip() + "\n"
 
     def _portfolio_account_runtime(
         request: Request,
@@ -1294,6 +1386,7 @@ def create_app() -> FastAPI:
         backup_status = read_runtime_status("backup_status")
         smoke_status = read_runtime_status("smoke_status")
         verify_status = read_runtime_status("verify_status")
+        delivery_status = read_runtime_status("delivery_status")
         now = datetime.now(timezone.utc)
         worker_health = "unknown"
         worker_age_seconds = None
@@ -1324,6 +1417,8 @@ def create_app() -> FastAPI:
             warnings.append("Smoke runtime check has not been recorded yet.")
         if verify_status is None:
             warnings.append("DB verification status has not been recorded yet.")
+        if delivery_status is None:
+            warnings.append("Delivery status has not been recorded yet.")
         return {
             "app_version": settings.app_version,
             "environment": settings.environment,
@@ -1348,6 +1443,7 @@ def create_app() -> FastAPI:
             "backup_status": backup_status,
             "smoke_status": smoke_status,
             "verify_status": verify_status,
+            "delivery_status": delivery_status,
             "warnings": warnings,
         }
 
@@ -2336,6 +2432,67 @@ def create_app() -> FastAPI:
         portfolio = _portfolio_summary(portfolio_rows)
         return _portfolio_brief(portfolio)
 
+    @app.get("/admin/portfolio/brief.md", response_class=PlainTextResponse)
+    def admin_portfolio_brief_markdown(
+        request: Request,
+        session: Session = Depends(get_db_session),
+    ) -> PlainTextResponse:
+        actor = _require_admin_user(request, session)
+        actor_email = actor.email
+        _require_portfolio_owner(session, actor_email)
+        owner_rows = _owner_accounts_with_memberships(session, actor_email)
+        portfolio_rows = [_portfolio_account_row(session, actor_email, item["account"]) for item in owner_rows]
+        portfolio_rows.sort(key=lambda item: (-int(item["risk_score"]), item["account"].name.lower()))
+        portfolio = _portfolio_summary(portfolio_rows)
+        brief = _portfolio_brief(portfolio)
+        return PlainTextResponse(_portfolio_brief_markdown(brief), media_type="text/markdown; charset=utf-8")
+
+    @app.get("/admin/portfolio/brief.txt", response_class=PlainTextResponse)
+    def admin_portfolio_brief_text(
+        request: Request,
+        session: Session = Depends(get_db_session),
+    ) -> PlainTextResponse:
+        actor = _require_admin_user(request, session)
+        actor_email = actor.email
+        _require_portfolio_owner(session, actor_email)
+        owner_rows = _owner_accounts_with_memberships(session, actor_email)
+        portfolio_rows = [_portfolio_account_row(session, actor_email, item["account"]) for item in owner_rows]
+        portfolio_rows.sort(key=lambda item: (-int(item["risk_score"]), item["account"].name.lower()))
+        portfolio = _portfolio_summary(portfolio_rows)
+        brief = _portfolio_brief(portfolio)
+        return PlainTextResponse(_portfolio_brief_text(brief), media_type="text/plain; charset=utf-8")
+
+    @app.post("/admin/portfolio/brief/generate")
+    async def admin_generate_portfolio_brief(
+        request: Request,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        actor = _require_admin_user(request, session)
+        actor_email = actor.email
+        _require_portfolio_owner(session, actor_email)
+        owner_rows = _owner_accounts_with_memberships(session, actor_email)
+        portfolio_rows = [_portfolio_account_row(session, actor_email, item["account"]) for item in owner_rows]
+        portfolio_rows.sort(key=lambda item: (-int(item["risk_score"]), item["account"].name.lower()))
+        portfolio = _portfolio_summary(portfolio_rows)
+        brief = _portfolio_brief(portfolio)
+        paths = write_delivery_bundle(
+            scope="portfolio",
+            name="portfolio_brief",
+            json_payload=brief,
+            markdown_text=_portfolio_brief_markdown(brief),
+            text_text=_portfolio_brief_text(brief),
+        )
+        status_payload = {
+            "status": "ok",
+            "scope": "portfolio",
+            "actor_email": actor_email,
+            "accounts_count": brief["headline"]["accounts_count"],
+            "paths": paths,
+        }
+        write_runtime_status("delivery_status", status_payload)
+        return JSONResponse({"brief": brief, "paths": paths, "status": status_payload})
+
     @app.get("/admin/accounts", response_class=HTMLResponse)
     def admin_accounts_page(
         request: Request,
@@ -2731,6 +2888,130 @@ def create_app() -> FastAPI:
         ensure_permission(runtime, "dashboard.read")
         pack = _account_delivery_pack(runtime, session)
         return PlainTextResponse(_account_delivery_text(pack), media_type="text/plain; charset=utf-8")
+
+    @app.post("/admin/{account_slug}/delivery/generate")
+    async def admin_generate_delivery(
+        request: Request,
+        account_slug: str,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        actor = _require_admin_user(request, session)
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor.email)
+        ensure_permission(runtime, "dashboard.read")
+        pack = _account_delivery_pack(runtime, session)
+        paths = write_delivery_bundle(
+            scope="accounts",
+            name=runtime.account.slug,
+            json_payload={
+                "generated_at": pack["generated_at"],
+                "account": _serialize_account(runtime.account),
+                "handoff_summary": pack["handoff_summary"],
+                "configured_now": pack["configured_now"],
+                "setup_gaps": pack["setup_gaps"],
+                "health_problems": pack["health_problems"],
+                "owner_actions": pack["owner_actions"],
+                "operator_checklist": pack["operator_checklist"],
+                "integrations_needing_attention": [
+                    {
+                        "integration_id": item["integration"].id,
+                        "external_ref": item["integration"].external_ref,
+                        "display_name": item["integration"].display_name,
+                        "provider_name": item["integration"].provider_name,
+                        "status": item["integration"].status,
+                        "sync_state": item["sync_state"],
+                        "last_error": item["last_error"],
+                    }
+                    for item in pack["integrations_needing_attention"]
+                ],
+            },
+            markdown_text=_account_delivery_markdown(pack),
+            text_text=_account_delivery_text(pack),
+        )
+        status_payload = {
+            "status": "ok",
+            "scope": "account",
+            "account_slug": runtime.account.slug,
+            "actor_email": actor.email,
+            "paths": paths,
+            "handoff_summary": pack["handoff_summary"],
+        }
+        write_runtime_status("delivery_status", status_payload)
+        return JSONResponse({"paths": paths, "status": status_payload})
+
+    @app.post("/internal/reports/accounts/{account_slug}/delivery")
+    async def internal_generate_account_delivery(
+        request: Request,
+        account_slug: str,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        _require_internal_api_token(request)
+        payload = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+        actor_email = str(payload.get("actor_email") or "").strip().lower()
+        if not actor_email:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="actor_email is required.")
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
+        ensure_permission(runtime, "dashboard.read")
+        pack = _account_delivery_pack(runtime, session)
+        paths = write_delivery_bundle(
+            scope="accounts",
+            name=runtime.account.slug,
+            json_payload={
+                "generated_at": pack["generated_at"],
+                "account": _serialize_account(runtime.account),
+                "handoff_summary": pack["handoff_summary"],
+                "configured_now": pack["configured_now"],
+                "setup_gaps": pack["setup_gaps"],
+                "health_problems": pack["health_problems"],
+                "owner_actions": pack["owner_actions"],
+                "operator_checklist": pack["operator_checklist"],
+            },
+            markdown_text=_account_delivery_markdown(pack),
+            text_text=_account_delivery_text(pack),
+        )
+        status_payload = {
+            "status": "ok",
+            "scope": "account",
+            "account_slug": runtime.account.slug,
+            "actor_email": actor_email,
+            "paths": paths,
+            "handoff_summary": pack["handoff_summary"],
+        }
+        write_runtime_status("delivery_status", status_payload)
+        return JSONResponse({"paths": paths, "status": status_payload})
+
+    @app.post("/internal/reports/portfolio/brief")
+    async def internal_generate_portfolio_brief(
+        request: Request,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        _require_internal_api_token(request)
+        payload = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+        actor_email = str(payload.get("actor_email") or "").strip().lower()
+        if not actor_email:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="actor_email is required.")
+        _require_portfolio_owner(session, actor_email)
+        owner_rows = _owner_accounts_with_memberships(session, actor_email)
+        portfolio_rows = [_portfolio_account_row(session, actor_email, item["account"]) for item in owner_rows]
+        portfolio_rows.sort(key=lambda item: (-int(item["risk_score"]), item["account"].name.lower()))
+        portfolio = _portfolio_summary(portfolio_rows)
+        brief = _portfolio_brief(portfolio)
+        paths = write_delivery_bundle(
+            scope="portfolio",
+            name="portfolio_brief",
+            json_payload=brief,
+            markdown_text=_portfolio_brief_markdown(brief),
+            text_text=_portfolio_brief_text(brief),
+        )
+        status_payload = {
+            "status": "ok",
+            "scope": "portfolio",
+            "actor_email": actor_email,
+            "accounts_count": brief["headline"]["accounts_count"],
+            "paths": paths,
+        }
+        write_runtime_status("delivery_status", status_payload)
+        return JSONResponse({"brief": brief, "paths": paths, "status": status_payload})
 
     @app.get("/admin/{account_slug}/dashboard", response_class=HTMLResponse)
     def admin_dashboard(

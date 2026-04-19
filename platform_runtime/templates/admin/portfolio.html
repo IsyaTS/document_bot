@@ -9,6 +9,9 @@
     <span class="chip">{{ portfolio.accounts_count }} owner accounts</span>
     <span class="chip">{{ portfolio.accounts_needing_action }} need action today</span>
     <a class="pill-link" href="/admin/portfolio/brief">brief endpoint</a>
+    <a class="pill-link" href="/admin/portfolio/brief.md">markdown</a>
+    <a class="pill-link" href="/admin/portfolio/brief.txt">text</a>
+    <button type="button" class="ghost" id="generate-portfolio-brief">generate snapshot</button>
   </div>
 </div>
 
@@ -361,6 +364,24 @@
   for (const button of document.querySelectorAll(".portfolio-run-sync")) {
     button.addEventListener("click", async () => {
       await runPortfolioSync(button.dataset.accountSlug);
+    });
+  }
+
+  const portfolioGenerateButton = document.getElementById("generate-portfolio-brief");
+  if (portfolioGenerateButton) {
+    portfolioGenerateButton.addEventListener("click", async () => {
+      portfolioGenerateButton.disabled = true;
+      const response = await adminFetch("/admin/portfolio/brief/generate", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({}),
+      });
+      if (!response.ok) {
+        portfolioGenerateButton.disabled = false;
+        alert(`Portfolio brief snapshot failed: ${await response.text()}`);
+        return;
+      }
+      window.location.reload();
     });
   }
 
