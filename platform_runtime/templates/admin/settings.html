@@ -139,6 +139,20 @@
       </section>
 
       <section class="card soft-card">
+        <h4>AI Copilot</h4>
+        <div class="form-grid two">
+          <label style="grid-column: 1 / span 2;">
+            Focus areas
+            <input name="copilot_focus_areas" value="{{ account_settings.copilot_focus_areas or '' }}" placeholder="conversion quality, stock risk, cash discipline">
+            <span class="status-line">Optional focus that guides grounded copilot analysis for this account.</span>
+          </label>
+        </div>
+        <div class="chips" style="margin-top: 14px;">
+          <label class="inline-toggle"><input type="checkbox" name="export_copilot_to_obsidian" {% if account_settings.export_copilot_to_obsidian %}checked{% endif %}> export copilot reports to Obsidian</label>
+        </div>
+      </section>
+
+      <section class="card soft-card">
         <h4>Feature Flags</h4>
         <div class="stack">
           {% for item in feature_definitions %}

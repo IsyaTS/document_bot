@@ -139,3 +139,32 @@ def export_notification_dispatch_note(
         },
         settings=settings,
     )
+
+
+def export_copilot_report_note(
+    *,
+    account_slug: str,
+    account_name: str,
+    generated_at: str,
+    title: str,
+    markdown_text: str,
+    generation_mode: str,
+    model_name: str | None = None,
+    settings: PlatformSettings | None = None,
+) -> dict[str, str]:
+    timestamp = generated_at or datetime.now(timezone.utc).isoformat()
+    note_name = f"{timestamp[:10]} {account_slug} copilot"
+    return write_obsidian_note(
+        folder_parts=["Accounts", account_slug, "Copilot"],
+        note_name=note_name,
+        title=title or f"{account_name} Copilot Report",
+        markdown_text=markdown_text,
+        metadata={
+            "account_slug": account_slug,
+            "scope": "copilot_report",
+            "generated_at": timestamp,
+            "generation_mode": generation_mode,
+            "model_name": model_name or "",
+        },
+        settings=settings,
+    )

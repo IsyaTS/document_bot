@@ -8,6 +8,7 @@ from platform_core.services.bootstrap import BootstrapResult, CoreBootstrapServi
 from platform_core.services.billing import BillingService, PayrollRegisterSnapshot
 from platform_core.services.business_os import BusinessOSService, InventoryInsight
 from platform_core.services.communications import CommunicationAnalysis, CommunicationService
+from platform_core.services.copilot import CopilotService
 from platform_core.services.credentials import CredentialCrypto, CredentialCryptoError
 from platform_core.services.dashboard import DashboardCatalogService, ExecutiveDashboardService
 from platform_core.services.execution import EmployeeExecutionSummary, ExecutionService
@@ -42,6 +43,7 @@ __all__ = [
     "BusinessOSService",
     "CommunicationAnalysis",
     "CommunicationService",
+    "CopilotService",
     "CredentialCrypto",
     "CredentialCryptoError",
     "CoreBootstrapService",

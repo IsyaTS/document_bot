@@ -687,6 +687,28 @@ class KnowledgeItem(Base, AccountScopedMixin, TimestampMixin):
     metadata_json: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False, default=dict)
 
 
+class CopilotReport(Base, AccountScopedMixin, TimestampMixin):
+    __tablename__ = "copilot_reports"
+    __table_args__ = (
+        Index("ix_copilot_reports_account_status_created_at", "account_id", "status", "created_at"),
+        Index("ix_copilot_reports_account_scope_created_at", "account_id", "scope", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    created_by_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    scope: Mapped[str] = mapped_column(String(32), nullable=False, default="account")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="completed")
+    generation_mode: Mapped[str] = mapped_column(String(32), nullable=False, default="heuristic")
+    model_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    provider_response_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    question_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    summary_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    markdown_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    obsidian_note_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    payload_json: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False, default=dict)
+
+
 class TaskCheckin(Base, AccountScopedMixin, TimestampMixin):
     __tablename__ = "task_checkins"
     __table_args__ = (

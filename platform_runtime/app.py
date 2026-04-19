@@ -29,6 +29,7 @@ from platform_core.models import (
     Alert,
     CommunicationImportBatch,
     CommunicationReview,
+    CopilotReport,
     Customer,
     Deal,
     Document,
@@ -65,6 +66,7 @@ from platform_core.services import (
     BillingService,
     BusinessOSService,
     CommunicationService,
+    CopilotService,
     EmployeeSnapshot,
     EmployeeExecutionSummary,
     ExecutionService,
@@ -468,6 +470,8 @@ def create_app() -> FastAPI:
                 items.append({"key": "inventory", "label": "Inventory", "path": "inventory"})
                 items.append({"key": "notifications", "label": "Notifications", "path": "notifications"})
                 items.append({"key": "advisor", "label": "Advisor", "path": "advisor"})
+            if feature_access["ai_copilot"]["allowed"]:
+                items.append({"key": "copilot", "label": "Copilot", "path": "copilot"})
             if feature_access["goals_tracking"]["allowed"]:
                 items.append({"key": "goals", "label": "Goals", "path": "goals"})
         if "alerts.read" in permissions or "tasks.read" in permissions or "*" in permissions:
@@ -1041,6 +1045,7 @@ def create_app() -> FastAPI:
             {"key": "operations_workflows", "label": "Operations workflows", "description": "Purchases, receiving, logistics requests and documents."},
             {"key": "communication_intelligence", "label": "Communication intelligence", "description": "Transcript reviews, quality signals and owner guidance."},
             {"key": "business_os", "label": "Business OS", "description": "CRM, inventory analytics, notifications and advisor workflows."},
+            {"key": "ai_copilot", "label": "AI copilot", "description": "Grounded AI analysis, root-cause review and owner action suggestions."},
             {"key": "goals_tracking", "label": "Goals tracking", "description": "Plan vs fact and goal workflows."},
             {"key": "integrations_setup", "label": "Integrations setup", "description": "Admin UI for integration setup and sync."},
             {"key": "ops_console", "label": "Ops console", "description": "Ops / Sync visibility and actions."},
@@ -1051,25 +1056,25 @@ def create_app() -> FastAPI:
             "internal": {
                 "label": "Internal",
                 "summary": "Internal operator deployment with full platform surface for live business use.",
-                "recommended_features": {"portfolio_console", "owner_briefs", "knowledge_base", "people_execution", "payroll_kpi", "operations_workflows", "communication_intelligence", "business_os", "goals_tracking", "integrations_setup", "ops_console"},
+                "recommended_features": {"portfolio_console", "owner_briefs", "knowledge_base", "people_execution", "payroll_kpi", "operations_workflows", "communication_intelligence", "business_os", "ai_copilot", "goals_tracking", "integrations_setup", "ops_console"},
                 "usage_note": "Best fit for active internal operations and product validation.",
             },
             "pilot": {
                 "label": "Pilot",
                 "summary": "Small rollout for one operating team with core execution and onboarding flows.",
-                "recommended_features": {"owner_briefs", "knowledge_base", "people_execution", "payroll_kpi", "operations_workflows", "communication_intelligence", "business_os", "goals_tracking", "integrations_setup", "ops_console"},
+                "recommended_features": {"owner_briefs", "knowledge_base", "people_execution", "payroll_kpi", "operations_workflows", "communication_intelligence", "business_os", "ai_copilot", "goals_tracking", "integrations_setup", "ops_console"},
                 "usage_note": "Good for proving value before broad rollout.",
             },
             "growth": {
                 "label": "Growth",
                 "summary": "Multi-account owner workflow with portfolio visibility and delivery flows.",
-                "recommended_features": {"portfolio_console", "owner_briefs", "knowledge_base", "people_execution", "payroll_kpi", "operations_workflows", "communication_intelligence", "business_os", "goals_tracking", "integrations_setup", "ops_console"},
+                "recommended_features": {"portfolio_console", "owner_briefs", "knowledge_base", "people_execution", "payroll_kpi", "operations_workflows", "communication_intelligence", "business_os", "ai_copilot", "goals_tracking", "integrations_setup", "ops_console"},
                 "usage_note": "Designed for wider operational rollout.",
             },
             "enterprise": {
                 "label": "Enterprise",
                 "summary": "Highest readiness profile with all current product surfaces enabled.",
-                "recommended_features": {"portfolio_console", "owner_briefs", "knowledge_base", "people_execution", "payroll_kpi", "operations_workflows", "communication_intelligence", "business_os", "goals_tracking", "integrations_setup", "ops_console"},
+                "recommended_features": {"portfolio_console", "owner_briefs", "knowledge_base", "people_execution", "payroll_kpi", "operations_workflows", "communication_intelligence", "business_os", "ai_copilot", "goals_tracking", "integrations_setup", "ops_console"},
                 "usage_note": "Suitable for fully managed multi-account environments.",
             },
         }
@@ -1095,6 +1100,7 @@ def create_app() -> FastAPI:
             {"key": "notification_dispatches", "label": "Notification dispatches", "description": "Soft limit for delivered notification artifacts."},
             {"key": "task_checkins", "label": "Task check-ins", "description": "Soft limit for execution check-ins and resolution notes."},
             {"key": "document_settlements", "label": "Document settlements", "description": "Soft limit for invoice payments, claim resolutions and write-offs."},
+            {"key": "copilot_reports", "label": "Copilot reports", "description": "Soft limit for stored AI copilot analyses."},
         ]
 
     def _default_account_settings() -> dict[str, object]:
@@ -1110,6 +1116,8 @@ def create_app() -> FastAPI:
             "notification_telegram_chat_ids": [],
             "notification_webhook_url": "",
             "export_notifications_to_obsidian": True,
+            "copilot_focus_areas": "",
+            "export_copilot_to_obsidian": True,
         }
 
     def _account_product_config(account: Account) -> dict[str, object]:
@@ -1267,6 +1275,9 @@ def create_app() -> FastAPI:
         document_settlements = session.execute(
             select(func.count()).select_from(DocumentSettlement).where(DocumentSettlement.account_id == account.id)
         ).scalar_one()
+        copilot_reports = session.execute(
+            select(func.count()).select_from(CopilotReport).where(CopilotReport.account_id == account.id)
+        ).scalar_one()
         return {
             "active_memberships": sum(1 for item in memberships if item.status == "active"),
             "active_integrations": sum(1 for item in integrations if item.status != "archived"),
@@ -1284,6 +1295,7 @@ def create_app() -> FastAPI:
             "notification_dispatches": int(notification_dispatches or 0),
             "task_checkins": int(task_checkins or 0),
             "document_settlements": int(document_settlements or 0),
+            "copilot_reports": int(copilot_reports or 0),
         }
 
     def _account_usage_rows(account: Account, session: Session) -> list[dict[str, object]]:
@@ -1391,6 +1403,11 @@ def create_app() -> FastAPI:
         ).scalar_one()
         if notification_dispatch_count == 0:
             next_steps.append({"label": "Dispatch the first digest", "href": f"/admin/{runtime.account.slug}/notifications"})
+        copilot_report_count = session.execute(
+            select(func.count()).select_from(CopilotReport).where(CopilotReport.account_id == runtime.account.id)
+        ).scalar_one()
+        if copilot_report_count == 0:
+            next_steps.append({"label": "Run the first AI copilot analysis", "href": f"/admin/{runtime.account.slug}/copilot"})
         if not settings_payload.get("default_owner_user_id"):
             next_steps.append({"label": "Set default owner", "href": f"/admin/{runtime.account.slug}/settings"})
         if not settings_payload.get("default_operator_user_id") and onboarding["active_memberships"]:
@@ -4038,6 +4055,8 @@ def create_app() -> FastAPI:
             "notification_telegram_chat_ids": [item.strip() for item in _value("notification_telegram_chat_ids").split(",") if item.strip()],
             "notification_webhook_url": _value("notification_webhook_url"),
             "export_notifications_to_obsidian": bool(payload.get("export_notifications_to_obsidian")),
+            "copilot_focus_areas": _value("copilot_focus_areas"),
+            "export_copilot_to_obsidian": bool(payload.get("export_copilot_to_obsidian")),
         }
         try:
             AccountService(session).update_account(
@@ -5155,6 +5174,150 @@ def create_app() -> FastAPI:
                 "advisor_items": items,
             },
         )
+
+    @app.get("/admin/{account_slug}/copilot", response_class=HTMLResponse)
+    def admin_copilot(
+        request: Request,
+        account_slug: str,
+        report_id: int | None = Query(default=None),
+        session: Session = Depends(get_db_session),
+    ) -> HTMLResponse:
+        user = _current_session_user(session, request)
+        if user is None:
+            request.session.clear()
+            return _login_redirect(f"/admin/{account_slug}/copilot")
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=user.email)
+        request.session["admin_account_slug"] = runtime.account.slug
+        ensure_permission(runtime, "dashboard.read")
+        _ensure_account_feature(runtime, "ai_copilot", "AI Copilot")
+        service = CopilotService(session)
+        reports = service.list_reports(runtime.context, limit=20)
+        selected_report = None
+        if report_id is not None:
+            selected_report = service.get_report(runtime.context, report_id)
+        elif reports:
+            selected_report = reports[0]
+        account_settings = _account_product_config(runtime.account)
+        return templates.TemplateResponse(
+            request,
+            "admin/copilot.html",
+            {
+                **_admin_context(request, session, runtime, page="copilot"),
+                "copilot_reports": reports,
+                "selected_report": _serialize_copilot_report(selected_report, account_slug=runtime.account.slug) if selected_report else None,
+                "account_settings": account_settings,
+                "openai_enabled": bool(settings.openai_api_key),
+            },
+        )
+
+    @app.post("/admin/{account_slug}/copilot/generate")
+    async def admin_generate_copilot_report(
+        request: Request,
+        account_slug: str,
+        session: Session = Depends(get_db_session),
+    ) -> RedirectResponse:
+        await _require_csrf(request)
+        actor = _require_admin_user(request, session)
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor.email)
+        request.session["admin_account_slug"] = runtime.account.slug
+        ensure_permission(runtime, "dashboard.read")
+        _ensure_account_feature(runtime, "ai_copilot", "AI Copilot")
+        payload = parse_qs((await request.body()).decode("utf-8"), keep_blank_values=True)
+        question_text = str((payload.get("question_text") or [""])[0]).strip() or None
+        report = CopilotService(session).generate_account_report(
+            runtime,
+            created_by_user_id=actor.id,
+            question_text=question_text,
+        )
+        AuditLogService(session).log(
+            runtime.context,
+            "copilot.report.generated",
+            "copilot_report",
+            str(report.id),
+            details={"generation_mode": report.generation_mode, "model_name": report.model_name},
+        )
+        _push_flash(request, "success", f"Copilot report generated in {report.generation_mode} mode.")
+        return RedirectResponse(url=f"/admin/{runtime.account.slug}/copilot?report_id={report.id}", status_code=status.HTTP_302_FOUND)
+
+    @app.get("/admin/{account_slug}/copilot/reports/{report_id}.json")
+    def admin_copilot_report_json(
+        request: Request,
+        account_slug: str,
+        report_id: int,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        user = _current_session_user(session, request)
+        if user is None:
+            request.session.clear()
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Admin session is invalid or expired.")
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=user.email)
+        ensure_permission(runtime, "dashboard.read")
+        _ensure_account_feature(runtime, "ai_copilot", "AI Copilot")
+        report = CopilotService(session).get_report(runtime.context, report_id)
+        return JSONResponse({"report": _serialize_copilot_report(report, account_slug=runtime.account.slug)})
+
+    @app.post("/admin/{account_slug}/copilot/reports/{report_id}/actions/{action_index}/task")
+    async def admin_copilot_action_to_task(
+        request: Request,
+        account_slug: str,
+        report_id: int,
+        action_index: int,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        actor = _require_admin_user(request, session)
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor.email)
+        ensure_permission(runtime, "tasks.manage")
+        _ensure_account_feature(runtime, "ai_copilot", "AI Copilot")
+        report = CopilotService(session).get_report(runtime.context, report_id)
+        payload = report.payload_json if isinstance(report.payload_json, dict) else {}
+        actions = payload.get("recommended_actions") or []
+        if action_index < 0 or action_index >= len(actions) or not isinstance(actions[action_index], dict):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Copilot action not found.")
+        action = dict(actions[action_index])
+        settings_payload = _account_product_config(runtime.account)
+        assignee_user_id = settings_payload.get("default_operator_user_id") or settings_payload.get("default_owner_user_id")
+        dedupe_key = f"copilot:{report.id}:{action_index}"
+        existing_task = session.execute(
+            select(Task).where(Task.account_id == runtime.account.id, Task.dedupe_key == dedupe_key)
+        ).scalar_one_or_none()
+        if existing_task is not None:
+            return JSONResponse({"task": _serialize_task(existing_task), "report": _serialize_copilot_report(report, account_slug=runtime.account.slug)})
+        task = Task(
+            account_id=runtime.account.id,
+            assignee_user_id=int(assignee_user_id) if assignee_user_id else None,
+            created_by_user_id=actor.id,
+            source="copilot",
+            title=str(action.get("title") or "Copilot follow-up"),
+            description=str(action.get("reason") or "").strip() or None,
+            status="open",
+            priority="high" if str(action.get("priority") or "normal") in {"critical", "high"} else "normal",
+            related_entity_type="copilot_report",
+            related_entity_id=str(report.id),
+            dedupe_key=dedupe_key,
+        )
+        session.add(task)
+        session.flush()
+        session.add(
+            TaskEvent(
+                account_id=runtime.account.id,
+                task_id=task.id,
+                actor_user_id=actor.id,
+                event_type="created",
+                payload_json={"source": "copilot", "report_id": report.id, "action_index": action_index},
+            )
+        )
+        action["task_id"] = task.id
+        actions[action_index] = action
+        report.payload_json = {**payload, "recommended_actions": actions}
+        AuditLogService(session).log(
+            runtime.context,
+            "copilot.action.task_created",
+            "copilot_report",
+            str(report.id),
+            details={"action_index": action_index, "task_id": task.id},
+        )
+        return JSONResponse({"task": _serialize_task(task), "report": _serialize_copilot_report(report, account_slug=runtime.account.slug)})
 
     @app.get("/admin/{account_slug}/operations", response_class=HTMLResponse)
     def admin_operations(
@@ -7123,6 +7286,65 @@ def _serialize_knowledge_item(item: KnowledgeItem) -> dict[str, object]:
         "metadata": item.metadata_json if isinstance(item.metadata_json, dict) else {},
         "created_at": _serialize_datetime(item.created_at),
         "updated_at": _serialize_datetime(item.updated_at),
+    }
+
+
+def _target_area_href(account_slug: str, target_area: str) -> str:
+    return {
+        "dashboard": f"/admin/{account_slug}/dashboard",
+        "alerts_tasks": f"/admin/{account_slug}/alerts-tasks",
+        "goals": f"/admin/{account_slug}/goals?risk_only=1",
+        "communications": f"/admin/{account_slug}/communications",
+        "inventory": f"/admin/{account_slug}/inventory",
+        "crm": f"/admin/{account_slug}/crm",
+        "payroll": f"/admin/{account_slug}/payroll",
+        "operations": f"/admin/{account_slug}/operations",
+        "notifications": f"/admin/{account_slug}/notifications",
+        "integrations": f"/admin/{account_slug}/integrations",
+        "ops_sync": f"/admin/{account_slug}/ops-sync",
+        "knowledge": f"/admin/{account_slug}/knowledge",
+    }.get(target_area, f"/admin/{account_slug}/dashboard")
+
+
+def _serialize_copilot_report(report: CopilotReport, *, account_slug: str) -> dict[str, object]:
+    payload = report.payload_json if isinstance(report.payload_json, dict) else {}
+    actions = []
+    for index, item in enumerate(payload.get("recommended_actions") or []):
+        if not isinstance(item, dict):
+            continue
+        target_area = str(item.get("target_area") or "dashboard")
+        actions.append(
+            {
+                "index": index,
+                "title": str(item.get("title") or "Untitled action"),
+                "reason": str(item.get("reason") or ""),
+                "owner": str(item.get("owner") or "owner"),
+                "priority": str(item.get("priority") or "normal"),
+                "target_area": target_area,
+                "target_href": _target_area_href(account_slug, target_area),
+                "task_id": item.get("task_id"),
+            }
+        )
+    return {
+        "id": report.id,
+        "account_id": report.account_id,
+        "created_by_user_id": report.created_by_user_id,
+        "scope": report.scope,
+        "status": report.status,
+        "generation_mode": report.generation_mode,
+        "model_name": report.model_name,
+        "provider_response_id": report.provider_response_id,
+        "question_text": report.question_text,
+        "title": report.title,
+        "summary_text": report.summary_text,
+        "markdown_text": report.markdown_text,
+        "obsidian_note_path": report.obsidian_note_path,
+        "created_at": _serialize_datetime(report.created_at),
+        "updated_at": _serialize_datetime(report.updated_at),
+        "payload": {
+            **payload,
+            "recommended_actions": actions,
+        },
     }
 
 

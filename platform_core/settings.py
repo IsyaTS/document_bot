@@ -29,6 +29,9 @@ class PlatformSettings:
     worker_poll_interval_seconds: int
     runtime_lease_ttl_seconds: int
     notification_telegram_bot_token: str | None
+    openai_api_key: str | None
+    openai_model: str
+    openai_reasoning_effort: str
     smtp_host: str | None
     smtp_port: int
     smtp_username: str | None
@@ -83,6 +86,9 @@ def load_platform_settings() -> PlatformSettings:
         worker_poll_interval_seconds=max(1, int(os.getenv("PLATFORM_WORKER_POLL_INTERVAL_SECONDS", "30"))),
         runtime_lease_ttl_seconds=max(15, int(os.getenv("PLATFORM_RUNTIME_LEASE_TTL_SECONDS", "120"))),
         notification_telegram_bot_token=os.getenv("PLATFORM_NOTIFICATION_TELEGRAM_BOT_TOKEN") or None,
+        openai_api_key=os.getenv("PLATFORM_OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY") or None,
+        openai_model=(os.getenv("PLATFORM_OPENAI_MODEL") or os.getenv("OPENAI_MODEL") or "gpt-5-mini").strip() or "gpt-5-mini",
+        openai_reasoning_effort=(os.getenv("PLATFORM_OPENAI_REASONING_EFFORT", "medium").strip() or "medium"),
         smtp_host=os.getenv("PLATFORM_SMTP_HOST") or None,
         smtp_port=max(1, int(os.getenv("PLATFORM_SMTP_PORT", "587"))),
         smtp_username=os.getenv("PLATFORM_SMTP_USERNAME") or None,

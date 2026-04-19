@@ -1,0 +1,188 @@
+{% extends "admin/base.html" %}
+{% block content %}
+<div class="topbar">
+  <div>
+    <h2>Copilot</h2>
+    <p class="subtle">Grounded account analysis using current business signals, knowledge items and execution pressure.</p>
+  </div>
+  <div class="chips">
+    <span class="chip">{{ copilot_reports|length }} reports</span>
+    <span class="chip">{{ 'OpenAI enabled' if openai_enabled else 'heuristic fallback' }}</span>
+    <a class="pill-link" href="/admin/{{ runtime.account.slug }}/advisor">advisor</a>
+  </div>
+</div>
+
+<section class="grid cols-2 integrations-layout">
+  <article class="card">
+    <div class="actions" style="justify-content: space-between;">
+      <div>
+        <h3>Generate Report</h3>
+        <p class="subtle">The copilot uses dashboard, goals, alerts, tasks, communications, inventory, documents and knowledge base context.</p>
+      </div>
+      <span class="badge {{ 'good' if openai_enabled else 'warn' }}">{{ 'ai' if openai_enabled else 'fallback' }}</span>
+    </div>
+    <form method="post" action="/admin/{{ runtime.account.slug }}/copilot/generate" class="stack" style="margin-top: 14px;">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <label>
+        Question for copilot
+        <textarea name="question_text" rows="4" placeholder="What should the owner do this week to improve execution and reduce risk?"></textarea>
+      </label>
+      <div class="inline-card">
+        <strong>Current focus</strong>
+        <div class="status-line">{{ account_settings.copilot_focus_areas or "not configured" }}</div>
+        <div class="actions" style="margin-top: 10px;">
+          <a class="pill-link" href="/admin/{{ runtime.account.slug }}/settings">open settings</a>
+        </div>
+      </div>
+      <div class="actions">
+        <button type="submit">Generate copilot report</button>
+      </div>
+    </form>
+
+    <section class="card soft-card" style="margin-top: 16px; padding: 0;">
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Report</th><th>Mode</th><th></th></tr></thead>
+          <tbody>
+            {% for item in copilot_reports %}
+            <tr>
+              <td>
+                <strong>{{ item.title }}</strong>
+                <div class="status-line">{{ item.created_at }}</div>
+              </td>
+              <td>{{ item.generation_mode }}{% if item.model_name %}<div class="status-line">{{ item.model_name }}</div>{% endif %}</td>
+              <td><a class="pill-link" href="/admin/{{ runtime.account.slug }}/copilot?report_id={{ item.id }}">open</a></td>
+            </tr>
+            {% else %}
+            <tr><td colspan="3" class="empty">No copilot reports yet. Generate the first one from the current account state.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </article>
+
+  <article class="card">
+    {% if selected_report %}
+    <div class="actions" style="justify-content: space-between;">
+      <div>
+        <h3>{{ selected_report.title }}</h3>
+        <p class="subtle">{{ selected_report.created_at }} · {{ selected_report.generation_mode }}{% if selected_report.model_name %} · {{ selected_report.model_name }}{% endif %}</p>
+      </div>
+      <div class="chips">
+        <a class="pill-link" href="/admin/{{ runtime.account.slug }}/copilot/reports/{{ selected_report.id }}.json">json</a>
+        {% if selected_report.obsidian_note_path %}
+        <span class="chip">obsidian linked</span>
+        {% endif %}
+      </div>
+    </div>
+
+    <section class="card soft-card" style="margin-top: 14px; padding: 14px;">
+      <h4>Executive Summary</h4>
+      <p>{{ selected_report.summary_text or selected_report.payload.executive_summary }}</p>
+      {% if selected_report.payload.generation_warning %}
+      <div class="notice" style="margin-top: 12px;">{{ selected_report.payload.generation_warning }}</div>
+      {% endif %}
+    </section>
+
+    <section class="grid cols-2" style="margin-top: 16px;">
+      <article class="card soft-card" style="padding: 14px;">
+        <h4>Root Causes</h4>
+        <ul>
+          {% for item in selected_report.payload.root_causes %}
+          <li>{{ item }}</li>
+          {% else %}
+          <li>No root causes listed.</li>
+          {% endfor %}
+        </ul>
+      </article>
+      <article class="card soft-card" style="padding: 14px;">
+        <h4>Questions To Verify</h4>
+        <ul>
+          {% for item in selected_report.payload.questions_to_verify %}
+          <li>{{ item }}</li>
+          {% else %}
+          <li>No open questions listed.</li>
+          {% endfor %}
+        </ul>
+      </article>
+    </section>
+
+    <section class="card soft-card" style="margin-top: 16px; padding: 14px;">
+      <h4>Recommended Actions</h4>
+      <div class="stack" style="gap: 12px;">
+        {% for item in selected_report.payload.recommended_actions %}
+        <div class="inline-card">
+          <div class="actions" style="justify-content: space-between;">
+            <strong>[{{ item.priority }}] {{ item.title }}</strong>
+            <div class="chips">
+              <span class="chip">{{ item.owner }}</span>
+              <span class="chip">{{ item.target_area }}</span>
+              <a class="pill-link" href="{{ item.target_href }}">open area</a>
+              <button type="button" class="secondary create-copilot-task" data-report-id="{{ selected_report.id }}" data-action-index="{{ item.index }}">
+                {{ 'task #' ~ item.task_id if item.task_id else 'create task' }}
+              </button>
+            </div>
+          </div>
+          <div class="status-line">{{ item.reason }}</div>
+        </div>
+        {% else %}
+        <p class="empty">No actions generated.</p>
+        {% endfor %}
+      </div>
+      <div class="subtle" id="copilot-task-status" style="margin-top: 12px;"></div>
+    </section>
+
+    <section class="grid cols-2" style="margin-top: 16px;">
+      <article class="card soft-card" style="padding: 14px;">
+        <h4>Supporting Signals</h4>
+        <ul>
+          {% for item in selected_report.payload.supporting_signals %}
+          <li>{{ item }}</li>
+          {% else %}
+          <li>No supporting signals listed.</li>
+          {% endfor %}
+        </ul>
+      </article>
+      <article class="card soft-card" style="padding: 14px;">
+        <h4>Risks</h4>
+        <ul>
+          {% for item in selected_report.payload.risks %}
+          <li>{{ item }}</li>
+          {% else %}
+          <li>No additional risks listed.</li>
+          {% endfor %}
+        </ul>
+      </article>
+    </section>
+    {% else %}
+    <p class="empty">Generate the first copilot report to get grounded root-cause analysis and owner actions.</p>
+    {% endif %}
+  </article>
+</section>
+
+{% if selected_report %}
+<script>
+  const copilotTaskStatus = document.getElementById("copilot-task-status");
+  document.querySelectorAll(".create-copilot-task").forEach((button) => {
+    button.addEventListener("click", async () => {
+      if (button.dataset.locked === "1") return;
+      button.dataset.locked = "1";
+      const response = await adminFetch(`/admin/{{ runtime.account.slug }}/copilot/reports/${button.dataset.reportId}/actions/${button.dataset.actionIndex}/task`, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({}),
+      });
+      button.dataset.locked = "0";
+      if (!response.ok) {
+        copilotTaskStatus.textContent = await response.text();
+        return;
+      }
+      const body = await response.json();
+      copilotTaskStatus.textContent = `Created task #${body.task.id}.`;
+      window.location.reload();
+    });
+  });
+</script>
+{% endif %}
+{% endblock %}

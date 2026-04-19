@@ -177,6 +177,7 @@ Telegram-бот продолжает жить как legacy adapter, а platform
 - stage 9.4: outbound delivery channels and notification transport
 - stage 9.5: payroll register, billing and document settlements workflow
 - stage 9.6: automatic messaging webhook ingestion
+- stage 9.7: grounded AI copilot and Obsidian-linked account analysis
 - stage 7.8: productization layer
 - stage 7.9: execution brief and account actions
 - stage 8.0: delivery layer and product polish
@@ -189,6 +190,7 @@ Telegram-бот продолжает жить как legacy adapter, а platform
 - communication batch import and notification dispatch outbox
 - messaging webhook ingestion for telegram and whatsapp into communication reviews
 - real notification transport for webhook plus configured delivery targets for telegram/email
+- grounded copilot reports with OpenAI Responses API support and heuristic fallback
 - execution check-ins and payroll payment register
 - billing document settlements and payroll register exports
 - integration layer with `integrations`, `integration_credentials`, `provider_tokens`, `sync_jobs`, `integration_logs`
@@ -204,7 +206,8 @@ Telegram-бот продолжает жить как legacy adapter, а platform
 - `generic_bank`: writes into canonical bank tables
 - `moysklad`: writes into canonical business tables
 - `avito`: writes into canonical ads/leads tables and affects dashboard + automation
-- `telegram`, `whatsapp`, `google_sheets`: contracts exist, runtime implementation is not done yet
+- `telegram`, `whatsapp`: webhook ingestion and outbound send foundation exist for messaging providers
+- `google_sheets`: contract exists, runtime implementation is not done yet
 
 ### Authoritative runtime DB
 
@@ -508,6 +511,26 @@ Stage 9.6 adds:
   - inbound messages are converted into `communication_reviews`
   - critical webhook reviews can auto-create follow-up tasks
   - integration `last_webhook_at` is updated on successful ingest
+
+Stage 9.7 adds:
+
+- grounded AI copilot surface:
+  - `GET /admin/{account_slug}/copilot`
+  - `POST /admin/{account_slug}/copilot/generate`
+  - `GET /admin/{account_slug}/copilot/reports/{report_id}.json`
+  - `POST /admin/{account_slug}/copilot/reports/{report_id}/actions/{action_index}/task`
+- persisted copilot reports:
+  - `copilot_reports`
+  - stored executive summary, root causes, recommended actions and risks
+- OpenAI integration contract:
+  - uses OpenAI Python SDK + Responses API when `PLATFORM_OPENAI_API_KEY` or `OPENAI_API_KEY` is configured
+  - falls back safely to grounded heuristic analysis when no key is configured or generation fails
+- Obsidian linkage:
+  - copilot reports export to `Accounts/<account_slug>/Copilot/...`
+  - export can be toggled per account in `Settings`
+- product linkage:
+  - copilot reports can create follow-up tasks directly
+  - copilot focus areas can be configured per account in `Settings`
 
 Stage 8.8 adds:
 
