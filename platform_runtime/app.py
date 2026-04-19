@@ -16,16 +16,45 @@ from starlette.datastructures import UploadFile
 from starlette.middleware.sessions import SessionMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from platform_core.models import Account, AccountUser, Alert, Customer, Deal, Employee, Goal, GoalTarget, KnowledgeItem, Role, RuntimeLease, Task, TaskEvent, User
+from platform_core.models import (
+    Account,
+    AccountUser,
+    Alert,
+    Customer,
+    Deal,
+    Document,
+    Employee,
+    Goal,
+    GoalTarget,
+    InstallationRequest,
+    KnowledgeItem,
+    Product,
+    Purchase,
+    Role,
+    RuntimeLease,
+    Task,
+    TaskEvent,
+    User,
+    Warehouse,
+)
 from platform_core.runtime_delivery import write_delivery_bundle
 from platform_core.runtime_obsidian import export_account_delivery_note, export_portfolio_brief_note
 from platform_core.exceptions import AuthorizationError, PlatformCoreError, TenantContextError
 from platform_core.runtime_status import read_runtime_status, write_runtime_status
-from platform_core.services import AuditLogService, EmployeeSnapshot, ExecutiveDashboardService, GOAL_METRIC_DEFINITIONS, GoalService, KnowledgeService, PeopleService
+from platform_core.services import (
+    AuditLogService,
+    EmployeeSnapshot,
+    ExecutiveDashboardService,
+    GOAL_METRIC_DEFINITIONS,
+    GoalService,
+    KnowledgeService,
+    OperationsService,
+    PeopleService,
+)
 from platform_core.services.accounts import AccountService, MembershipService, UserService
 from platform_core.services.user_security import UserSecurityService
 from platform_core.services.runtime import (
@@ -404,6 +433,8 @@ def create_app() -> FastAPI:
                 items.append({"key": "knowledge", "label": "Knowledge", "path": "knowledge"})
             if feature_access["people_execution"]["allowed"]:
                 items.append({"key": "people", "label": "People", "path": "people"})
+            if feature_access["operations_workflows"]["allowed"]:
+                items.append({"key": "operations", "label": "Operations", "path": "operations"})
             if feature_access["goals_tracking"]["allowed"]:
                 items.append({"key": "goals", "label": "Goals", "path": "goals"})
         if "alerts.read" in permissions or "tasks.read" in permissions or "*" in permissions:
@@ -973,6 +1004,7 @@ def create_app() -> FastAPI:
             {"key": "owner_briefs", "label": "Owner briefs", "description": "Portfolio briefs and digest blocks."},
             {"key": "knowledge_base", "label": "Knowledge base", "description": "Operational memory, files and SOP knowledge."},
             {"key": "people_execution", "label": "People execution", "description": "Employee registry, workload and KPI view."},
+            {"key": "operations_workflows", "label": "Operations workflows", "description": "Purchases, receiving, logistics requests and documents."},
             {"key": "goals_tracking", "label": "Goals tracking", "description": "Plan vs fact and goal workflows."},
             {"key": "integrations_setup", "label": "Integrations setup", "description": "Admin UI for integration setup and sync."},
             {"key": "ops_console", "label": "Ops console", "description": "Ops / Sync visibility and actions."},
@@ -983,25 +1015,25 @@ def create_app() -> FastAPI:
             "internal": {
                 "label": "Internal",
                 "summary": "Internal operator deployment with full platform surface for live business use.",
-                "recommended_features": {"portfolio_console", "owner_briefs", "knowledge_base", "people_execution", "goals_tracking", "integrations_setup", "ops_console"},
+                "recommended_features": {"portfolio_console", "owner_briefs", "knowledge_base", "people_execution", "operations_workflows", "goals_tracking", "integrations_setup", "ops_console"},
                 "usage_note": "Best fit for active internal operations and product validation.",
             },
             "pilot": {
                 "label": "Pilot",
                 "summary": "Small rollout for one operating team with core execution and onboarding flows.",
-                "recommended_features": {"owner_briefs", "knowledge_base", "people_execution", "goals_tracking", "integrations_setup", "ops_console"},
+                "recommended_features": {"owner_briefs", "knowledge_base", "people_execution", "operations_workflows", "goals_tracking", "integrations_setup", "ops_console"},
                 "usage_note": "Good for proving value before broad rollout.",
             },
             "growth": {
                 "label": "Growth",
                 "summary": "Multi-account owner workflow with portfolio visibility and delivery flows.",
-                "recommended_features": {"portfolio_console", "owner_briefs", "knowledge_base", "people_execution", "goals_tracking", "integrations_setup", "ops_console"},
+                "recommended_features": {"portfolio_console", "owner_briefs", "knowledge_base", "people_execution", "operations_workflows", "goals_tracking", "integrations_setup", "ops_console"},
                 "usage_note": "Designed for wider operational rollout.",
             },
             "enterprise": {
                 "label": "Enterprise",
                 "summary": "Highest readiness profile with all current product surfaces enabled.",
-                "recommended_features": {"portfolio_console", "owner_briefs", "knowledge_base", "people_execution", "goals_tracking", "integrations_setup", "ops_console"},
+                "recommended_features": {"portfolio_console", "owner_briefs", "knowledge_base", "people_execution", "operations_workflows", "goals_tracking", "integrations_setup", "ops_console"},
                 "usage_note": "Suitable for fully managed multi-account environments.",
             },
         }
@@ -1016,6 +1048,9 @@ def create_app() -> FastAPI:
             {"key": "active_goals", "label": "Active goals", "description": "Soft limit for active goals."},
             {"key": "active_knowledge_items", "label": "Knowledge items", "description": "Soft limit for active knowledge entries."},
             {"key": "active_employees", "label": "Active employees", "description": "Soft limit for active employee records."},
+            {"key": "active_documents", "label": "Active documents", "description": "Soft limit for active document records."},
+            {"key": "open_installation_requests", "label": "Open installation requests", "description": "Soft limit for open logistics / installation requests."},
+            {"key": "open_purchase_requests", "label": "Open purchase requests", "description": "Soft limit for requested purchases awaiting receiving."},
         ]
 
     def _default_account_settings() -> dict[str, object]:
@@ -1142,12 +1177,30 @@ def create_app() -> FastAPI:
         goals = GoalService(session).list_goals(TenantContext(account_id=account.id, actor_user_id=None, source="settings", is_system=True))
         knowledge_count = KnowledgeService(session).count_active_items(account.id)
         active_employees = PeopleService(session).count_active_employees(account.id)
+        documents_count = session.execute(
+            select(func.count()).select_from(Document).where(Document.account_id == account.id, Document.status != "archived")
+        ).scalar_one()
+        open_installations = session.execute(
+            select(func.count()).select_from(InstallationRequest).where(
+                InstallationRequest.account_id == account.id,
+                InstallationRequest.status.in_(["open", "scheduled"]),
+            )
+        ).scalar_one()
+        open_purchase_requests = session.execute(
+            select(func.count()).select_from(Purchase).where(
+                Purchase.account_id == account.id,
+                Purchase.status.in_(["draft", "requested", "ordered"]),
+            )
+        ).scalar_one()
         return {
             "active_memberships": sum(1 for item in memberships if item.status == "active"),
             "active_integrations": sum(1 for item in integrations if item.status != "archived"),
             "active_goals": sum(1 for item in goals if item.status != "archived"),
             "active_knowledge_items": knowledge_count,
             "active_employees": active_employees,
+            "active_documents": int(documents_count or 0),
+            "open_installation_requests": int(open_installations or 0),
+            "open_purchase_requests": int(open_purchase_requests or 0),
         }
 
     def _account_usage_rows(account: Account, session: Session) -> list[dict[str, object]]:
@@ -1196,6 +1249,14 @@ def create_app() -> FastAPI:
             next_steps.append({"label": "Load the first SOP or knowledge note", "href": f"/admin/{runtime.account.slug}/knowledge"})
         if PeopleService(session).count_active_employees(runtime.account.id) == 0:
             next_steps.append({"label": "Add the first employee and assign ownership", "href": f"/admin/{runtime.account.slug}/people"})
+        product_count = session.execute(
+            select(func.count()).select_from(Product).where(Product.account_id == runtime.account.id)
+        ).scalar_one()
+        warehouse_count = session.execute(
+            select(func.count()).select_from(Warehouse).where(Warehouse.account_id == runtime.account.id)
+        ).scalar_one()
+        if product_count == 0 or warehouse_count == 0:
+            next_steps.append({"label": "Set up the first product and warehouse", "href": f"/admin/{runtime.account.slug}/operations"})
         if len(onboarding["integration_rows"]) == 0:
             next_steps.append({"label": "Connect the first integration", "href": f"/admin/{runtime.account.slug}/integrations"})
         if onboarding["last_success"] is None and len(onboarding["integration_rows"]) > 0:
@@ -1598,6 +1659,15 @@ def create_app() -> FastAPI:
 
     def _employee_snapshot_map(runtime: ResolvedRuntimeContext, session: Session) -> dict[int, EmployeeSnapshot]:
         return {item.employee.id: item for item in PeopleService(session).employee_snapshots(runtime.context)}
+
+    def _document_type_options() -> list[str]:
+        return ["invoice", "claim", "purchase_order", "receipt", "internal_note"]
+
+    def _document_status_options() -> list[str]:
+        return ["draft", "issued", "sent", "paid", "archived"]
+
+    def _installation_status_options() -> list[str]:
+        return ["open", "scheduled", "done", "cancelled"]
 
     def _account_delivery_markdown(pack: dict[str, object]) -> str:
         account = pack["account"]
@@ -4201,6 +4271,340 @@ def create_app() -> FastAPI:
         session.flush()
         return JSONResponse({"task": _serialize_task(task)})
 
+    @app.get("/admin/{account_slug}/operations", response_class=HTMLResponse)
+    def admin_operations(
+        request: Request,
+        account_slug: str,
+        threshold_days: int = Query(default=30, ge=0),
+        session: Session = Depends(get_db_session),
+    ) -> HTMLResponse:
+        user = _current_session_user(session, request)
+        if user is None:
+            request.session.clear()
+            return _login_redirect(f"/admin/{account_slug}/operations")
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=user.email)
+        request.session["admin_account_slug"] = runtime.account.slug
+        ensure_permission(runtime, "business.read")
+        _ensure_account_feature(runtime, "operations_workflows", "Operations")
+        operations_service = OperationsService(session)
+        products = operations_service.list_products(runtime.context)
+        warehouses = operations_service.list_warehouses(runtime.context)
+        purchases = operations_service.list_purchases(runtime.context)
+        documents = operations_service.list_documents(runtime.context)
+        installation_requests = operations_service.list_installation_requests(runtime.context)
+        stagnant_threshold = threshold_days
+        stagnant_stock = operations_service.stagnant_stock(runtime.context, threshold_days=stagnant_threshold)
+        recent_customers = session.execute(
+            select(Customer)
+            .where(Customer.account_id == runtime.account.id)
+            .order_by(Customer.updated_at.desc(), Customer.id.desc())
+            .limit(50)
+        ).scalars().all()
+        recent_deals = session.execute(
+            select(Deal)
+            .where(Deal.account_id == runtime.account.id)
+            .order_by(Deal.updated_at.desc(), Deal.id.desc())
+            .limit(50)
+        ).scalars().all()
+        active_employees = session.execute(
+            select(Employee)
+            .where(Employee.account_id == runtime.account.id, Employee.status == "active")
+            .order_by(Employee.full_name.asc(), Employee.id.asc())
+        ).scalars().all()
+        customer_ids = {
+            item
+            for item in (
+                [purchase.supplier_customer_id for purchase in purchases]
+                + [document.customer_id for document in documents]
+                + [installation.customer_id for installation in installation_requests]
+            )
+            if item is not None
+        }
+        deal_ids = {
+            item
+            for item in (
+                [document.deal_id for document in documents]
+                + [installation.deal_id for installation in installation_requests]
+            )
+            if item is not None
+        }
+        employee_ids = {item.assigned_employee_id for item in installation_requests if item.assigned_employee_id is not None}
+        customer_lookup = {
+            item.id: item
+            for item in session.execute(
+                select(Customer).where(Customer.account_id == runtime.account.id, Customer.id.in_(customer_ids))
+            ).scalars().all()
+        } if customer_ids else {}
+        deal_lookup = {
+            item.id: item
+            for item in session.execute(
+                select(Deal).where(Deal.account_id == runtime.account.id, Deal.id.in_(deal_ids))
+            ).scalars().all()
+        } if deal_ids else {}
+        employee_lookup = {
+            item.id: item
+            for item in session.execute(
+                select(Employee).where(Employee.account_id == runtime.account.id, Employee.id.in_(employee_ids))
+            ).scalars().all()
+        } if employee_ids else {}
+        return templates.TemplateResponse(
+            request,
+            "admin/operations.html",
+            {
+                **_admin_context(request, session, runtime, page="operations"),
+                "products": products,
+                "warehouses": warehouses,
+                "purchases": purchases,
+                "documents": documents,
+                "installation_requests": installation_requests,
+                "stagnant_stock": stagnant_stock,
+                "stagnant_threshold_days": stagnant_threshold,
+                "recent_customers": recent_customers,
+                "recent_deals": recent_deals,
+                "active_employees": active_employees,
+                "customer_lookup": customer_lookup,
+                "deal_lookup": deal_lookup,
+                "employee_lookup": employee_lookup,
+                "document_type_options": _document_type_options(),
+                "document_status_options": _document_status_options(),
+                "can_manage_operations": _is_manager_role(runtime.role_code) or "*" in runtime.permissions or "business.write" in runtime.permissions,
+            },
+        )
+
+    @app.post("/admin/{account_slug}/operations/warehouse/save")
+    async def admin_save_warehouse(
+        request: Request,
+        account_slug: str,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        payload = await request.json()
+        actor_email = _require_admin_user(request, session).email
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
+        _require_account_manager(runtime)
+        ensure_permission(runtime, "business.write")
+        _ensure_account_feature(runtime, "operations_workflows", "Operations")
+        body = payload.get("warehouse") or {}
+        try:
+            warehouse = OperationsService(session).create_warehouse(
+                runtime.context,
+                code=str(body.get("code") or "").strip(),
+                name=str(body.get("name") or "").strip(),
+                location=str(body.get("location") or "").strip() or None,
+            )
+            AuditLogService(session).log(
+                runtime.context,
+                "operations.warehouse.created",
+                "warehouse",
+                str(warehouse.id),
+                details={"code": warehouse.code, "name": warehouse.name},
+            )
+        except (PlatformCoreError, TenantContextError, ValueError, IntegrityError) as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        return JSONResponse({"warehouse": _serialize_warehouse(warehouse)})
+
+    @app.post("/admin/{account_slug}/operations/product/save")
+    async def admin_save_product(
+        request: Request,
+        account_slug: str,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        payload = await request.json()
+        actor_email = _require_admin_user(request, session).email
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
+        _require_account_manager(runtime)
+        ensure_permission(runtime, "business.write")
+        _ensure_account_feature(runtime, "operations_workflows", "Operations")
+        body = payload.get("product") or {}
+        try:
+            product = OperationsService(session).create_product(
+                runtime.context,
+                sku=str(body.get("sku") or "").strip() or None,
+                name=str(body.get("name") or "").strip(),
+                unit=str(body.get("unit") or "").strip() or "pcs",
+                list_price=Decimal(str(body.get("list_price") or "0")),
+                cost_price=Decimal(str(body.get("cost_price") or "0")),
+                min_stock_level=Decimal(str(body.get("min_stock_level") or "0")),
+            )
+            AuditLogService(session).log(
+                runtime.context,
+                "operations.product.created",
+                "product",
+                str(product.id),
+                details={"sku": product.sku, "name": product.name},
+            )
+        except (PlatformCoreError, TenantContextError, ValueError, IntegrityError, ArithmeticError) as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        return JSONResponse({"product": _serialize_product(product)})
+
+    @app.post("/admin/{account_slug}/operations/purchases/save")
+    async def admin_save_purchase(
+        request: Request,
+        account_slug: str,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        payload = await request.json()
+        actor_email = _require_admin_user(request, session).email
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
+        ensure_permission(runtime, "business.write")
+        _ensure_account_feature(runtime, "operations_workflows", "Operations")
+        body = payload.get("purchase") or {}
+        try:
+            purchase = OperationsService(session).create_purchase_request(
+                runtime.context,
+                supplier_customer_id=int(body["supplier_customer_id"]) if body.get("supplier_customer_id") else None,
+                warehouse_id=int(body["warehouse_id"]) if body.get("warehouse_id") else None,
+                product_id=int(body["product_id"]),
+                quantity=Decimal(str(body.get("quantity") or "0")),
+                unit_cost=Decimal(str(body.get("unit_cost") or "0")),
+                notes=str(body.get("notes") or "").strip() or None,
+            )
+            AuditLogService(session).log(
+                runtime.context,
+                "operations.purchase.created",
+                "purchase",
+                str(purchase.id),
+                details={"purchase_number": purchase.purchase_number, "status": purchase.status},
+            )
+        except (PlatformCoreError, TenantContextError, ValueError, IntegrityError, ArithmeticError, KeyError) as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        return JSONResponse({"purchase": _serialize_purchase(purchase)})
+
+    @app.post("/admin/{account_slug}/operations/purchases/{purchase_id}/receive")
+    async def admin_receive_purchase(
+        request: Request,
+        account_slug: str,
+        purchase_id: int,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        actor_email = _require_admin_user(request, session).email
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
+        ensure_permission(runtime, "business.write")
+        _ensure_account_feature(runtime, "operations_workflows", "Operations")
+        try:
+            purchase = OperationsService(session).receive_purchase(runtime.context, purchase_id)
+            AuditLogService(session).log(
+                runtime.context,
+                "operations.purchase.received",
+                "purchase",
+                str(purchase.id),
+                details={"purchase_number": purchase.purchase_number, "status": purchase.status},
+            )
+        except (PlatformCoreError, TenantContextError) as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        return JSONResponse({"purchase": _serialize_purchase(purchase)})
+
+    @app.post("/admin/{account_slug}/operations/documents/save")
+    async def admin_save_document(
+        request: Request,
+        account_slug: str,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        payload = await request.json()
+        actor_email = _require_admin_user(request, session).email
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
+        ensure_permission(runtime, "documents.manage")
+        _ensure_account_feature(runtime, "operations_workflows", "Operations")
+        body = payload.get("document") or {}
+        issued_at_raw = str(body.get("issued_at") or "").strip()
+        issued_at = datetime.fromisoformat(issued_at_raw) if issued_at_raw else None
+        if issued_at is not None and issued_at.tzinfo is None:
+            issued_at = issued_at.replace(tzinfo=timezone.utc)
+        try:
+            document = OperationsService(session).create_document(
+                runtime.context,
+                document_type=str(body.get("document_type") or "invoice").strip() or "invoice",
+                document_number=str(body.get("document_number") or "").strip() or None,
+                customer_id=int(body["customer_id"]) if body.get("customer_id") else None,
+                deal_id=int(body["deal_id"]) if body.get("deal_id") else None,
+                status=str(body.get("status") or "draft").strip() or "draft",
+                issued_at=issued_at,
+                total_amount=Decimal(str(body.get("total_amount") or "0")),
+                summary=str(body.get("summary") or "").strip() or None,
+            )
+            AuditLogService(session).log(
+                runtime.context,
+                "operations.document.created",
+                "document",
+                str(document.id),
+                details={"document_type": document.document_type, "status": document.status},
+            )
+        except (PlatformCoreError, TenantContextError, ValueError, IntegrityError, ArithmeticError) as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        return JSONResponse({"document": _serialize_document(document)})
+
+    @app.post("/admin/{account_slug}/operations/installations/save")
+    async def admin_save_installation(
+        request: Request,
+        account_slug: str,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        payload = await request.json()
+        actor_email = _require_admin_user(request, session).email
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
+        ensure_permission(runtime, "business.write")
+        _ensure_account_feature(runtime, "operations_workflows", "Operations")
+        body = payload.get("installation") or {}
+        scheduled_for_raw = str(body.get("scheduled_for") or "").strip()
+        scheduled_for = datetime.fromisoformat(scheduled_for_raw) if scheduled_for_raw else None
+        if scheduled_for is not None and scheduled_for.tzinfo is None:
+            scheduled_for = scheduled_for.replace(tzinfo=timezone.utc)
+        try:
+            installation = OperationsService(session).create_installation_request(
+                runtime.context,
+                customer_id=int(body["customer_id"]) if body.get("customer_id") else None,
+                deal_id=int(body["deal_id"]) if body.get("deal_id") else None,
+                assigned_employee_id=int(body["assigned_employee_id"]) if body.get("assigned_employee_id") else None,
+                title=str(body.get("title") or "").strip(),
+                address=str(body.get("address") or "").strip() or None,
+                scheduled_for=scheduled_for,
+                notes=str(body.get("notes") or "").strip() or None,
+            )
+            created_task = None
+            if installation.assigned_employee_id is not None:
+                employee = PeopleService(session).get_employee(runtime.context, installation.assigned_employee_id)
+                created_task = Task(
+                    account_id=runtime.account.id,
+                    assignee_user_id=employee.user_id,
+                    assignee_employee_id=employee.id,
+                    created_by_user_id=runtime.actor_user.id,
+                    source="operations",
+                    title=f"Installation: {installation.title}",
+                    description=installation.address or str((installation.notes_json or {}).get("notes") or "") or None,
+                    status="open",
+                    priority="high",
+                    due_at=installation.scheduled_for,
+                    related_entity_type="installation_request",
+                    related_entity_id=str(installation.id),
+                )
+                session.add(created_task)
+                session.flush()
+                session.add(
+                    TaskEvent(
+                        account_id=runtime.account.id,
+                        task_id=created_task.id,
+                        actor_user_id=runtime.actor_user.id,
+                        event_type="task.created_from_operations_ui",
+                        event_at=datetime.now(timezone.utc),
+                        payload_json={"installation_request_id": installation.id, "assigned_employee_id": employee.id},
+                    )
+                )
+            AuditLogService(session).log(
+                runtime.context,
+                "operations.installation.created",
+                "installation_request",
+                str(installation.id),
+                details={"status": installation.status, "assigned_employee_id": installation.assigned_employee_id, "task_id": created_task.id if created_task else None},
+            )
+        except (PlatformCoreError, TenantContextError, ValueError, IntegrityError) as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        return JSONResponse({"installation_request": _serialize_installation_request(installation), "task": _serialize_task(created_task) if created_task else None})
+
     @app.get("/admin/{account_slug}/alerts-tasks", response_class=HTMLResponse)
     def admin_alerts_tasks(
         request: Request,
@@ -5083,6 +5487,89 @@ def _serialize_alert(alert) -> dict[str, object]:
         "related_entity_type": alert.related_entity_type,
         "related_entity_id": alert.related_entity_id,
         "last_detected_at": _serialize_datetime(alert.last_detected_at),
+    }
+
+
+def _serialize_warehouse(warehouse: Warehouse) -> dict[str, object]:
+    return {
+        "id": warehouse.id,
+        "account_id": warehouse.account_id,
+        "code": warehouse.code,
+        "name": warehouse.name,
+        "status": warehouse.status,
+        "location": warehouse.location,
+        "created_at": _serialize_datetime(warehouse.created_at),
+        "updated_at": _serialize_datetime(warehouse.updated_at),
+    }
+
+
+def _serialize_product(product: Product) -> dict[str, object]:
+    return {
+        "id": product.id,
+        "account_id": product.account_id,
+        "sku": product.sku,
+        "name": product.name,
+        "unit": product.unit,
+        "status": product.status,
+        "list_price": str(product.list_price),
+        "cost_price": str(product.cost_price),
+        "min_stock_level": str(product.min_stock_level),
+        "created_at": _serialize_datetime(product.created_at),
+        "updated_at": _serialize_datetime(product.updated_at),
+    }
+
+
+def _serialize_purchase(purchase: Purchase) -> dict[str, object]:
+    return {
+        "id": purchase.id,
+        "account_id": purchase.account_id,
+        "supplier_customer_id": purchase.supplier_customer_id,
+        "warehouse_id": purchase.warehouse_id,
+        "purchase_number": purchase.purchase_number,
+        "status": purchase.status,
+        "ordered_at": _serialize_datetime(purchase.ordered_at),
+        "received_at": _serialize_datetime(purchase.received_at),
+        "currency": purchase.currency,
+        "total_amount": str(purchase.total_amount),
+        "notes_json": purchase.notes_json or {},
+        "created_at": _serialize_datetime(purchase.created_at),
+        "updated_at": _serialize_datetime(purchase.updated_at),
+    }
+
+
+def _serialize_document(document: Document) -> dict[str, object]:
+    return {
+        "id": document.id,
+        "account_id": document.account_id,
+        "customer_id": document.customer_id,
+        "deal_id": document.deal_id,
+        "document_type": document.document_type,
+        "document_number": document.document_number,
+        "status": document.status,
+        "issued_at": _serialize_datetime(document.issued_at),
+        "total_amount": str(document.total_amount),
+        "currency": document.currency,
+        "snapshot_json": document.snapshot_json or {},
+        "created_at": _serialize_datetime(document.created_at),
+        "updated_at": _serialize_datetime(document.updated_at),
+    }
+
+
+def _serialize_installation_request(request_item: InstallationRequest) -> dict[str, object]:
+    return {
+        "id": request_item.id,
+        "account_id": request_item.account_id,
+        "customer_id": request_item.customer_id,
+        "deal_id": request_item.deal_id,
+        "assigned_employee_id": request_item.assigned_employee_id,
+        "request_number": request_item.request_number,
+        "title": request_item.title,
+        "status": request_item.status,
+        "address": request_item.address,
+        "scheduled_for": _serialize_datetime(request_item.scheduled_for),
+        "notes_json": request_item.notes_json or {},
+        "created_at": _serialize_datetime(request_item.created_at),
+        "updated_at": _serialize_datetime(request_item.updated_at),
     }
 
 

@@ -165,6 +165,9 @@ Telegram-бот продолжает жить как legacy adapter, а platform
 - stage 6: executive dashboard query layer
 - stage 6.5: runtime surface + scheduler foundation
 - provider hardening foundation
+- stage 8.5: knowledge base and document intake foundation
+- stage 8.6: people execution and KPI foundation
+- stage 8.7: procurement, logistics and documents foundation
 - stage 7.8: productization layer
 - stage 7.9: execution brief and account actions
 - stage 8.0: delivery layer and product polish
@@ -407,6 +410,29 @@ Stage 8.6 adds:
   - `people_execution` feature flag
   - `active_employees` soft-limit visibility
   - readiness hint when the account has no employees configured
+
+Stage 8.7 adds:
+
+- account-scoped operations page:
+  - `GET /admin/{account_slug}/operations`
+  - `POST /admin/{account_slug}/operations/warehouse/save`
+  - `POST /admin/{account_slug}/operations/product/save`
+  - `POST /admin/{account_slug}/operations/purchases/save`
+  - `POST /admin/{account_slug}/operations/purchases/{purchase_id}/receive`
+  - `POST /admin/{account_slug}/operations/documents/save`
+  - `POST /admin/{account_slug}/operations/installations/save`
+- minimal procurement and logistics foundation:
+  - warehouse setup
+  - product setup
+  - purchase requests
+  - stock receiving into canonical `stock_items` and `stock_movements`
+  - installation requests
+  - stagnant stock visibility
+- document workflow foundation on top of canonical `documents`
+- product-layer integration:
+  - `operations_workflows` feature flag
+  - `active_documents`, `open_installation_requests`, `open_purchase_requests` soft-limit visibility
+  - readiness hint when the account has no product/warehouse setup
 
 Stage 8.1 adds:
 

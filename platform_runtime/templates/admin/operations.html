@@ -1,0 +1,510 @@
+{% extends "admin/base.html" %}
+{% block content %}
+<div class="topbar">
+  <div>
+    <h2>Operations</h2>
+    <p class="subtle">Procurement, receiving, installation requests, documents and stagnant stock in one operational surface.</p>
+  </div>
+  <div class="chips">
+    <span class="chip">{{ products|length }} products</span>
+    <span class="chip">{{ warehouses|length }} warehouses</span>
+    <span class="chip">{{ purchases|length }} purchases</span>
+    <a class="pill-link" href="/admin/{{ runtime.account.slug }}/delivery">delivery pack</a>
+  </div>
+</div>
+
+{% if not products or not warehouses %}
+<section class="notice" style="margin-bottom: 16px;">
+  Operations setup is not complete yet. Next step: create the first warehouse and stock product, then start purchase receiving and installation flows from this page.
+</section>
+{% endif %}
+
+<section class="grid cols-2 integrations-layout">
+  <article class="card">
+    <div class="actions" style="justify-content: space-between;">
+      <div>
+        <h3>Setup Helpers</h3>
+        <p class="subtle">Minimal helpers to make procurement and receiving usable without direct database work.</p>
+      </div>
+      <div class="actions">
+        <a class="pill-link" href="/admin/{{ runtime.account.slug }}/people">people</a>
+        <a class="pill-link" href="/admin/{{ runtime.account.slug }}/goals">goals</a>
+      </div>
+    </div>
+
+    {% if can_manage_operations %}
+    <section class="card soft-card" style="margin-top: 14px; padding: 14px;">
+      <h4>Create Warehouse</h4>
+      <div class="form-grid two" style="margin-top: 12px;">
+        <label>Code<input id="warehouse-code" placeholder="main"></label>
+        <label>Name<input id="warehouse-name" placeholder="Main warehouse"></label>
+        <label style="grid-column: 1 / span 2;">Location<input id="warehouse-location" placeholder="Moscow, central storage"></label>
+      </div>
+      <div class="actions" style="margin-top: 14px;">
+        <button type="button" id="save-warehouse">Create warehouse</button>
+        <span class="subtle" id="warehouse-status"></span>
+      </div>
+    </section>
+
+    <section class="card soft-card" style="margin-top: 14px; padding: 14px;">
+      <h4>Create Product</h4>
+      <div class="form-grid two" style="margin-top: 12px;">
+        <label>SKU<input id="product-sku" placeholder="hermes-kit-01"></label>
+        <label>Name<input id="product-name" placeholder="Hermes mounting kit"></label>
+        <label>Unit<input id="product-unit" value="pcs"></label>
+        <label>Min stock<input id="product-min-stock-level" type="number" step="0.01" value="0"></label>
+        <label>List price<input id="product-list-price" type="number" step="0.01" value="0"></label>
+        <label>Cost price<input id="product-cost-price" type="number" step="0.01" value="0"></label>
+      </div>
+      <div class="actions" style="margin-top: 14px;">
+        <button type="button" id="save-product">Create product</button>
+        <span class="subtle" id="product-status"></span>
+      </div>
+    </section>
+    {% else %}
+    <section class="notice" style="margin-top: 14px;">Read-only mode. Only account managers can change operations setup.</section>
+    {% endif %}
+
+    <section class="card soft-card" style="margin-top: 16px; padding: 0;">
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Warehouse</th><th>Location</th><th>Status</th></tr></thead>
+          <tbody>
+            {% for warehouse in warehouses %}
+            <tr>
+              <td><strong>{{ warehouse.name }}</strong><div class="status-line">{{ warehouse.code }}</div></td>
+              <td>{{ warehouse.location or "—" }}</td>
+              <td>{{ warehouse.status }}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="3" class="empty">No warehouses yet.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="card soft-card" style="margin-top: 16px; padding: 0;">
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Product</th><th>SKU</th><th>Cost</th><th>Min stock</th></tr></thead>
+          <tbody>
+            {% for product in products %}
+            <tr>
+              <td><strong>{{ product.name }}</strong></td>
+              <td>{{ product.sku or "—" }}</td>
+              <td>{{ product.cost_price }}</td>
+              <td>{{ product.min_stock_level }}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="4" class="empty">No products yet.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </article>
+
+  <article class="card">
+    <div class="actions" style="justify-content: space-between;">
+      <div>
+        <h3>Procurement and Receiving</h3>
+        <p class="subtle">Create purchase requests, then receive stock into the selected warehouse.</p>
+      </div>
+      <span class="badge">{{ purchases|length }} requests</span>
+    </div>
+
+    {% if can_manage_operations %}
+    <section class="card soft-card" style="margin-top: 14px; padding: 14px;">
+      <div class="form-grid two">
+        <label>
+          Product
+          <select id="purchase-product-id">
+            <option value="">—</option>
+            {% for product in products %}
+            <option value="{{ product.id }}">{{ product.name }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>
+          Warehouse
+          <select id="purchase-warehouse-id">
+            <option value="">—</option>
+            {% for warehouse in warehouses %}
+            <option value="{{ warehouse.id }}">{{ warehouse.name }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>
+          Supplier
+          <select id="purchase-supplier-customer-id">
+            <option value="">—</option>
+            {% for customer in recent_customers %}
+            <option value="{{ customer.id }}">{{ customer.name }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>Quantity<input id="purchase-quantity" type="number" step="0.01" value="1"></label>
+        <label>Unit cost<input id="purchase-unit-cost" type="number" step="0.01" value="0"></label>
+        <label style="grid-column: 1 / span 2;">Notes<textarea id="purchase-notes" rows="3" placeholder="Supplier ETA, packaging note, owner approval context."></textarea></label>
+      </div>
+      <div class="actions" style="margin-top: 14px;">
+        <button type="button" id="save-purchase">Create purchase request</button>
+        <span class="subtle" id="purchase-status"></span>
+      </div>
+    </section>
+    {% endif %}
+
+    <section class="card soft-card" style="margin-top: 16px; padding: 0;">
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Request</th><th>Status</th><th>Warehouse</th><th>Total</th><th></th></tr></thead>
+          <tbody>
+            {% for purchase in purchases %}
+            {% set supplier = customer_lookup.get(purchase.supplier_customer_id) %}
+            <tr>
+              <td>
+                <strong>{{ purchase.purchase_number or ("purchase-" ~ purchase.id) }}</strong>
+                <div class="status-line">{{ supplier.name if supplier else "supplier not linked" }}</div>
+              </td>
+              <td>{{ purchase.status }}</td>
+              <td>
+                {% set warehouse = (warehouses | selectattr('id', 'equalto', purchase.warehouse_id) | list | first) %}
+                {{ warehouse.name if warehouse else "—" }}
+              </td>
+              <td>{{ purchase.total_amount }} {{ purchase.currency }}</td>
+              <td>
+                {% if purchase.status != 'received' and can_manage_operations %}
+                <button type="button" class="secondary receive-purchase" data-purchase-id="{{ purchase.id }}">Receive</button>
+                {% else %}
+                <span class="status-line">{{ purchase.received_at or "received" }}</span>
+                {% endif %}
+              </td>
+            </tr>
+            {% else %}
+            <tr><td colspan="5" class="empty">No purchase requests yet.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </article>
+</section>
+
+<section class="grid cols-2 integrations-layout" style="margin-top: 16px;">
+  <article class="card">
+    <div class="actions" style="justify-content: space-between;">
+      <div>
+        <h3>Documents</h3>
+        <p class="subtle">Issue invoices, claims or operational documents and keep them account-scoped.</p>
+      </div>
+      <span class="badge">{{ documents|length }} docs</span>
+    </div>
+
+    {% if can_manage_operations %}
+    <section class="card soft-card" style="margin-top: 14px; padding: 14px;">
+      <div class="form-grid two">
+        <label>
+          Document type
+          <select id="document-type">
+            {% for option in document_type_options %}
+            <option value="{{ option }}">{{ option }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>Document number<input id="document-number" placeholder="INV-2026-001"></label>
+        <label>
+          Customer
+          <select id="document-customer-id">
+            <option value="">—</option>
+            {% for customer in recent_customers %}
+            <option value="{{ customer.id }}">{{ customer.name }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>
+          Deal
+          <select id="document-deal-id">
+            <option value="">—</option>
+            {% for deal in recent_deals %}
+            <option value="{{ deal.id }}">{{ deal.title }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>
+          Status
+          <select id="document-status">
+            {% for option in document_status_options %}
+            <option value="{{ option }}">{{ option }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>Issued at (UTC ISO)<input id="document-issued-at" placeholder="2026-04-19T09:00:00+00:00"></label>
+        <label>Total amount<input id="document-total-amount" type="number" step="0.01" value="0"></label>
+        <label style="grid-column: 1 / span 2;">Summary<textarea id="document-summary" rows="3" placeholder="Why this document exists, what it covers, what to do next."></textarea></label>
+      </div>
+      <div class="actions" style="margin-top: 14px;">
+        <button type="button" id="save-document">Create document</button>
+        <span class="subtle" id="document-status-line"></span>
+      </div>
+    </section>
+    {% endif %}
+
+    <section class="card soft-card" style="margin-top: 16px; padding: 0;">
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Document</th><th>Status</th><th>Customer</th><th>Total</th></tr></thead>
+          <tbody>
+            {% for document in documents %}
+            <tr>
+              <td><strong>{{ document.document_number or (document.document_type ~ "-" ~ document.id) }}</strong><div class="status-line">{{ document.document_type }}</div></td>
+              <td>{{ document.status }}</td>
+              <td>{{ customer_lookup.get(document.customer_id).name if document.customer_id in customer_lookup else "—" }}</td>
+              <td>{{ document.total_amount }} {{ document.currency }}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="4" class="empty">No documents yet.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </article>
+
+  <article class="card">
+    <div class="actions" style="justify-content: space-between;">
+      <div>
+        <h3>Installations and Logistics</h3>
+        <p class="subtle">Create installation requests, assign the responsible employee and keep field work visible.</p>
+      </div>
+      <span class="badge">{{ installation_requests|length }} requests</span>
+    </div>
+
+    {% if can_manage_operations %}
+    <section class="card soft-card" style="margin-top: 14px; padding: 14px;">
+      <div class="form-grid two">
+        <label>Title<input id="installation-title" placeholder="Install kitchen rack at client site"></label>
+        <label>Scheduled for (UTC ISO)<input id="installation-scheduled-for" placeholder="2026-04-20T11:00:00+00:00"></label>
+        <label>
+          Customer
+          <select id="installation-customer-id">
+            <option value="">—</option>
+            {% for customer in recent_customers %}
+            <option value="{{ customer.id }}">{{ customer.name }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>
+          Assigned employee
+          <select id="installation-assigned-employee-id">
+            <option value="">—</option>
+            {% for employee in active_employees %}
+            <option value="{{ employee.id }}">{{ employee.full_name }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>
+          Deal
+          <select id="installation-deal-id">
+            <option value="">—</option>
+            {% for deal in recent_deals %}
+            <option value="{{ deal.id }}">{{ deal.title }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>Address<input id="installation-address" placeholder="Client location"></label>
+        <label style="grid-column: 1 / span 2;">Notes<textarea id="installation-notes" rows="3" placeholder="Access rules, tools needed, escalation notes."></textarea></label>
+      </div>
+      <div class="actions" style="margin-top: 14px;">
+        <button type="button" id="save-installation">Create installation request</button>
+        <span class="subtle" id="installation-status-line"></span>
+      </div>
+    </section>
+    {% endif %}
+
+    <section class="card soft-card" style="margin-top: 16px; padding: 0;">
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Request</th><th>Status</th><th>Assignee</th><th>Schedule</th></tr></thead>
+          <tbody>
+            {% for request_item in installation_requests %}
+            {% set assignee = employee_lookup.get(request_item.assigned_employee_id) %}
+            <tr>
+              <td><strong>{{ request_item.request_number or ("inst-" ~ request_item.id) }}</strong><div class="status-line">{{ request_item.title }}</div></td>
+              <td>{{ request_item.status }}</td>
+              <td>{{ assignee.full_name if assignee else "—" }}</td>
+              <td>{{ request_item.scheduled_for or "—" }}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="4" class="empty">No installation requests yet.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </article>
+</section>
+
+<section class="card" style="margin-top: 16px;">
+  <div class="actions" style="justify-content: space-between;">
+    <div>
+      <h3>Stagnant Stock</h3>
+      <p class="subtle">Items with positive stock and weak movement rhythm. Use a smaller threshold during rollout if you want a stricter signal.</p>
+    </div>
+    <div class="chips">
+      <span class="chip">threshold {{ stagnant_threshold_days }}d</span>
+      <a class="pill-link" href="/admin/{{ runtime.account.slug }}/operations?threshold_days=0">strict now</a>
+      <a class="pill-link" href="/admin/{{ runtime.account.slug }}/operations?threshold_days=30">30d</a>
+    </div>
+  </div>
+  <div class="table-wrap" style="margin-top: 14px;">
+    <table>
+      <thead><tr><th>Product</th><th>Warehouse</th><th>On hand</th><th>Days since movement</th><th>Status</th></tr></thead>
+      <tbody>
+        {% for row in stagnant_stock %}
+        <tr>
+          <td>{{ row.product.name }}</td>
+          <td>{{ row.warehouse.name }}</td>
+          <td>{{ row.stock_item.quantity_on_hand }}</td>
+          <td>{{ row.days_since_movement if row.days_since_movement is not none else "unknown" }}</td>
+          <td><span class="badge {{ 'bad' if row.status == 'critical' else 'warn' }}">{{ row.status }}</span></td>
+        </tr>
+        {% else %}
+        <tr><td colspan="5" class="empty">No stagnant stock signal at the selected threshold.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<script>
+  async function postOperationsJson(path, payload, statusNodeId, successMessage, redirectPath = "") {
+    const statusNode = document.getElementById(statusNodeId);
+    if (statusNode) statusNode.textContent = "Saving...";
+    const response = await adminFetch(path, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(payload),
+    });
+    if (!response.ok) {
+      if (statusNode) statusNode.textContent = await response.text();
+      return null;
+    }
+    const body = await response.json();
+    if (statusNode) statusNode.textContent = successMessage(body);
+    if (redirectPath) {
+      window.location.href = redirectPath;
+    } else {
+      window.location.reload();
+    }
+    return body;
+  }
+
+  const saveWarehouseButton = document.getElementById("save-warehouse");
+  if (saveWarehouseButton) {
+    saveWarehouseButton.addEventListener("click", async () => {
+      await postOperationsJson(
+        `/admin/{{ runtime.account.slug }}/operations/warehouse/save`,
+        {warehouse: {
+          code: document.getElementById("warehouse-code").value.trim(),
+          name: document.getElementById("warehouse-name").value.trim(),
+          location: document.getElementById("warehouse-location").value.trim() || null,
+        }},
+        "warehouse-status",
+        (body) => `Saved warehouse #${body.warehouse.id}`
+      );
+    });
+  }
+
+  const saveProductButton = document.getElementById("save-product");
+  if (saveProductButton) {
+    saveProductButton.addEventListener("click", async () => {
+      await postOperationsJson(
+        `/admin/{{ runtime.account.slug }}/operations/product/save`,
+        {product: {
+          sku: document.getElementById("product-sku").value.trim() || null,
+          name: document.getElementById("product-name").value.trim(),
+          unit: document.getElementById("product-unit").value.trim() || "pcs",
+          min_stock_level: document.getElementById("product-min-stock-level").value || 0,
+          list_price: document.getElementById("product-list-price").value || 0,
+          cost_price: document.getElementById("product-cost-price").value || 0,
+        }},
+        "product-status",
+        (body) => `Saved product #${body.product.id}`
+      );
+    });
+  }
+
+  const savePurchaseButton = document.getElementById("save-purchase");
+  if (savePurchaseButton) {
+    savePurchaseButton.addEventListener("click", async () => {
+      await postOperationsJson(
+        `/admin/{{ runtime.account.slug }}/operations/purchases/save`,
+        {purchase: {
+          product_id: document.getElementById("purchase-product-id").value,
+          warehouse_id: document.getElementById("purchase-warehouse-id").value || null,
+          supplier_customer_id: document.getElementById("purchase-supplier-customer-id").value || null,
+          quantity: document.getElementById("purchase-quantity").value || 0,
+          unit_cost: document.getElementById("purchase-unit-cost").value || 0,
+          notes: document.getElementById("purchase-notes").value.trim() || null,
+        }},
+        "purchase-status",
+        (body) => `Saved purchase #${body.purchase.id}`
+      );
+    });
+  }
+
+  document.querySelectorAll(".receive-purchase").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const purchaseId = button.dataset.purchaseId;
+      await postOperationsJson(
+        `/admin/{{ runtime.account.slug }}/operations/purchases/${purchaseId}/receive`,
+        {},
+        "purchase-status",
+        (body) => `Received purchase #${body.purchase.id}`
+      );
+    });
+  });
+
+  const saveDocumentButton = document.getElementById("save-document");
+  if (saveDocumentButton) {
+    saveDocumentButton.addEventListener("click", async () => {
+      await postOperationsJson(
+        `/admin/{{ runtime.account.slug }}/operations/documents/save`,
+        {document: {
+          document_type: document.getElementById("document-type").value,
+          document_number: document.getElementById("document-number").value.trim() || null,
+          customer_id: document.getElementById("document-customer-id").value || null,
+          deal_id: document.getElementById("document-deal-id").value || null,
+          status: document.getElementById("document-status").value,
+          issued_at: document.getElementById("document-issued-at").value.trim() || null,
+          total_amount: document.getElementById("document-total-amount").value || 0,
+          summary: document.getElementById("document-summary").value.trim() || null,
+        }},
+        "document-status-line",
+        (body) => `Saved document #${body.document.id}`
+      );
+    });
+  }
+
+  const saveInstallationButton = document.getElementById("save-installation");
+  if (saveInstallationButton) {
+    saveInstallationButton.addEventListener("click", async () => {
+      await postOperationsJson(
+        `/admin/{{ runtime.account.slug }}/operations/installations/save`,
+        {installation: {
+          title: document.getElementById("installation-title").value.trim(),
+          scheduled_for: document.getElementById("installation-scheduled-for").value.trim() || null,
+          customer_id: document.getElementById("installation-customer-id").value || null,
+          deal_id: document.getElementById("installation-deal-id").value || null,
+          assigned_employee_id: document.getElementById("installation-assigned-employee-id").value || null,
+          address: document.getElementById("installation-address").value.trim() || null,
+          notes: document.getElementById("installation-notes").value.trim() || null,
+        }},
+        "installation-status-line",
+        (body) => `Saved installation request #${body.installation_request.id}`
+      );
+    });
+  }
+</script>
+{% endblock %}

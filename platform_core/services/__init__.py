@@ -9,6 +9,7 @@ from platform_core.services.credentials import CredentialCrypto, CredentialCrypt
 from platform_core.services.dashboard import DashboardCatalogService, ExecutiveDashboardService
 from platform_core.services.goals import GOAL_METRIC_DEFINITIONS, GoalMetricDefinition, GoalService
 from platform_core.services.knowledge import KnowledgeService
+from platform_core.services.operations import OperationsService, StagnantStockRow
 from platform_core.services.people import EmployeeSnapshot, PeopleService
 from platform_core.services.user_security import AuthResult, PasswordHasher, UserSecurityService
 from platform_core.services.runtime import (
@@ -41,6 +42,8 @@ __all__ = [
     "GoalMetricDefinition",
     "GoalService",
     "KnowledgeService",
+    "OperationsService",
+    "StagnantStockRow",
     "EmployeeSnapshot",
     "PeopleService",
     "AuthResult",

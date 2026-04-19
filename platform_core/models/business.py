@@ -459,6 +459,26 @@ class Document(Base, AccountScopedMixin, TimestampMixin):
     snapshot_json: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False, default=dict)
 
 
+class InstallationRequest(Base, AccountScopedMixin, TimestampMixin):
+    __tablename__ = "installation_requests"
+    __table_args__ = (
+        Index("ix_installation_requests_account_status_scheduled_for", "account_id", "status", "scheduled_for"),
+        Index("ix_installation_requests_account_customer_created_at", "account_id", "customer_id", "created_at"),
+        Index("ix_installation_requests_account_deal_created_at", "account_id", "deal_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    customer_id: Mapped[int | None] = mapped_column(ForeignKey("customers.id", ondelete="SET NULL"), nullable=True)
+    deal_id: Mapped[int | None] = mapped_column(ForeignKey("deals.id", ondelete="SET NULL"), nullable=True)
+    assigned_employee_id: Mapped[int | None] = mapped_column(ForeignKey("employees.id", ondelete="SET NULL"), nullable=True)
+    request_number: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="open")
+    address: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    scheduled_for: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    notes_json: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False, default=dict)
+
+
 class KnowledgeItem(Base, AccountScopedMixin, TimestampMixin):
     __tablename__ = "knowledge_items"
     __table_args__ = (
