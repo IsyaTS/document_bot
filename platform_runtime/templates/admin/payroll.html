@@ -165,6 +165,8 @@
         <button type="button" id="approve-payroll" class="ghost">Approve</button>
         <button type="button" id="pay-payroll" class="ghost">Mark paid</button>
         {% endif %}
+        <a class="pill-link" href="/admin/{{ runtime.account.slug }}/payroll/periods/{{ selected_period.id }}/register.txt">register txt</a>
+        <a class="pill-link" href="/admin/{{ runtime.account.slug }}/payroll/periods/{{ selected_period.id }}/register.json">register json</a>
       </div>
     </div>
     <div class="table-wrap" style="margin-top: 14px;">

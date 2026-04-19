@@ -464,6 +464,26 @@ class Document(Base, AccountScopedMixin, TimestampMixin):
     snapshot_json: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False, default=dict)
 
 
+class DocumentSettlement(Base, AccountScopedMixin, TimestampMixin):
+    __tablename__ = "document_settlements"
+    __table_args__ = (
+        Index("ix_document_settlements_account_document_settlement_date", "account_id", "document_id", "settlement_date"),
+        Index("ix_document_settlements_account_type_settlement_date", "account_id", "settlement_type", "settlement_date"),
+        Index("ix_document_settlements_account_status_created_at", "account_id", "status", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    document_id: Mapped[int] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"), nullable=False)
+    recorded_by_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    settlement_type: Mapped[str] = mapped_column(String(32), nullable=False, default="payment")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="recorded")
+    settlement_date: Mapped[date] = mapped_column(Date, nullable=False)
+    amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
+    currency: Mapped[str] = mapped_column(String(8), nullable=False, default="RUB")
+    reference: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    notes_json: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False, default=dict)
+
+
 class InstallationRequest(Base, AccountScopedMixin, TimestampMixin):
     __tablename__ = "installation_requests"
     __table_args__ = (

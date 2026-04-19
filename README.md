@@ -175,6 +175,7 @@ Telegram-бот продолжает жить как legacy adapter, а platform
 - stage 9.2: execution discipline and payroll payments foundation
 - stage 9.3: procurement, logistics and document workflows
 - stage 9.4: outbound delivery channels and notification transport
+- stage 9.5: payroll register, billing and document settlements workflow
 - stage 7.8: productization layer
 - stage 7.9: execution brief and account actions
 - stage 8.0: delivery layer and product polish
@@ -187,6 +188,7 @@ Telegram-бот продолжает жить как legacy adapter, а platform
 - communication batch import and notification dispatch outbox
 - real notification transport for webhook plus configured delivery targets for telegram/email
 - execution check-ins and payroll payment register
+- billing document settlements and payroll register exports
 - integration layer with `integrations`, `integration_credentials`, `provider_tokens`, `sync_jobs`, `integration_logs`
 - runtime API in `platform_runtime/app.py`
 - scheduler/worker loop in `platform_runtime/worker.py`
@@ -474,6 +476,22 @@ Stage 9.4 adds:
 - notification dispatches now record transport result payloads and delivery errors instead of artifact-only status
 - Obsidian notes for notification dispatches:
   - `Accounts/<account>/Notifications/...`
+
+Stage 9.5 adds:
+
+- account-scoped billing page:
+  - `GET /admin/{account_slug}/billing`
+  - `POST /admin/{account_slug}/billing/documents/save`
+  - `POST /admin/{account_slug}/billing/documents/{document_id}/settlements/save`
+  - `GET /admin/{account_slug}/billing/documents/{document_id}/preview.{txt|md|pdf}`
+- billing workflow hardening:
+  - invoice and claim creation with due date / template metadata
+  - document settlement register for payments, resolutions and write-offs
+  - document status updates driven by settlement results
+- payroll workflow hardening:
+  - `GET /admin/{account_slug}/payroll/periods/{payroll_period_id}/register.{txt|json}`
+  - payout register export for payroll periods
+- PDF preview support for operations / billing document previews
 
 Stage 8.8 adds:
 

@@ -5,6 +5,7 @@ from platform_core.services.automation import RuleCatalogService, RuleEngineServ
 from platform_core.services.audit import AuditLogService
 from platform_core.services.authz import AuthorizationService
 from platform_core.services.bootstrap import BootstrapResult, CoreBootstrapService
+from platform_core.services.billing import BillingService, PayrollRegisterSnapshot
 from platform_core.services.business_os import BusinessOSService, InventoryInsight
 from platform_core.services.communications import CommunicationAnalysis, CommunicationService
 from platform_core.services.credentials import CredentialCrypto, CredentialCryptoError
@@ -37,6 +38,7 @@ __all__ = [
     "AuditLogService",
     "AuthorizationService",
     "BootstrapResult",
+    "BillingService",
     "BusinessOSService",
     "CommunicationAnalysis",
     "CommunicationService",
@@ -62,6 +64,7 @@ __all__ = [
     "AuthResult",
     "AdminQueryService",
     "PasswordHasher",
+    "PayrollRegisterSnapshot",
     "ResolvedRuntimeContext",
     "RuntimeAutomationService",
     "RuntimeContextService",

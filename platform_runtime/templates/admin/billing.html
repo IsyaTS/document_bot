@@ -1,0 +1,214 @@
+{% extends "admin/base.html" %}
+{% block content %}
+<div class="topbar">
+  <div>
+    <h2>Billing</h2>
+    <p class="subtle">Invoices, claims, settlements and export-ready payroll register in one workflow surface.</p>
+  </div>
+  <div class="chips">
+    <span class="chip">{{ documents|length }} billing docs</span>
+    <span class="chip">{{ settlements|length }} settlements</span>
+    <a class="pill-link" href="/admin/{{ runtime.account.slug }}/payroll">payroll</a>
+    <a class="pill-link" href="/admin/{{ runtime.account.slug }}/operations">operations</a>
+  </div>
+</div>
+
+<section class="grid cols-2 integrations-layout">
+  <article class="card">
+    <div class="actions" style="justify-content: space-between;">
+      <div>
+        <h3>Create Billing Document</h3>
+        <p class="subtle">Issue invoices and claims with due dates and customer linkage.</p>
+      </div>
+      <span class="badge">workflow</span>
+    </div>
+
+    {% if can_manage_billing %}
+    <section class="card soft-card" style="margin-top: 14px; padding: 14px;">
+      <div class="form-grid two">
+        <label>
+          Type
+          <select id="billing-document-type">
+            <option value="invoice">invoice</option>
+            <option value="claim">claim</option>
+          </select>
+        </label>
+        <label>Number<input id="billing-document-number" placeholder="INV-2026-010"></label>
+        <label>
+          Customer
+          <select id="billing-customer-id">
+            <option value="">—</option>
+            {% for customer in customers %}
+            <option value="{{ customer.id }}">{{ customer.name }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>Total amount<input id="billing-total-amount" type="number" step="0.01" value="0"></label>
+        <label>Issued date<input id="billing-issued-at" type="date"></label>
+        <label>Due / response date<input id="billing-due-date" type="date"></label>
+        <label>Template code<input id="billing-template-code" placeholder="standard_invoice"></label>
+        <label style="grid-column: 1 / span 2;">Summary<textarea id="billing-summary" rows="4" placeholder="Scope, reason and next action."></textarea></label>
+      </div>
+      <div class="actions" style="margin-top: 14px;">
+        <button type="button" id="save-billing-document">Create billing document</button>
+        <span class="subtle" id="billing-status"></span>
+      </div>
+    </section>
+    {% endif %}
+
+    <section class="card soft-card" style="margin-top: 16px; padding: 0;">
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Document</th><th>Status</th><th>Due</th><th>Total</th><th></th></tr></thead>
+          <tbody>
+            {% for item in documents %}
+            <tr>
+              <td><strong>{{ item.document_number or (item.document_type ~ '-' ~ item.id) }}</strong><div class="status-line">{{ item.document_type }}</div></td>
+              <td>{{ item.status }}</td>
+              <td>{{ item.snapshot_json.get('due_date') or "—" }}</td>
+              <td>{{ item.total_amount }} {{ item.currency }}</td>
+              <td>
+                <a class="pill-link" href="/admin/{{ runtime.account.slug }}/billing?document_id={{ item.id }}">open</a>
+                <a class="pill-link" href="/admin/{{ runtime.account.slug }}/billing/documents/{{ item.id }}/preview.txt">txt</a>
+                <a class="pill-link" href="/admin/{{ runtime.account.slug }}/billing/documents/{{ item.id }}/preview.md">md</a>
+                <a class="pill-link" href="/admin/{{ runtime.account.slug }}/billing/documents/{{ item.id }}/preview.pdf">pdf</a>
+              </td>
+            </tr>
+            {% else %}
+            <tr><td colspan="5" class="empty">No invoices or claims yet.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </article>
+
+  <article class="card">
+    <div class="actions" style="justify-content: space-between;">
+      <div>
+        <h3>Settlements</h3>
+        <p class="subtle">Record invoice payments, claim resolutions and write-offs against the selected document.</p>
+      </div>
+      {% if selected_document %}
+      <span class="badge">{{ selected_document.document_number or selected_document.id }}</span>
+      {% endif %}
+    </div>
+
+    {% if selected_document and can_manage_billing %}
+    <section class="card soft-card" style="margin-top: 14px; padding: 14px;">
+      <div class="status-line">Selected: {{ selected_document.document_type }} · {{ selected_document.status }} · total {{ selected_document.total_amount }} {{ selected_document.currency }}</div>
+      <div class="form-grid two" style="margin-top: 12px;">
+        <label>
+          Settlement type
+          <select id="settlement-type">
+            <option value="payment">payment</option>
+            <option value="resolution">resolution</option>
+            <option value="writeoff">writeoff</option>
+          </select>
+        </label>
+        <label>
+          Status
+          <select id="settlement-status">
+            <option value="recorded">recorded</option>
+            <option value="confirmed">confirmed</option>
+            <option value="cancelled">cancelled</option>
+          </select>
+        </label>
+        <label>Date<input id="settlement-date" type="date"></label>
+        <label>Amount<input id="settlement-amount" type="number" step="0.01" value="{{ selected_document.total_amount }}"></label>
+        <label>Reference<input id="settlement-reference" placeholder="payment-2026-04-19"></label>
+        <label style="grid-column: 1 / span 2;">Note<textarea id="settlement-note" rows="3" placeholder="What happened and what remains next."></textarea></label>
+      </div>
+      <div class="actions" style="margin-top: 14px;">
+        <button type="button" id="save-settlement" data-document-id="{{ selected_document.id }}">Record settlement</button>
+        <span class="subtle" id="settlement-status-line"></span>
+      </div>
+    </section>
+    {% elif not selected_document %}
+    <section class="notice" style="margin-top: 14px;">Open an invoice or claim from the table to record payments and resolutions.</section>
+    {% endif %}
+
+    <section class="card soft-card" style="margin-top: 16px; padding: 0;">
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Date</th><th>Type</th><th>Amount</th><th>Ref</th><th>Status</th></tr></thead>
+          <tbody>
+            {% for item in settlements %}
+            <tr>
+              <td>{{ item.settlement_date }}</td>
+              <td>{{ item.settlement_type }}</td>
+              <td>{{ item.amount }} {{ item.currency }}</td>
+              <td>{{ item.reference or "—" }}</td>
+              <td>{{ item.status }}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="5" class="empty">No settlements recorded yet.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </article>
+</section>
+
+<script>
+  const billingStatus = document.getElementById("billing-status");
+  const settlementStatus = document.getElementById("settlement-status-line");
+
+  const saveBillingButton = document.getElementById("save-billing-document");
+  if (saveBillingButton) {
+    saveBillingButton.addEventListener("click", async () => {
+      const response = await adminFetch(`/admin/{{ runtime.account.slug }}/billing/documents/save`, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+          document: {
+            document_type: document.getElementById("billing-document-type").value,
+            document_number: document.getElementById("billing-document-number").value.trim() || null,
+            customer_id: document.getElementById("billing-customer-id").value || null,
+            total_amount: document.getElementById("billing-total-amount").value || 0,
+            issued_at: document.getElementById("billing-issued-at").value || null,
+            due_date: document.getElementById("billing-due-date").value || null,
+            template_code: document.getElementById("billing-template-code").value.trim() || null,
+            summary: document.getElementById("billing-summary").value.trim() || null,
+          }
+        }),
+      });
+      if (!response.ok) {
+        billingStatus.textContent = await response.text();
+        return;
+      }
+      const body = await response.json();
+      billingStatus.textContent = `Saved ${body.document.document_type} #${body.document.id}.`;
+      window.location.href = `/admin/{{ runtime.account.slug }}/billing?document_id=${body.document.id}`;
+    });
+  }
+
+  const saveSettlementButton = document.getElementById("save-settlement");
+  if (saveSettlementButton) {
+    saveSettlementButton.addEventListener("click", async () => {
+      const response = await adminFetch(`/admin/{{ runtime.account.slug }}/billing/documents/${saveSettlementButton.dataset.documentId}/settlements/save`, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+          settlement: {
+            settlement_type: document.getElementById("settlement-type").value,
+            status: document.getElementById("settlement-status").value,
+            settlement_date: document.getElementById("settlement-date").value,
+            amount: document.getElementById("settlement-amount").value || 0,
+            reference: document.getElementById("settlement-reference").value.trim() || null,
+            note: document.getElementById("settlement-note").value.trim() || null,
+          }
+        }),
+      });
+      if (!response.ok) {
+        settlementStatus.textContent = await response.text();
+        return;
+      }
+      const body = await response.json();
+      settlementStatus.textContent = `Recorded settlement #${body.settlement.id}.`;
+      window.location.reload();
+    });
+  }
+</script>
+{% endblock %}

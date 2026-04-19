@@ -4,6 +4,7 @@ import hashlib
 import json
 import mimetypes
 import secrets
+from io import BytesIO
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -11,11 +12,13 @@ from urllib.parse import parse_qs, urlencode
 from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 from starlette.datastructures import UploadFile
 from starlette.middleware.sessions import SessionMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
 from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -29,6 +32,7 @@ from platform_core.models import (
     Customer,
     Deal,
     Document,
+    DocumentSettlement,
     Employee,
     EmployeeKPI,
     Goal,
@@ -57,6 +61,7 @@ from platform_core.exceptions import AuthorizationError, PlatformCoreError, Tena
 from platform_core.runtime_status import read_runtime_status, write_runtime_status
 from platform_core.services import (
     AuditLogService,
+    BillingService,
     BusinessOSService,
     CommunicationService,
     EmployeeSnapshot,
@@ -453,6 +458,7 @@ def create_app() -> FastAPI:
                 items.append({"key": "payroll", "label": "Payroll", "path": "payroll"})
             if feature_access["operations_workflows"]["allowed"]:
                 items.append({"key": "operations", "label": "Operations", "path": "operations"})
+                items.append({"key": "billing", "label": "Billing", "path": "billing"})
             if feature_access["communication_intelligence"]["allowed"]:
                 items.append({"key": "communications", "label": "Communications", "path": "communications"})
             if feature_access["business_os"]["allowed"]:
@@ -1086,6 +1092,7 @@ def create_app() -> FastAPI:
             {"key": "notification_events", "label": "Notification events", "description": "Soft limit for generated notification events."},
             {"key": "notification_dispatches", "label": "Notification dispatches", "description": "Soft limit for delivered notification artifacts."},
             {"key": "task_checkins", "label": "Task check-ins", "description": "Soft limit for execution check-ins and resolution notes."},
+            {"key": "document_settlements", "label": "Document settlements", "description": "Soft limit for invoice payments, claim resolutions and write-offs."},
         ]
 
     def _default_account_settings() -> dict[str, object]:
@@ -1255,6 +1262,9 @@ def create_app() -> FastAPI:
         task_checkins = session.execute(
             select(func.count()).select_from(TaskCheckin).where(TaskCheckin.account_id == account.id)
         ).scalar_one()
+        document_settlements = session.execute(
+            select(func.count()).select_from(DocumentSettlement).where(DocumentSettlement.account_id == account.id)
+        ).scalar_one()
         return {
             "active_memberships": sum(1 for item in memberships if item.status == "active"),
             "active_integrations": sum(1 for item in integrations if item.status != "archived"),
@@ -1271,6 +1281,7 @@ def create_app() -> FastAPI:
             "notification_events": int(notification_events or 0),
             "notification_dispatches": int(notification_dispatches or 0),
             "task_checkins": int(task_checkins or 0),
+            "document_settlements": int(document_settlements or 0),
         }
 
     def _account_usage_rows(account: Account, session: Session) -> list[dict[str, object]]:
@@ -1361,6 +1372,14 @@ def create_app() -> FastAPI:
         ).scalar_one()
         if payroll_period_count > 0 and payroll_payment_count == 0:
             next_steps.append({"label": "Record the first payroll payment", "href": f"/admin/{runtime.account.slug}/payroll"})
+        document_count = session.execute(
+            select(func.count()).select_from(Document).where(Document.account_id == runtime.account.id)
+        ).scalar_one()
+        settlement_count = session.execute(
+            select(func.count()).select_from(DocumentSettlement).where(DocumentSettlement.account_id == runtime.account.id)
+        ).scalar_one()
+        if document_count > 0 and settlement_count == 0:
+            next_steps.append({"label": "Record the first invoice payment or claim resolution", "href": f"/admin/{runtime.account.slug}/billing"})
         if len(onboarding["integration_rows"]) == 0:
             next_steps.append({"label": "Connect the first integration", "href": f"/admin/{runtime.account.slug}/integrations"})
         if onboarding["last_success"] is None and len(onboarding["integration_rows"]) > 0:
@@ -1786,6 +1805,33 @@ def create_app() -> FastAPI:
 
     def _notification_channel_options() -> list[str]:
         return ["internal", "telegram", "email", "webhook"]
+
+    def _render_text_pdf(title: str, body_text: str) -> bytes:
+        buffer = BytesIO()
+        pdf = canvas.Canvas(buffer, pagesize=A4)
+        width, height = A4
+        y = height - 40
+        pdf.setFont("Helvetica-Bold", 14)
+        pdf.drawString(40, y, title[:100])
+        y -= 24
+        pdf.setFont("Helvetica", 10)
+        for raw_line in body_text.splitlines() or [""]:
+            line = raw_line or " "
+            while line:
+                chunk = line[:110]
+                pdf.drawString(40, y, chunk)
+                y -= 14
+                line = line[110:]
+                if y < 60:
+                    pdf.showPage()
+                    pdf.setFont("Helvetica", 10)
+                    y = height - 40
+            if y < 60:
+                pdf.showPage()
+                pdf.setFont("Helvetica", 10)
+                y = height - 40
+        pdf.save()
+        return buffer.getvalue()
 
     def _payroll_period_kind_options() -> list[str]:
         return ["month", "week", "custom"]
@@ -4660,6 +4706,168 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
         return JSONResponse({"entry": _serialize_payroll_entry(entry), "payment": _serialize_payroll_payment(payment)})
 
+    @app.get("/admin/{account_slug}/payroll/periods/{payroll_period_id}/register.{format_name}")
+    def admin_payroll_register_export(
+        request: Request,
+        account_slug: str,
+        payroll_period_id: int,
+        format_name: str,
+        session: Session = Depends(get_db_session),
+    ) -> Response:
+        user = _current_session_user(session, request)
+        if user is None:
+            request.session.clear()
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Admin session is required.")
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=user.email)
+        ensure_permission(runtime, "business.read")
+        _ensure_account_feature(runtime, "payroll_kpi", "Payroll")
+        if format_name not in {"txt", "json"}:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unsupported payroll register format.")
+        payload = BillingService(session).render_payroll_register(runtime.context, payroll_period_id=payroll_period_id, format_name=format_name)
+        media_type = "application/json" if format_name == "json" else "text/plain"
+        return Response(content=payload, media_type=media_type)
+
+    @app.get("/admin/{account_slug}/billing", response_class=HTMLResponse)
+    def admin_billing(
+        request: Request,
+        account_slug: str,
+        document_id: int | None = Query(default=None),
+        session: Session = Depends(get_db_session),
+    ) -> HTMLResponse:
+        user = _current_session_user(session, request)
+        if user is None:
+            request.session.clear()
+            return _login_redirect(f"/admin/{account_slug}/billing")
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=user.email)
+        request.session["admin_account_slug"] = runtime.account.slug
+        ensure_permission(runtime, "business.read")
+        _ensure_account_feature(runtime, "operations_workflows", "Billing")
+        service = BillingService(session)
+        documents = service.list_documents(runtime.context, document_types=["invoice", "claim"])
+        settlements = service.list_settlements(runtime.context, document_id=document_id)
+        selected_document = None
+        if document_id is not None:
+            selected_document = next((item for item in documents if item.id == document_id), None)
+            if selected_document is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Billing document not found.")
+        elif documents:
+            selected_document = documents[0]
+            settlements = service.list_settlements(runtime.context, document_id=selected_document.id)
+        customers = BusinessOSService(session).list_customers(runtime)
+        return templates.TemplateResponse(
+            request,
+            "admin/billing.html",
+            {
+                **_admin_context(request, session, runtime, page="billing"),
+                "documents": documents,
+                "settlements": settlements,
+                "selected_document": selected_document,
+                "customers": customers,
+                "can_manage_billing": _is_manager_role(runtime.role_code) or "*" in runtime.permissions or "business.write" in runtime.permissions,
+            },
+        )
+
+    @app.post("/admin/{account_slug}/billing/documents/save")
+    async def admin_save_billing_document(
+        request: Request,
+        account_slug: str,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        payload = await request.json()
+        actor = _require_admin_user(request, session)
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor.email)
+        _require_account_manager(runtime)
+        ensure_permission(runtime, "documents.manage")
+        _ensure_account_feature(runtime, "operations_workflows", "Billing")
+        body = _parse_admin_payload(payload, "document")
+        try:
+            document = BillingService(session).create_billing_document(
+                runtime.context,
+                document_type=str(body.get("document_type") or "invoice").strip() or "invoice",
+                document_number=str(body.get("document_number") or "").strip() or None,
+                customer_id=int(body["customer_id"]) if body.get("customer_id") else None,
+                total_amount=Decimal(str(body.get("total_amount") or "0")),
+                issued_at=date.fromisoformat(str(body["issued_at"])) if body.get("issued_at") else None,
+                due_date=date.fromisoformat(str(body["due_date"])) if body.get("due_date") else None,
+                summary=str(body.get("summary") or "").strip() or None,
+                template_code=str(body.get("template_code") or "").strip() or None,
+            )
+            AuditLogService(session).log(
+                runtime.context,
+                "billing.document.created",
+                "document",
+                str(document.id),
+                details={"document_type": document.document_type, "status": document.status},
+            )
+        except (PlatformCoreError, TenantContextError, ValueError, IntegrityError, ArithmeticError) as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        return JSONResponse({"document": _serialize_document(document)})
+
+    @app.post("/admin/{account_slug}/billing/documents/{document_id}/settlements/save")
+    async def admin_save_billing_settlement(
+        request: Request,
+        account_slug: str,
+        document_id: int,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        payload = await request.json()
+        actor = _require_admin_user(request, session)
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor.email)
+        _require_account_manager(runtime)
+        ensure_permission(runtime, "documents.manage")
+        _ensure_account_feature(runtime, "operations_workflows", "Billing")
+        body = _parse_admin_payload(payload, "settlement")
+        try:
+            document, settlement = BillingService(session).record_settlement(
+                runtime.context,
+                document_id=document_id,
+                recorded_by_user_id=runtime.actor_user.id,
+                settlement_type=str(body.get("settlement_type") or "payment").strip() or "payment",
+                settlement_date=date.fromisoformat(str(body["settlement_date"])),
+                amount=Decimal(str(body.get("amount") or "0")),
+                reference=str(body.get("reference") or "").strip() or None,
+                note=str(body.get("note") or "").strip() or None,
+                status=str(body.get("status") or "recorded").strip() or "recorded",
+            )
+            AuditLogService(session).log(
+                runtime.context,
+                "billing.document.settlement_recorded",
+                "document_settlement",
+                str(settlement.id),
+                details={"document_id": document.id, "settlement_type": settlement.settlement_type, "amount": str(settlement.amount)},
+            )
+        except (PlatformCoreError, TenantContextError, ValueError, ArithmeticError) as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        return JSONResponse({"document": _serialize_document(document), "settlement": _serialize_document_settlement(settlement)})
+
+    @app.get("/admin/{account_slug}/billing/documents/{document_id}/preview.{format_name}")
+    def admin_billing_document_preview(
+        request: Request,
+        account_slug: str,
+        document_id: int,
+        format_name: str,
+        session: Session = Depends(get_db_session),
+    ) -> Response:
+        user = _current_session_user(session, request)
+        if user is None:
+            request.session.clear()
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Admin session is required.")
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=user.email)
+        ensure_permission(runtime, "documents.manage")
+        _ensure_account_feature(runtime, "operations_workflows", "Billing")
+        preview = BusinessOSService(session).render_document_preview(runtime, document_id)
+        if format_name == "md":
+            payload = f"# {runtime.account.name} billing document preview\n\n```\n{preview}\n```\n"
+            return PlainTextResponse(payload)
+        if format_name == "txt":
+            return PlainTextResponse(preview + "\n")
+        if format_name == "pdf":
+            pdf_bytes = _render_text_pdf(f"{runtime.account.name} billing document", preview)
+            return Response(content=pdf_bytes, media_type="application/pdf")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unsupported preview format.")
+
     @app.get("/admin/{account_slug}/crm", response_class=HTMLResponse)
     def admin_crm(
         request: Request,
@@ -5264,11 +5472,13 @@ def create_app() -> FastAPI:
         preview = BusinessOSService(session).render_document_preview(runtime, document_id)
         if format_name == "md":
             payload = f"# {runtime.account.name} document preview\n\n```\n{preview}\n```\n"
-        elif format_name == "txt":
-            payload = preview + "\n"
+            return PlainTextResponse(payload)
+        if format_name == "txt":
+            return PlainTextResponse(preview + "\n")
+        if format_name == "pdf":
+            return Response(content=_render_text_pdf(f"{runtime.account.name} document preview", preview), media_type="application/pdf")
         else:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unsupported preview format.")
-        return PlainTextResponse(payload)
 
     @app.post("/admin/{account_slug}/operations/installations/save")
     async def admin_save_installation(
@@ -6727,6 +6937,24 @@ def _serialize_document(document: Document) -> dict[str, object]:
         "snapshot_json": document.snapshot_json or {},
         "created_at": _serialize_datetime(document.created_at),
         "updated_at": _serialize_datetime(document.updated_at),
+    }
+
+
+def _serialize_document_settlement(settlement: DocumentSettlement) -> dict[str, object]:
+    return {
+        "id": settlement.id,
+        "account_id": settlement.account_id,
+        "document_id": settlement.document_id,
+        "recorded_by_user_id": settlement.recorded_by_user_id,
+        "settlement_type": settlement.settlement_type,
+        "status": settlement.status,
+        "settlement_date": settlement.settlement_date.isoformat(),
+        "amount": str(settlement.amount),
+        "currency": settlement.currency,
+        "reference": settlement.reference,
+        "notes_json": settlement.notes_json or {},
+        "created_at": _serialize_datetime(settlement.created_at),
+        "updated_at": _serialize_datetime(settlement.updated_at),
     }
 
 
