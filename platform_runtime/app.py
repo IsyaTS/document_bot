@@ -3798,9 +3798,12 @@ def create_app() -> FastAPI:
         detail_raw: str | None = None,
         scope_raw: str | None = None,
         request_params: dict[str, str] | None = None,
+        session: Session | None = None,
+        runtime: ResolvedRuntimeContext | None = None,
     ) -> dict[str, object]:
         request_params = request_params or {}
-        filters = _site_dashboard_filters(selected_date_raw, period_raw, date_from_raw, date_to_raw)
+        effective_period_raw = period_raw or "month"
+        filters = _site_dashboard_filters(selected_date_raw, effective_period_raw, date_from_raw, date_to_raw)
         period_code = str(filters["period_code"])
         period_meta = _site_period_meta(period_code, str(filters["date_from_label"]), str(filters["date_to_label"]))
         period_query = _site_period_query(period_code, str(filters["date_from"]), str(filters["date_to"]))
@@ -3870,6 +3873,41 @@ def create_app() -> FastAPI:
         sources = MARKETING_SOURCES
         city_options = MARKETING_CITY_OPTIONS
         quantity_options = MARKETING_QUANTITY_OPTIONS
+        date_from_value = date.fromisoformat(str(filters["date_from"]))
+        date_to_value = date.fromisoformat(str(filters["date_to"]))
+        account_session_active = session is not None and runtime is not None
+        live_ads: dict[str, object] | None = None
+        if account_session_active:
+            live_ads = _ads_workspace_data(
+                runtime,
+                session,
+                period={"day": "today", "yesterday": "yesterday", "week": "week", "month": "month", "custom": "custom"}.get(period_code, "month"),
+                date_from=date_from_value if period_code == "custom" else None,
+                date_to=date_to_value if period_code == "custom" else None,
+            )
+
+        def money_label(value: object | None) -> str:
+            if value is None:
+                return "Нет данных"
+            return f"{_finance_format_decimal(_finance_parse_decimal_or_zero(value))} ₽"
+
+        def percent_label(numerator: object | None, denominator: object | None) -> str:
+            left = _finance_parse_decimal_or_zero(numerator or 0)
+            right = _finance_parse_decimal_or_zero(denominator or 0)
+            if right <= 0:
+                return "0%"
+            return f"{((left / right) * Decimal('100')).quantize(Decimal('0.1'))}%"
+
+        def live_session_message_panel() -> dict[str, object]:
+            return rows_panel(
+                "Аккаунт",
+                "Live-данные Авито доступны только внутри выбранного аккаунта.",
+                [
+                    ("Статус", "Нет active account session"),
+                    ("Что делать", "Войдите в аккаунт и откройте маркетинг снова"),
+                    ("Период", str(filters["period_label"])),
+                ],
+            )
         source_scope = str(scope_raw or request_params.get("scope") or "").strip()
         if source_scope not in sources:
             source_scope = sources[0]
@@ -4082,6 +4120,192 @@ def create_app() -> FastAPI:
             else:
                 panels = [rows_panel("Дата", f"{title} по дате", [("Дата", str(filters["selected_date_label"])), ("Значение", metric_map[active_tab]), ("Источник", active_scope), ("Статус", "макет")])]
 
+        ads_summary = dict(live_ads.get("ads_summary") or {}) if live_ads is not None else {}
+        ads_daily_rows = list(live_ads.get("ads_daily_rows") or []) if live_ads is not None else []
+        ads_campaign_rows = list(live_ads.get("ads_campaign_rows") or []) if live_ads is not None else []
+        latest_metric_date = live_ads.get("ads_latest_metric_date") if live_ads is not None and isinstance(live_ads.get("ads_latest_metric_date"), date) else None
+        account_state = {
+            "label": "Аккаунт",
+            "value": str(runtime.account.name or runtime.account.slug) if account_session_active and runtime is not None else "Не выбран",
+            "meta": "active account session" if account_session_active else "Нет active account session",
+            "tone": "success" if account_session_active else "warning",
+        }
+        ads_state = {
+            "label": "Данные Авито",
+            "value": latest_metric_date.strftime("%d.%m.%Y") if latest_metric_date is not None else "Нет данных",
+            "meta": "последняя дата метрик" if account_session_active else "live-данные откроются после входа в аккаунт",
+            "tone": "default" if account_session_active else "warning",
+        }
+        context_line = (
+            f"Аккаунт: {runtime.account.name or runtime.account.slug}"
+            if account_session_active and runtime is not None
+            else "Live-данные Авито доступны только внутри активного аккаунта."
+        )
+        states = [account_state, ads_state]
+
+        if account_session_active and live_ads is not None:
+            campaigns_count = int(ads_summary.get("campaigns_count") or 0)
+            active_campaigns_count = int(ads_summary.get("active_campaigns_count") or 0)
+            spend_total = ads_summary.get("spend_total")
+            leads_total = int(ads_summary.get("leads_total") or 0)
+            conversions_total = int(ads_summary.get("conversions_total") or 0)
+            cpl_total = ads_summary.get("cpl_total")
+            cac_value = ads_summary.get("cac_value")
+            if active_tab == "summary":
+                title = "Сводка"
+                description = f"Живые данные Авито {period_meta['window']}."
+                metrics = [
+                    {"label": "Источник", "value": active_scope, "meta": "данные из Avito sync", "tone": "default"},
+                    {"label": "Период", "value": str(filters["period_label"]), "meta": f"активно {period_meta['window']}", "tone": "default"},
+                    {"label": "Расходы", "value": money_label(spend_total), "meta": f"по рекламе {period_meta['window']}", "tone": "default"},
+                    {"label": "Лиды", "value": str(leads_total), "meta": f"получено {period_meta['window']}", "tone": "default"},
+                ]
+                if detail_code == "period":
+                    panels = [
+                        chips_panel("Источник", "Выбранный источник", [{"label": item, "href": marketing_href("source", "all", item), "active": item == active_scope} for item in sources]),
+                        form_panel(
+                            "Период",
+                            "Выбрать диапазон",
+                            [
+                                {"label": "С", "name": "date_from", "type": "date", "value": str(filters["date_from"])},
+                                {"label": "По", "name": "date_to", "type": "date", "value": str(filters["date_to"])},
+                            ],
+                            "Сохранить",
+                            period_value="custom",
+                        ),
+                        rows_panel(
+                            "Сводка",
+                            "Живой период по Avito",
+                            [
+                                ("Источник", active_scope),
+                                ("Кампаний", campaigns_count),
+                                ("Активных кампаний", active_campaigns_count),
+                                ("Расходы", money_label(spend_total)),
+                                ("Лиды", leads_total),
+                                ("Конверсия", percent_label(conversions_total, leads_total)),
+                                ("Стоимость лида", money_label(cpl_total)),
+                                ("Стоимость клиента", money_label(cac_value)),
+                            ],
+                        ),
+                    ]
+                else:
+                    panels = [
+                        chips_panel("Источник", "Выбранный источник", [{"label": item, "href": marketing_href("source", "all", item), "active": item == active_scope} for item in sources]),
+                        rows_panel(
+                            "Сводка",
+                            "Текущий live-срез Avito",
+                            [
+                                ("Дата", latest_metric_date.strftime("%d.%m.%Y") if latest_metric_date is not None else "Нет данных"),
+                                ("Кампаний", campaigns_count),
+                                ("Расходы", money_label(spend_total)),
+                                ("Лиды", leads_total),
+                                ("Конверсии", conversions_total),
+                            ],
+                        ),
+                    ]
+            elif active_tab == "source":
+                title = "Источники"
+                description = "Живой разрез рекламы по Avito."
+                metrics = [
+                    {"label": "Источник", "value": active_scope, "meta": "активный источник", "tone": "default"},
+                    {"label": "Расходы", "value": money_label(spend_total), "meta": f"маркетинг {period_meta['window']}", "tone": "default"},
+                    {"label": "Лиды", "value": str(leads_total), "meta": f"входящий поток {period_meta['window']}", "tone": "default"},
+                    {"label": "Конверсия", "value": percent_label(conversions_total, leads_total), "meta": f"в клиента {period_meta['window']}", "tone": "default"},
+                ]
+                source_rows = []
+                for row in ads_campaign_rows[:12]:
+                    campaign = row.get("campaign")
+                    if campaign is None:
+                        continue
+                    source_rows.append((str(campaign.name), f"{money_label(row.get('spend'))} · {int(row.get('leads_count') or 0)} лидов"))
+                panels = [
+                    chips_panel("Источники", "Доступные источники", [{"label": item, "href": marketing_href("summary", "period", item), "active": item == active_scope} for item in sources]),
+                    rows_panel("Сводка источника", active_scope, source_rows or [("Нет данных", "Кампании Avito не найдены")]),
+                ]
+            elif active_tab == "cities":
+                title = "Города"
+                description = f"Городовой срез {period_meta['window']}."
+                metrics = [
+                    {"label": "Источник", "value": active_scope, "meta": "текущий источник", "tone": "default"},
+                    {"label": "Городов", "value": "Нет данных", "meta": "в текущем Avito sync нет city-level метрик", "tone": "warning"},
+                    {"label": "Лиды", "value": str(leads_total), "meta": f"по источнику {period_meta['window']}", "tone": "default"},
+                    {"label": "Конверсия", "value": percent_label(conversions_total, leads_total), "meta": f"среднее {period_meta['window']}", "tone": "default"},
+                ]
+                panels = [
+                    rows_panel(
+                        "Города",
+                        "Городовой срез пока не приходит из Avito API.",
+                        [
+                            ("Статус", "Нет city-level metrics"),
+                            ("Кампаний", campaigns_count),
+                            ("Последняя дата метрик", latest_metric_date.strftime("%d.%m.%Y") if latest_metric_date is not None else "Нет данных"),
+                        ],
+                    )
+                ]
+            elif active_tab in {"expenses", "cac", "cpl", "leads", "conversion"}:
+                title_map = {"expenses": "Расходы", "cac": "Стоимость клиента", "cpl": "Стоимость лида", "leads": "Лиды", "conversion": "Конверсия"}
+                live_value_map = {
+                    "expenses": money_label(spend_total),
+                    "cac": money_label(cac_value),
+                    "cpl": money_label(cpl_total),
+                    "leads": str(leads_total),
+                    "conversion": percent_label(conversions_total, leads_total),
+                }
+                title = title_map.get(active_tab, "Маркетинг")
+                description = f"{title} по live-данным Avito {period_meta['window']}."
+                metrics = [
+                    {"label": "Источник", "value": active_scope, "meta": "текущий источник", "tone": "default"},
+                    {"label": "Дата", "value": latest_metric_date.strftime("%d.%m.%Y") if latest_metric_date is not None else str(filters["selected_date_label"]), "meta": f"срез {period_meta['window']}", "tone": "default"},
+                    {"label": "Период", "value": str(filters["period_label"]), "meta": f"активно {period_meta['window']}", "tone": "default"},
+                    {"label": title, "value": live_value_map[active_tab], "meta": f"значение {period_meta['window']}", "tone": "default"},
+                ]
+                if detail_code == "period":
+                    panels = [
+                        form_panel(
+                            "Период",
+                            "Выбрать диапазон",
+                            [
+                                {"label": "С", "name": "date_from", "type": "date", "value": str(filters["date_from"])},
+                                {"label": "По", "name": "date_to", "type": "date", "value": str(filters["date_to"])},
+                            ],
+                            "Сохранить",
+                            period_value="custom",
+                        ),
+                        rows_panel(
+                            "Выбранный период",
+                            "Текущий диапазон по Avito",
+                            [
+                                ("Период", str(filters["period_label"])),
+                                ("С", str(filters["date_from_label"])),
+                                ("По", str(filters["date_to_label"])),
+                                ("Источник", active_scope),
+                                (title, live_value_map[active_tab]),
+                            ],
+                        ),
+                    ]
+                else:
+                    latest_daily = ads_daily_rows[0] if ads_daily_rows else None
+                    panels = [
+                        rows_panel(
+                            "Дата",
+                            f"{title} по дате",
+                            [
+                                ("Дата", latest_daily["date"].strftime("%d.%m.%Y") if isinstance(latest_daily, dict) and isinstance(latest_daily.get("date"), date) else (latest_metric_date.strftime("%d.%m.%Y") if latest_metric_date is not None else "Нет данных")),
+                                ("Значение", live_value_map[active_tab]),
+                                ("Источник", active_scope),
+                                ("Статус", "live"),
+                            ],
+                        )
+                    ]
+        elif active_tab in {"summary", "source", "cities", "expenses", "cac", "cpl", "leads", "conversion"}:
+            metrics = [
+                {"label": "Источник", "value": active_scope, "meta": "экран маркетинга", "tone": "default"},
+                {"label": "Период", "value": str(filters["period_label"]), "meta": "текущий фильтр", "tone": "default"},
+                {"label": "Аккаунт", "value": "Не выбран", "meta": "нет active account session", "tone": "warning"},
+                {"label": "Данные Авито", "value": "Недоступны", "meta": "войдите в аккаунт для live-данных", "tone": "warning"},
+            ]
+            panels = [live_session_message_panel()]
+
         return {
             "filters": filters,
             "workspace_id": "marketing-workspace",
@@ -4091,11 +4315,12 @@ def create_app() -> FastAPI:
             "active_scope": active_scope,
             "title": title,
             "description": description,
-            "context_line": f"Источник: {active_scope}",
+            "context_line": context_line,
             "tabs": tabs,
             "tab_groups": [{"eyebrow": "Маркетинг", "title": "Разделы маркетинга", "primary": False, "items": tabs}],
             "block_title": "Разделы маркетинга",
             "subtabs": subtabs,
+            "states": states,
             "metrics": metrics,
             "panels": panels,
         }
@@ -4109,9 +4334,12 @@ def create_app() -> FastAPI:
         detail_raw: str | None = None,
         scope_raw: str | None = None,
         request_params: dict[str, str] | None = None,
+        session: Session | None = None,
+        runtime: ResolvedRuntimeContext | None = None,
     ) -> dict[str, object]:
         request_params = request_params or {}
-        filters = _site_dashboard_filters(selected_date_raw, period_raw, date_from_raw, date_to_raw)
+        effective_period_raw = period_raw or "month"
+        filters = _site_dashboard_filters(selected_date_raw, effective_period_raw, date_from_raw, date_to_raw)
         period_code = str(filters["period_code"])
         period_meta = _site_period_meta(period_code, str(filters["date_from_label"]), str(filters["date_to_label"]))
         period_query = _site_period_query(period_code, str(filters["date_from"]), str(filters["date_to"]))
@@ -4179,6 +4407,35 @@ def create_app() -> FastAPI:
             return {"label": label, "href": href, "active": active}
 
         sources = SALES_SOURCES
+        date_from_value = date.fromisoformat(str(filters["date_from"]))
+        date_to_value = date.fromisoformat(str(filters["date_to"]))
+        account_session_active = session is not None and runtime is not None
+        live_ads: dict[str, object] | None = None
+        if account_session_active:
+            live_ads = _ads_workspace_data(
+                runtime,
+                session,
+                period={"day": "today", "yesterday": "yesterday", "week": "week", "month": "month", "custom": "custom"}.get(period_code, "month"),
+                date_from=date_from_value if period_code == "custom" else None,
+                date_to=date_to_value if period_code == "custom" else None,
+            )
+
+        def money_label(value: object | None) -> str:
+            if value is None:
+                return "Нет данных"
+            return f"{_finance_format_decimal(_finance_parse_decimal_or_zero(value))} ₽"
+
+        def live_session_message_panel() -> dict[str, object]:
+            return rows_panel(
+                "Аккаунт",
+                "Live-данные Avito доступны только внутри выбранного аккаунта.",
+                [
+                    ("Статус", "Нет active account session"),
+                    ("Что делать", "Войдите в аккаунт и откройте продажи снова"),
+                    ("Период", str(filters["period_label"])),
+                ],
+            )
+
         source_scope = str(scope_raw or request_params.get("scope") or "").strip()
         if source_scope not in sources:
             source_scope = sources[0]
@@ -4305,6 +4562,185 @@ def create_app() -> FastAPI:
             else:
                 panels = [rows_panel("Дата", f"{title} по дате", [("Дата", str(filters["selected_date_label"])), ("Значение", metric_map[active_tab]), ("Источник", active_scope), ("Статус", "макет")])]
 
+        ads_summary = dict(live_ads.get("ads_summary") or {}) if live_ads is not None else {}
+        ads_daily_rows = list(live_ads.get("ads_daily_rows") or []) if live_ads is not None else []
+        ads_campaign_rows = list(live_ads.get("ads_campaign_rows") or []) if live_ads is not None else []
+        latest_metric_date = live_ads.get("ads_latest_metric_date") if live_ads is not None and isinstance(live_ads.get("ads_latest_metric_date"), date) else None
+        account_state = {
+            "label": "Аккаунт",
+            "value": str(runtime.account.name or runtime.account.slug) if account_session_active and runtime is not None else "Не выбран",
+            "meta": "active account session" if account_session_active else "Нет active account session",
+            "tone": "success" if account_session_active else "warning",
+        }
+        ads_state = {
+            "label": "Данные Avito",
+            "value": latest_metric_date.strftime("%d.%m.%Y") if latest_metric_date is not None else "Нет данных",
+            "meta": "последняя дата метрик" if account_session_active else "live-данные откроются после входа в аккаунт",
+            "tone": "default" if account_session_active else "warning",
+        }
+        context_line = (
+            f"Аккаунт: {runtime.account.name or runtime.account.slug}"
+            if account_session_active and runtime is not None
+            else "Live-данные Avito доступны только внутри активного аккаунта."
+        )
+        states = [account_state, ads_state]
+
+        if account_session_active and live_ads is not None:
+            campaigns_count = int(ads_summary.get("campaigns_count") or 0)
+            leads_total = int(ads_summary.get("leads_total") or 0)
+            conversions_total = int(ads_summary.get("conversions_total") or 0)
+            acquired_customers_count = int(ads_summary.get("acquired_customers_count") or 0)
+            won_revenue_total = ads_summary.get("won_revenue_total")
+            avg_check_value = ads_summary.get("avg_check_value")
+            cac_value = ads_summary.get("cac_value")
+            if active_tab == "summary":
+                title = "Сводка"
+                description = f"Живая сводка продаж из Avito и закрытых сделок {period_meta['window']}."
+                metrics = [
+                    {"label": "Источник", "value": active_scope, "meta": "данные из Avito sync", "tone": "default"},
+                    {"label": "Период", "value": str(filters["period_label"]), "meta": f"активно {period_meta['window']}", "tone": "default"},
+                    {"label": "Клиенты", "value": str(acquired_customers_count), "meta": f"закрыто {period_meta['window']}", "tone": "default"},
+                    {"label": "Средний чек", "value": money_label(avg_check_value), "meta": f"по закрытым сделкам {period_meta['window']}", "tone": "default"},
+                ]
+                if detail_code == "period":
+                    panels = [
+                        chips_panel("Источник", "Выбранный источник", [{"label": item, "href": sales_href("source", "all", item), "active": item == active_scope} for item in sources]),
+                        form_panel(
+                            "Период",
+                            "Выбрать диапазон",
+                            [
+                                {"label": "С", "name": "date_from", "type": "date", "value": str(filters["date_from"])},
+                                {"label": "По", "name": "date_to", "type": "date", "value": str(filters["date_to"])},
+                            ],
+                            "Сохранить",
+                            period_value="custom",
+                        ),
+                        rows_panel(
+                            "Сводка",
+                            "Период по Avito и сделкам",
+                            [
+                                ("Клиенты", acquired_customers_count),
+                                ("Выручка", money_label(won_revenue_total)),
+                                ("Средний чек", money_label(avg_check_value)),
+                                ("CAC", money_label(cac_value)),
+                                ("Конверсии", conversions_total),
+                            ],
+                        ),
+                    ]
+                else:
+                    panels = [
+                        chips_panel("Источник", "Выбранный источник", [{"label": item, "href": sales_href("source", "all", item), "active": item == active_scope} for item in sources]),
+                        rows_panel(
+                            "Сводка",
+                            "Текущий live-срез Avito",
+                            [
+                                ("Дата", latest_metric_date.strftime("%d.%m.%Y") if latest_metric_date is not None else "Нет данных"),
+                                ("Лиды", leads_total),
+                                ("Конверсии", conversions_total),
+                                ("Клиенты", acquired_customers_count),
+                                ("Средний чек", money_label(avg_check_value)),
+                            ],
+                        ),
+                    ]
+            elif active_tab == "source":
+                title = "Источники"
+                description = "Живой разрез продаж по Avito."
+                metrics = [
+                    {"label": "Источник", "value": active_scope, "meta": "активный источник", "tone": "default"},
+                    {"label": "Средний чек", "value": money_label(avg_check_value), "meta": f"по закрытым сделкам {period_meta['window']}", "tone": "default"},
+                    {"label": "Клиенты", "value": str(acquired_customers_count), "meta": f"закрыто {period_meta['window']}", "tone": "default"},
+                    {"label": "Кампании", "value": str(campaigns_count), "meta": "в live-срезе", "tone": "default"},
+                ]
+                source_rows = []
+                for row in ads_campaign_rows[:12]:
+                    campaign = row.get("campaign")
+                    if campaign is None:
+                        continue
+                    source_rows.append((str(campaign.name), f"{int(row.get('conversions_count') or 0)} конв. · {money_label(row.get('spend'))}"))
+                panels = [
+                    chips_panel("Источники", "Доступные источники", [{"label": item, "href": sales_href("summary", "period", item), "active": item == active_scope} for item in sources]),
+                    rows_panel("Сводка источника", active_scope, source_rows or [("Нет данных", "Кампании Avito не найдены")]),
+                ]
+            elif active_tab == "cities":
+                title = "Города"
+                description = f"Городовой срез продаж {period_meta['window']}."
+                metrics = [
+                    {"label": "Источник", "value": active_scope, "meta": "текущий источник", "tone": "default"},
+                    {"label": "Городов", "value": "Нет данных", "meta": "в текущем Avito sync нет city-level метрик", "tone": "warning"},
+                    {"label": "Клиенты", "value": str(acquired_customers_count), "meta": f"по источнику {period_meta['window']}", "tone": "default"},
+                    {"label": "Средний чек", "value": money_label(avg_check_value), "meta": f"по закрытым сделкам {period_meta['window']}", "tone": "default"},
+                ]
+                panels = [
+                    rows_panel(
+                        "Города",
+                        "Городовой срез пока не приходит из Avito API.",
+                        [
+                            ("Статус", "Нет city-level metrics"),
+                            ("Кампаний", campaigns_count),
+                            ("Последняя дата метрик", latest_metric_date.strftime("%d.%m.%Y") if latest_metric_date is not None else "Нет данных"),
+                        ],
+                    )
+                ]
+            elif active_tab in {"avg_check", "days"}:
+                title_map = {"avg_check": "Средний чек", "days": "Дни"}
+                live_value_map = {
+                    "avg_check": money_label(avg_check_value),
+                    "days": str(acquired_customers_count),
+                }
+                title = title_map.get(active_tab, "Продажи")
+                description = f"{title} по live-данным Avito {period_meta['window']}."
+                metrics = [
+                    {"label": "Источник", "value": active_scope, "meta": "текущий источник", "tone": "default"},
+                    {"label": "Дата", "value": latest_metric_date.strftime("%d.%m.%Y") if latest_metric_date is not None else str(filters["selected_date_label"]), "meta": f"срез {period_meta['window']}", "tone": "default"},
+                    {"label": "Период", "value": str(filters["period_label"]), "meta": f"активно {period_meta['window']}", "tone": "default"},
+                    {"label": title, "value": live_value_map[active_tab], "meta": f"значение {period_meta['window']}", "tone": "default"},
+                ]
+                if detail_code == "period":
+                    top_days_rows = [
+                        (item["date"].strftime("%d.%m.%Y"), f"{int(item.get('conversions_count') or 0)} конв. · {money_label(item.get('spend'))}")
+                        for item in ads_daily_rows[:12]
+                        if isinstance(item, dict) and isinstance(item.get("date"), date)
+                    ]
+                    panels = [
+                        form_panel(
+                            "Период",
+                            "Выбрать диапазон",
+                            [
+                                {"label": "С", "name": "date_from", "type": "date", "value": str(filters["date_from"])},
+                                {"label": "По", "name": "date_to", "type": "date", "value": str(filters["date_to"])},
+                            ],
+                            "Сохранить",
+                            period_value="custom",
+                        ),
+                        rows_panel(
+                            "Выбранный период",
+                            "Дни по Avito",
+                            top_days_rows or [("Нет данных", "Дневные метрики не найдены")],
+                        ),
+                    ]
+                else:
+                    latest_daily = ads_daily_rows[0] if ads_daily_rows else None
+                    panels = [
+                        rows_panel(
+                            "Дата",
+                            f"{title} по дате",
+                            [
+                                ("Дата", latest_daily["date"].strftime("%d.%m.%Y") if isinstance(latest_daily, dict) and isinstance(latest_daily.get("date"), date) else (latest_metric_date.strftime("%d.%m.%Y") if latest_metric_date is not None else "Нет данных")),
+                                ("Клиенты", acquired_customers_count),
+                                ("Выручка", money_label(won_revenue_total)),
+                                ("Средний чек", money_label(avg_check_value)),
+                            ],
+                        )
+                    ]
+        elif active_tab in {"summary", "source", "cities", "avg_check", "days"}:
+            metrics = [
+                {"label": "Источник", "value": active_scope, "meta": "экран продаж", "tone": "default"},
+                {"label": "Период", "value": str(filters["period_label"]), "meta": "текущий фильтр", "tone": "default"},
+                {"label": "Аккаунт", "value": "Не выбран", "meta": "нет active account session", "tone": "warning"},
+                {"label": "Данные Avito", "value": "Недоступны", "meta": "войдите в аккаунт для live-данных", "tone": "warning"},
+            ]
+            panels = [live_session_message_panel()]
+
         return {
             "filters": filters,
             "workspace_id": "sales-workspace",
@@ -4314,11 +4750,12 @@ def create_app() -> FastAPI:
             "active_scope": active_scope,
             "title": title,
             "description": description,
-            "context_line": f"Источник: {active_scope}",
+            "context_line": context_line,
             "tabs": tabs,
             "tab_groups": [{"eyebrow": "Продажи", "title": "Разделы продаж", "primary": False, "items": tabs}],
             "block_title": "Разделы продаж",
             "subtabs": subtabs,
+            "states": states,
             "metrics": metrics,
             "panels": panels,
         }
@@ -10745,9 +11182,9 @@ def create_app() -> FastAPI:
         if str(section.get("key")) == "inventory" and not domain_chart_view:
             site_inventory_surface = _site_inventory_surface_model(selected_date, period, date_from, date_to, tab, detail, scope, dict(request.query_params), session=session, runtime=public_runtime)
         if str(section.get("key")) == "marketing" and not domain_chart_view:
-            site_marketing_surface = _site_marketing_surface_model(selected_date, period, date_from, date_to, tab, detail, scope, dict(request.query_params))
+            site_marketing_surface = _site_marketing_surface_model(selected_date, period, date_from, date_to, tab, detail, scope, dict(request.query_params), session=session, runtime=public_runtime)
         if str(section.get("key")) == "sales" and not domain_chart_view:
-            site_sales_surface = _site_sales_surface_model(selected_date, period, date_from, date_to, tab, detail, scope, dict(request.query_params))
+            site_sales_surface = _site_sales_surface_model(selected_date, period, date_from, date_to, tab, detail, scope, dict(request.query_params), session=session, runtime=public_runtime)
         if str(section.get("key")) == "employees" and not domain_chart_view:
             site_employees_surface = _site_employees_surface_model(selected_date, period, date_from, date_to, tab, detail, scope, dict(request.query_params))
         if str(section.get("key")) == "documents" and not domain_chart_view:
@@ -15736,9 +16173,21 @@ def create_app() -> FastAPI:
                 and (effective_to is None or activity_day <= effective_to)
             ]
         )
+        won_revenue_total = sum(
+            (
+                Decimal(item.amount_total or 0)
+                for item in deals
+                if (activity_day := _deal_activity_day(item)) is not None
+                and (effective_from is None or activity_day >= effective_from)
+                and (effective_to is None or activity_day <= effective_to)
+            ),
+            Decimal("0"),
+        )
+        avg_check_value = (won_revenue_total / Decimal(acquired_customers_count)).quantize(Decimal("0.01")) if acquired_customers_count > 0 else None
         cac_value = (spend_total / Decimal(acquired_customers_count)).quantize(Decimal("0.01")) if acquired_customers_count > 0 else None
 
         campaign_rollups: dict[int, dict[str, object]] = {}
+        daily_rollups: dict[date, dict[str, object]] = {}
         for metric in metrics:
             row = campaign_rollups.setdefault(
                 metric.campaign_id,
@@ -15757,6 +16206,18 @@ def create_app() -> FastAPI:
             row["rows_count"] = int(row["rows_count"]) + 1
             if metric.metric_date and metric.metric_date > row["last_metric_date"]:
                 row["last_metric_date"] = metric.metric_date
+            daily_row = daily_rollups.setdefault(
+                metric.metric_date,
+                {
+                    "date": metric.metric_date,
+                    "spend": Decimal("0"),
+                    "leads_count": 0,
+                    "conversions_count": 0,
+                },
+            )
+            daily_row["spend"] = Decimal(daily_row["spend"]) + Decimal(metric.spend)
+            daily_row["leads_count"] = int(daily_row["leads_count"]) + int(metric.leads_count or 0)
+            daily_row["conversions_count"] = int(daily_row["conversions_count"]) + int(metric.conversions_count or 0)
 
         ads_campaign_rows: list[dict[str, object]] = []
         for row in campaign_rollups.values():
@@ -15778,6 +16239,17 @@ def create_app() -> FastAPI:
             ),
             reverse=True,
         )
+        ads_daily_rows = []
+        for metric_date in sorted(daily_rollups.keys(), reverse=True):
+            row = daily_rollups[metric_date]
+            spend = Decimal(row["spend"])
+            leads_count = int(row["leads_count"])
+            ads_daily_rows.append(
+                {
+                    **row,
+                    "cpl": (spend / Decimal(leads_count)).quantize(Decimal("0.01")) if leads_count > 0 else None,
+                }
+            )
         dashboard_period = period if period in {"today", "yesterday", "week", "month"} else "month"
         dashboard = ExecutiveDashboardService(session).get_dashboard(runtime.context, dashboard_period)
         advertising_widget = dashboard.get("widgets", {}).get("advertising", {}) if isinstance(dashboard, dict) else {}
@@ -15802,9 +16274,13 @@ def create_app() -> FastAPI:
                 "conversions_total": conversions_total,
                 "cpl_total": cpl_total,
                 "acquired_customers_count": acquired_customers_count,
+                "won_revenue_total": won_revenue_total,
+                "avg_check_value": avg_check_value,
                 "cac_value": cac_value,
             },
             "ads_campaign_rows": ads_campaign_rows[:20],
+            "ads_daily_rows": ads_daily_rows[:31],
+            "ads_latest_metric_date": metrics[0].metric_date if metrics else None,
             "ads_recent_metrics": [
                 {
                     "metric": item,
