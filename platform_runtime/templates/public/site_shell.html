@@ -1,0 +1,829 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf-token" content="{{ site_csrf_token or '' }}">
+  <title>{{ site_section.label }} · {{ brand_title }}</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230f172a'/%3E%3Cpath d='M9 10h14v3H9zm0 5h14v3H9zm0 5h9v3H9z' fill='%23fff'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/admin-static/public.css?v={{ admin_asset_version }}">
+</head>
+<body>
+  <main class="site-shell">
+    <aside class="site-sidebar">
+      <div class="site-brand">
+        <div class="site-brand-copy">
+          <div class="site-brand-lead">Рабочая система</div>
+          <div class="site-brand-line">для владельца:</div>
+          <div class="site-brand-line">все показатели в одном месте</div>
+        </div>
+      </div>
+      <form class="site-search" method="get" action="{{ site_global_search.action }}">
+        {% for item in site_global_search.hidden %}
+        <input type="hidden" name="{{ item.name }}" value="{{ item.value }}">
+        {% endfor %}
+        <label class="site-search-field">
+          <span>Поиск</span>
+          <input type="text" name="{{ site_global_search.field_name }}" placeholder="{{ site_global_search.placeholder }}">
+        </label>
+        <button class="button secondary site-search-button" type="submit">Открыть</button>
+      </form>
+      <nav class="site-nav">
+        {% for item in site_nav %}
+        <a class="site-nav-link {% if item.key == site_section.key %}active{% endif %}" href="/site/{{ item.key }}">{{ item.label }}</a>
+        {% endfor %}
+      </nav>
+      <div class="site-side-actions">
+        {% if can_public_sync_all and public_runtime is not none %}
+        <button class="button site-sync-all-button" type="button">Обновить всё</button>
+        <div class="site-brand-copy site-sync-all-status-wrap" style="margin-top: 8px;">
+          <div class="site-brand-lead site-sync-all-status"></div>
+        </div>
+        {% endif %}
+        <a class="button" href="{{ account_href }}">{{ account_label or 'Аккаунт' }}</a>
+        <a class="button secondary" href="{{ login_href }}">{{ login_label or 'Вход' }}</a>
+        <a class="button ghost" href="{{ register_href }}">Регистрация</a>
+      </div>
+    </aside>
+
+    <section class="site-content">
+      <nav class="site-breadcrumbs" aria-label="Breadcrumb">
+        {% for item in site_breadcrumbs %}
+        {% if item.href %}
+        <a class="site-breadcrumb-link" href="{{ item.href }}">{{ item.label }}</a>
+        {% else %}
+        <span class="site-breadcrumb-current">{{ item.label }}</span>
+        {% endif %}
+        {% if not loop.last %}
+        <span class="site-breadcrumb-sep">/</span>
+        {% endif %}
+        {% endfor %}
+      </nav>
+      {% if can_public_sync_all and public_runtime is not none %}
+      <div class="cta-row" style="margin-bottom: 16px; align-items: center;">
+        <button class="button site-sync-all-button" type="button">Обновить всё</button>
+        <span class="subtle site-sync-all-status"></span>
+      </div>
+      {% endif %}
+      {% if site_charts %}
+      <section class="chart-shell">
+        <div class="chart-toolbar">
+          <div class="chart-nav">
+            <button class="chart-arrow" type="button" aria-label="Предыдущий период">‹</button>
+            <div>
+              <div class="eyebrow">{{ site_section.eyebrow }}</div>
+              <h2>{{ site_section.title }}</h2>
+            </div>
+            <button class="chart-arrow" type="button" aria-label="Следующий период">›</button>
+          </div>
+          <div class="chart-periods" aria-label="Период">
+            {% for period in site_charts.periods %}
+            <button class="chart-period {% if period == site_charts.selected_period %}active{% endif %}" type="button">{{ period }}</button>
+            {% endfor %}
+          </div>
+        </div>
+
+        <section class="chart-grid">
+          {% for chart in site_charts.charts %}
+          <article class="public-card chart-card">
+            <div class="section-head compact">
+              <div>
+                <div class="eyebrow">{{ chart.title }}</div>
+                {% if chart.subtitle %}
+                <h2>{{ chart.subtitle }}</h2>
+                {% endif %}
+              </div>
+              <strong class="chart-value">{{ chart.value }}</strong>
+            </div>
+            <div class="chart-bars" aria-hidden="true">
+              {% for value in chart.bars %}
+              <span class="chart-bar" style="height: {{ value }}%;"></span>
+              {% endfor %}
+            </div>
+          </article>
+          {% endfor %}
+        </section>
+      </section>
+      {% elif site_dashboard %}
+      <article class="hero-card site-hero">
+        <div class="dashboard-toolbar">
+          <div class="dashboard-toolbar-head">
+            <div class="eyebrow">Показатели</div>
+            <h2>Период: {{ site_dashboard.filters.period_label }}</h2>
+            <p class="dashboard-summary">{{ site_dashboard.summary }}</p>
+          </div>
+        </div>
+        <div class="dashboard-periods" aria-label="Период">
+          {% for item in site_dashboard.filters.periods %}
+          <a
+            class="dashboard-period {% if item.code == site_dashboard.filters.period_code %}active{% endif %}"
+            href="/site/dashboard?period={{ item.code }}{% if item.code == 'custom' %}&date_from={{ site_dashboard.filters.date_from }}&date_to={{ site_dashboard.filters.date_to }}{% endif %}"
+          >
+            {{ item.label }}
+          </a>
+          {% endfor %}
+        </div>
+        {% if site_dashboard.filters.period_code == 'custom' %}
+        <form class="dashboard-filter-form" method="get" action="/site/dashboard">
+          <input type="hidden" name="period" value="custom">
+          <label class="dashboard-date-field">
+            <span>С</span>
+            <input type="date" name="date_from" value="{{ site_dashboard.filters.date_from }}">
+          </label>
+          <label class="dashboard-date-field">
+            <span>По</span>
+            <input type="date" name="date_to" value="{{ site_dashboard.filters.date_to }}">
+          </label>
+          <button class="button dashboard-apply-button" type="submit">Применить</button>
+        </form>
+        {% endif %}
+        <p class="lead">{{ site_section.description }}</p>
+        {% if site_dashboard.quick_actions %}
+        <div class="cta-row">
+          {% for item in site_dashboard.quick_actions %}
+          <a class="button {% if item.tone == 'secondary' %}secondary{% elif item.tone == 'ghost' %}ghost{% endif %}" href="{{ item.href }}">{{ item.label }}</a>
+          {% endfor %}
+        </div>
+        {% endif %}
+      </article>
+
+      <section class="metric-grid dashboard-metric-grid">
+        {% for item in site_dashboard.top_metrics %}
+        <article class="metric-box dashboard-metric-box priority-{{ item.priority }} {% if item.tone == 'danger' %}tone-danger{% elif item.tone == 'warning' %}tone-warning{% endif %}">
+          <span class="metric-label">{{ item.label }}</span>
+          <strong class="dashboard-metric-value">{{ item.value }}</strong>
+          <span>{{ item.meta }}</span>
+        </article>
+        {% endfor %}
+      </section>
+
+      <section class="chart-shell dashboard-chart-shell">
+        <div class="section-head compact">
+          <div>
+            <div class="eyebrow">Графики</div>
+            <h2>{{ site_dashboard.charts_title }}</h2>
+          </div>
+        </div>
+        <p class="lead">{{ site_dashboard.charts_description }}</p>
+        <section class="chart-grid">
+          {% for chart in site_dashboard.charts %}
+          <article class="public-card chart-card">
+            <div class="section-head compact">
+              <div>
+                <div class="eyebrow">{{ chart.title }}</div>
+                <p class="chart-meta">{{ chart.meta }}</p>
+              </div>
+              <strong class="chart-value">{{ chart.value }}</strong>
+            </div>
+            <div class="chart-bars" aria-hidden="true">
+              {% for value in chart.bars %}
+              <span class="chart-bar" style="height: {{ value }}%;"></span>
+              {% endfor %}
+            </div>
+            <div class="chart-card-footer">
+              <a class="button ghost" href="{{ chart.href }}">Смотреть все графики</a>
+            </div>
+          </article>
+          {% endfor %}
+        </section>
+      </section>
+
+      {% elif site_domain_charts %}
+      <article class="hero-card site-hero">
+        <div class="dashboard-toolbar">
+          <div class="dashboard-toolbar-head">
+            <div class="eyebrow">{{ site_domain_charts.eyebrow }}</div>
+            <h2>{{ site_domain_charts.title }}</h2>
+          </div>
+        </div>
+        <div class="dashboard-periods" aria-label="Период">
+          {% for item in site_domain_charts.filters.periods %}
+          <a
+            class="dashboard-period {% if item.code == site_domain_charts.filters.period_code %}active{% endif %}"
+            href="/site/{{ site_section.key }}?view=charts&period={{ item.code }}{% if item.code == 'custom' %}&date_from={{ site_domain_charts.filters.date_from }}&date_to={{ site_domain_charts.filters.date_to }}{% endif %}{% if site_domain_charts.active_source %}&source={{ site_domain_charts.active_source }}{% endif %}"
+          >
+            {{ item.label }}
+          </a>
+          {% endfor %}
+        </div>
+        {% if site_domain_charts.filters.period_code == 'custom' %}
+        <form class="dashboard-filter-form" method="get" action="/site/{{ site_section.key }}">
+          <input type="hidden" name="view" value="charts">
+          <input type="hidden" name="period" value="custom">
+          {% if site_domain_charts.active_source %}
+          <input type="hidden" name="source" value="{{ site_domain_charts.active_source }}">
+          {% endif %}
+          <label class="dashboard-date-field">
+            <span>С</span>
+            <input type="date" name="date_from" value="{{ site_domain_charts.filters.date_from }}">
+          </label>
+          <label class="dashboard-date-field">
+            <span>По</span>
+            <input type="date" name="date_to" value="{{ site_domain_charts.filters.date_to }}">
+          </label>
+          <button class="button dashboard-apply-button" type="submit">Применить</button>
+        </form>
+        {% endif %}
+        {% if site_domain_charts.sources %}
+        <div class="dashboard-periods" aria-label="Источник">
+          {% for item in site_domain_charts.sources %}
+          <a class="dashboard-period {% if item.active %}active{% endif %}" href="{{ item.href }}">{{ item.label }}</a>
+          {% endfor %}
+        </div>
+        {% endif %}
+        <p class="lead">{{ site_domain_charts.description }}</p>
+        <div class="cta-row">
+          <a class="button ghost" href="/site/dashboard?period={{ site_domain_charts.filters.period_code }}{% if site_domain_charts.filters.period_code == 'custom' %}&date_from={{ site_domain_charts.filters.date_from }}&date_to={{ site_domain_charts.filters.date_to }}{% endif %}">Назад в показатели</a>
+        </div>
+      </article>
+
+      <section class="chart-shell dashboard-chart-shell">
+        <div class="section-head compact">
+          <div>
+            <div class="eyebrow">Категория</div>
+            <h2>{{ site_domain_charts.eyebrow }}</h2>
+          </div>
+        </div>
+        <section class="chart-grid">
+          {% for chart in site_domain_charts.charts %}
+          <article class="public-card chart-card">
+            <div class="section-head compact">
+              <div>
+                <div class="eyebrow">{{ chart.title }}</div>
+                <h2>{{ chart.subtitle }}</h2>
+              </div>
+              {% if chart.kind != 'list' %}
+              <strong class="chart-value">{{ chart.value }}</strong>
+              {% endif %}
+            </div>
+            {% if chart.kind == 'list' %}
+            <div class="chart-list" aria-label="{{ chart.title }}">
+              {% for item in chart['items'] %}
+              <div class="chart-list-item">
+                <span>{{ item.label }}</span>
+                <strong>{{ item.value }}</strong>
+              </div>
+              {% endfor %}
+            </div>
+            {% else %}
+            <div class="chart-bars" aria-hidden="true">
+              {% for value in chart.bars %}
+              <span class="chart-bar" style="height: {{ value }}%;"></span>
+              {% endfor %}
+            </div>
+            {% endif %}
+          </article>
+          {% endfor %}
+        </section>
+      </section>
+
+      {% elif site_workspace_surface %}
+      <article class="hero-card site-hero" id="{{ site_workspace_surface.workspace_id }}">
+        <div class="dashboard-toolbar">
+          <div class="dashboard-toolbar-head">
+            <div class="eyebrow">{{ site_workspace_surface.section_label }}</div>
+            <h2>{{ site_workspace_surface.title }}</h2>
+            <p class="dashboard-summary">{{ site_workspace_surface.description }}</p>
+            {% if site_workspace_surface.context_line %}
+            <p class="workspace-context-line">{{ site_workspace_surface.context_line }}</p>
+            {% endif %}
+            {% if site_public_message %}
+            <p class="workspace-context-line {% if site_public_message.level == 'error' %}tone-danger{% elif site_public_message.level == 'success' %}tone-success{% elif site_public_message.level == 'warning' %}tone-warning{% endif %}">{{ site_public_message.message }}</p>
+            {% endif %}
+          </div>
+        </div>
+        {% if site_workspace_back_button %}
+        <div class="cta-row workspace-back-row">
+          <a class="button ghost" href="{{ site_workspace_back_button.href }}">{{ site_workspace_back_button.label }}</a>
+        </div>
+        {% endif %}
+        {% if site_section_status %}
+        <section class="workspace-section-status">
+          <article class="workspace-state-card {% if site_section_status.tone == 'danger' %}tone-danger{% elif site_section_status.tone == 'warning' %}tone-warning{% elif site_section_status.tone == 'success' %}tone-success{% endif %}">
+            <span class="metric-label">{{ site_section_status.label }}</span>
+            <strong>{{ site_section_status.value }}</strong>
+            <span>{{ site_section_status.meta }}</span>
+          </article>
+        </section>
+        {% endif %}
+        {% if not site_workspace_surface.hide_periods %}
+        <div class="dashboard-periods" aria-label="Период">
+          {% for item in site_workspace_surface.filters.periods %}
+          <a
+            class="dashboard-period {% if item.code == site_workspace_surface.filters.period_code %}active{% endif %}"
+            href="{{ item.href }}"
+          >
+            {{ item.label }}
+          </a>
+          {% endfor %}
+        </div>
+        {% if site_workspace_surface.filters.period_code == 'custom' %}
+        <form class="dashboard-filter-form" method="get" action="/site/{{ site_section.key }}#{{ site_workspace_surface.workspace_id }}">
+          <input type="hidden" name="selected_date" value="{{ site_workspace_surface.filters.anchor_date }}">
+          <input type="hidden" name="tab" value="{{ site_workspace_surface.active_tab }}">
+          <input type="hidden" name="detail" value="{{ site_workspace_surface.active_detail }}">
+          {% if site_workspace_surface.active_scope %}
+          <input type="hidden" name="scope" value="{{ site_workspace_surface.active_scope }}">
+          {% endif %}
+          <input type="hidden" name="period" value="custom">
+          <label class="dashboard-date-field">
+            <span>С</span>
+            <input type="date" name="date_from" value="{{ site_workspace_surface.filters.date_from }}">
+          </label>
+          <label class="dashboard-date-field">
+            <span>По</span>
+            <input type="date" name="date_to" value="{{ site_workspace_surface.filters.date_to }}">
+          </label>
+          <button class="button dashboard-apply-button" type="submit">Применить</button>
+        </form>
+        {% endif %}
+        {% endif %}
+      </article>
+
+      <section class="public-card finance-actions-shell">
+        <div class="finance-action-sections">
+          {% for group in site_workspace_surface.tab_groups %}
+          <section class="finance-action-group {% if group.primary %}finance-action-group-primary{% endif %}">
+            <div class="section-head compact">
+              <div>
+                <div class="eyebrow">{{ group.eyebrow }}</div>
+                <h2>{{ group.title }}</h2>
+              </div>
+            </div>
+            <div class="action-grid finance-action-grid {% if group.primary %}finance-action-grid-primary{% endif %}">
+              {% for item in group['items'] %}
+              <a class="action-card finance-action-card {% if group.primary %}finance-action-card-primary{% endif %} {% if item.active %}active{% endif %}" href="{{ item.href }}">
+                {% if item.icon %}
+                <span class="action-icon">{{ item.icon }}</span>
+                {% endif %}
+                <strong>{{ item.label }}</strong>
+              </a>
+              {% endfor %}
+            </div>
+          </section>
+          {% endfor %}
+        </div>
+        {% if site_section.key == 'integrations' and site_workspace_surface.active_tab == 'avito' %}
+        <div class="cta-row" style="margin-top: 14px;">
+          <a class="button" href="/site/integrations/avito/start">Подключить Авито</a>
+        </div>
+        {% endif %}
+      </section>
+
+      {% if site_workspace_surface.subtabs %}
+      <section class="public-card finance-actions-shell">
+        <div class="section-head compact">
+          <div>
+            <div class="eyebrow">Следующий уровень</div>
+            <h2>{{ site_workspace_surface.title }}</h2>
+          </div>
+        </div>
+        <div class="dashboard-periods" aria-label="Подменю">
+          {% for item in site_workspace_surface.subtabs %}
+          <a class="dashboard-period {% if item.active %}active{% endif %}" href="{{ item.href }}">{{ item.label }}</a>
+          {% endfor %}
+        </div>
+      </section>
+      {% endif %}
+
+      {% if site_workspace_surface.states %}
+      <section class="workspace-state-strip">
+        {% for item in site_workspace_surface.states %}
+        <article class="workspace-state-card {% if item.tone == 'danger' %}tone-danger{% elif item.tone == 'warning' %}tone-warning{% elif item.tone == 'success' %}tone-success{% endif %}">
+          <span class="metric-label">{{ item.label }}</span>
+          <strong>{{ item.value }}</strong>
+          <span>{{ item.meta }}</span>
+        </article>
+        {% endfor %}
+      </section>
+      {% endif %}
+
+      <section class="metric-grid dashboard-metric-grid">
+        {% for item in site_workspace_surface.metrics %}
+        <article class="metric-box dashboard-metric-box priority-secondary {% if item.tone == 'danger' %}tone-danger{% elif item.tone == 'warning' %}tone-warning{% endif %}">
+          <span class="metric-label">{{ item.label }}</span>
+          <strong class="dashboard-metric-value">{{ item.value }}</strong>
+          <span>{{ item.meta }}</span>
+        </article>
+        {% endfor %}
+      </section>
+
+      <section class="site-grid finance-detail-grid">
+        {% for panel in site_workspace_surface.panels %}
+        <article class="public-card">
+          <div class="section-head compact">
+            <div>
+              <div class="eyebrow">{{ panel.title }}</div>
+              <h2>{{ panel.subtitle }}</h2>
+            </div>
+          </div>
+          {% if panel.kind == 'chips' %}
+          <div class="list-grid finance-chip-grid" style="margin-top: 14px;">
+            {% for item in panel['items'] %}
+            <a class="list-chip {% if item.active %}active{% endif %}" href="{{ item.href }}">{{ item.label }}</a>
+            {% endfor %}
+          </div>
+          {% if panel.note %}
+          <p class="finance-panel-note">{{ panel.note }}</p>
+          {% endif %}
+          {% elif panel.kind == 'avito_oauth' %}
+          <div style="margin-top: 14px;">
+            {% if panel.client_id and panel.state %}
+            <div class="avito-oauth-shell">
+              <script
+                class="Avito_oauth"
+                charset="utf-8"
+                data-client-id="{{ panel.client_id }}"
+                data-title="{{ panel.button_title }}"
+                data-compact="false"
+                data-class-name="avito-oauth-button"
+                data-color="red"
+                {% if panel.scope %}data-scope="{{ panel.scope }}"{% endif %}
+                data-state="{{ panel.state }}"
+                src="https://www.avito.ru/auth/button.js"
+              ></script>
+            </div>
+            <div class="cta-row" style="margin-top: 12px;">
+              <a class="button" href="{{ panel.oauth_start_href or '/site/integrations/avito/start' }}">Подключить Авито</a>
+            </div>
+            {% else %}
+            <div class="stack-item finance-detail-item">
+              <span>Статус</span>
+              <strong>Avito OAuth не настроен</strong>
+            </div>
+            {% endif %}
+          </div>
+          {% if panel.note %}
+          <p class="finance-panel-note">{{ panel.note }}</p>
+          {% endif %}
+          {% elif panel.kind == 'telegram_app' %}
+          <div class="stack-list" style="margin-top: 14px;">
+            {% for item in panel['items'] %}
+            <div class="stack-item finance-detail-item">
+              <span>{{ item.label }}</span>
+              <strong>{{ item.value }}</strong>
+            </div>
+            {% endfor %}
+          </div>
+          {% if panel.image_url %}
+          <div style="margin-top: 16px; display: grid; justify-items: start; gap: 12px;">
+            <img src="{{ panel.image_url }}" alt="QR Telegram" style="width: 164px; height: 164px; border-radius: 20px; border: 1px solid rgba(15, 23, 42, 0.08); background: #fff; object-fit: contain; padding: 10px;">
+          </div>
+          {% endif %}
+          {% if panel.note %}
+          <p class="finance-panel-note">{{ panel.note }}</p>
+          {% endif %}
+          {% if panel.href %}
+          <div class="cta-row">
+            <a class="button" href="{{ panel.href }}" target="_blank" rel="noreferrer">{{ panel.button_label or 'Открыть' }}</a>
+          </div>
+          {% endif %}
+          {% elif panel.kind == 'form' %}
+          <form class="finance-inline-form" method="{{ panel.method or 'get' }}" action="{{ panel.action }}">
+            {% for field in panel.hidden %}
+            <input type="hidden" name="{{ field.name }}" value="{{ field.value }}">
+            {% endfor %}
+            <div class="stack-list" style="margin-top: 14px;">
+              {% for item in panel['items'] %}
+              <label class="stack-item finance-form-field">
+                <span class="finance-field-label">{{ item.label }}{% if item.required %} *{% endif %}</span>
+                {% if item.type == 'date' %}
+                <input type="date" name="{{ item.name }}" value="{{ item.value }}">
+                {% elif item.type == 'file' %}
+                <input type="file" name="{{ item.name }}">
+                {% elif item.type == 'textarea' %}
+                <textarea name="{{ item.name }}" class="finance-form-textarea">{{ item.value }}</textarea>
+                {% elif item.type == 'select' %}
+                <select name="{{ item.name }}">
+                  {% for option in item.options %}
+                  <option value="{{ option }}" {% if option == item.value %}selected{% endif %}>{{ option }}</option>
+                  {% endfor %}
+                </select>
+                {% else %}
+                <input type="text" name="{{ item.name }}" value="{{ item.value }}">
+                {% endif %}
+                {% if item.hint %}
+                <small class="finance-form-hint">{{ item.hint }}</small>
+                {% endif %}
+              </label>
+              {% endfor %}
+            </div>
+            {% if panel.note %}
+            <p class="finance-panel-note">{{ panel.note }}</p>
+            {% endif %}
+            <div class="cta-row">
+              <button class="button" type="submit" {% if panel.button_name %}name="{{ panel.button_name }}"{% endif %}{% if panel.button_value %} value="{{ panel.button_value }}"{% endif %}>{{ panel.button_label }}</button>
+              {% if panel.secondary_button_label %}
+              <button
+                class="button secondary"
+                type="submit"
+                {% if panel.secondary_button_name %}name="{{ panel.secondary_button_name }}"{% endif %}
+                {% if panel.secondary_button_value %}value="{{ panel.secondary_button_value }}"{% endif %}
+              >
+                {{ panel.secondary_button_label }}
+              </button>
+              {% endif %}
+            </div>
+          </form>
+          {% elif panel.kind == 'qr_cards' %}
+          <div class="stack-list" style="margin-top: 14px;">
+            {% for item in panel['items'] %}
+            <div
+              class="stack-item finance-detail-item telegram-qr-card"
+              style="align-items: flex-start; gap: 14px;"
+              {% if item.status_url %}data-status-url="{{ item.status_url }}"{% endif %}
+              {% if item.refresh_url %}data-refresh-url="{{ item.refresh_url }}"{% endif %}
+              {% if item.password_url %}data-password-url="{{ item.password_url }}"{% endif %}
+            >
+              <img
+                class="telegram-qr-card-image"
+                src="{{ item.image_url or '' }}"
+                alt="QR {{ item.label }}"
+                style="width: 132px; height: 132px; border-radius: 16px; border: 1px solid rgba(15, 23, 42, 0.08); background: #fff; object-fit: contain; padding: 8px; {% if not item.image_url %}display: none;{% endif %}"
+              >
+              <div style="display: grid; gap: 8px;">
+                <span>{{ item.label }}</span>
+                <strong class="telegram-qr-card-message">{{ item.value }}</strong>
+                <div class="status-line telegram-qr-card-status">{{ item.status or '' }}</div>
+                <div class="status-line telegram-qr-card-expiry">Нажмите кнопку ниже, чтобы выпустить новый QR-код.</div>
+                {% if item.refresh_url %}
+                <div class="cta-row" style="margin-top: 0;">
+                  <a class="button secondary telegram-qr-card-refresh" href="{{ item.page_refresh_href or item.refresh_url }}">Обновить QR-код</a>
+                </div>
+                {% endif %}
+                <div class="telegram-qr-card-password-block" style="display: none;">
+                  <label style="display: grid; gap: 6px;">
+                    <span>Облачный пароль Telegram</span>
+                    <input type="password" class="telegram-qr-card-password-input" placeholder="Введите cloud password">
+                  </label>
+                  <div class="cta-row" style="margin-top: 8px;">
+                    <button class="button secondary telegram-qr-card-password-submit" type="button">Подтвердить пароль</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+            {% endfor %}
+          </div>
+          {% if panel.note %}
+          <p class="finance-panel-note">{{ panel.note }}</p>
+          {% endif %}
+          {% else %}
+          <div class="stack-list" style="margin-top: 14px;">
+            {% for item in panel['items'] %}
+            <div class="stack-item finance-detail-item">
+              <span>{{ item.label }}</span>
+              <strong>{{ item.value }}</strong>
+            </div>
+            {% endfor %}
+          </div>
+          {% if panel.note %}
+          <p class="finance-panel-note">{{ panel.note }}</p>
+          {% endif %}
+          {% endif %}
+        </article>
+        {% endfor %}
+      </section>
+
+      {% else %}
+      <section class="site-grid">
+        <article class="public-card">
+          <div class="section-head compact">
+            <div>
+              <div class="eyebrow">Что здесь будет</div>
+              <h2>Основные блоки</h2>
+            </div>
+          </div>
+          <div class="list-grid" style="margin-top: 14px;">
+            {% for item in site_section.later %}
+            <span class="list-chip">{{ item }}</span>
+            {% endfor %}
+          </div>
+        </article>
+
+        <article class="public-card">
+          <div class="section-head compact">
+            <div>
+              <div class="eyebrow">Главные действия</div>
+              <h2>Ключевые действия пользователя</h2>
+            </div>
+          </div>
+          <div class="stack-list" style="margin-top: 14px;">
+            {% for item in site_section.actions %}
+            <div class="stack-item">
+              <strong>{{ item }}</strong>
+              <span>Позже сюда подключим живую логику из ядра и сделаем действие рабочим.</span>
+            </div>
+            {% endfor %}
+          </div>
+        </article>
+      </section>
+      {% endif %}
+    </section>
+  </main>
+  <script>
+    const siteCsrfToken = {{ site_csrf_token|tojson }};
+    window.siteFetch = function (url, options) {
+      const next = {...(options || {})};
+      const headers = new Headers(next.headers || {});
+      if (siteCsrfToken && !headers.has("X-CSRF-Token")) {
+        headers.set("X-CSRF-Token", siteCsrfToken);
+      }
+      next.headers = headers;
+      return fetch(url, next);
+    };
+
+    (function () {
+      const syncButtons = Array.from(document.querySelectorAll(".site-sync-all-button"));
+      const statusNodes = Array.from(document.querySelectorAll(".site-sync-all-status"));
+      if (!syncButtons.length) return;
+      syncButtons.forEach(function (syncButton) {
+        syncButton.addEventListener("click", function () {
+          syncButtons.forEach(function (button) { button.disabled = true; });
+          statusNodes.forEach(function (node) { node.textContent = "Запускаю синхронизацию..."; });
+          window.siteFetch(`/admin/{{ public_runtime.account.slug if public_runtime is not none else '' }}/sync-all`, {
+            method: "POST",
+            credentials: "same-origin",
+          })
+            .then(function (response) {
+              if (!response.ok) {
+                return response.text().then(function (text) { throw new Error(text); });
+              }
+              return response.json();
+            })
+            .then(function (payload) {
+              const message = payload.failed_count
+                ? `Запущено ${payload.count}, ошибок ${payload.failed_count}`
+                : `Запущено ${payload.count} интеграций`;
+              statusNodes.forEach(function (node) { node.textContent = message; });
+              window.location.reload();
+            })
+            .catch(function (error) {
+              statusNodes.forEach(function (node) { node.textContent = "Ошибка синхронизации: " + error; });
+              syncButtons.forEach(function (button) { button.disabled = false; });
+            });
+        });
+      });
+    }());
+
+    (function () {
+      const workspace = document.querySelector('[id$="-workspace"]');
+      if (!workspace) return;
+      const key = "site-workspace-scroll:" + window.location.pathname;
+      const saved = window.sessionStorage.getItem(key);
+      if (saved) {
+        window.requestAnimationFrame(function () {
+          window.scrollTo(0, Number(saved));
+          window.sessionStorage.removeItem(key);
+        });
+      }
+      document.querySelectorAll('a[href*="' + window.location.pathname + '"]').forEach(function (link) {
+        link.addEventListener("click", function () {
+          window.sessionStorage.setItem(key, String(window.scrollY));
+        });
+      });
+      document.querySelectorAll('form[action*="' + window.location.pathname + '"]').forEach(function (form) {
+        form.addEventListener("submit", function () {
+          window.sessionStorage.setItem(key, String(window.scrollY));
+        });
+      });
+    }());
+
+    (function () {
+      const cards = document.querySelectorAll(".telegram-qr-card[data-status-url][data-refresh-url]");
+      if (!cards.length) return;
+
+      function qrRequestUrl(url) {
+        const next = new URL(url, window.location.origin);
+        next.searchParams.set("_ts", String(Date.now()));
+        return next.toString();
+      }
+
+      async function loadCard(card, forceRefresh) {
+        const imageNode = card.querySelector(".telegram-qr-card-image");
+        const messageNode = card.querySelector(".telegram-qr-card-message");
+        const statusNode = card.querySelector(".telegram-qr-card-status");
+        const expiryNode = card.querySelector(".telegram-qr-card-expiry");
+        const passwordBlock = card.querySelector(".telegram-qr-card-password-block");
+        const response = await fetch(qrRequestUrl(forceRefresh ? card.dataset.refreshUrl : card.dataset.statusUrl), {
+          credentials: "same-origin",
+          cache: "no-store",
+        });
+        if (!response.ok) {
+          throw new Error(await response.text());
+        }
+        const payload = await response.json();
+        messageNode.textContent = payload.message || "";
+        statusNode.textContent = payload.connected ? "подключен" : payload.pending ? "ожидает вход" : payload.state === "password_required" ? "нужен пароль" : "не подключен";
+        expiryNode.textContent = payload.expires_at
+          ? `QR действует до ${payload.expires_at}`
+          : payload.connected
+          ? "Аккаунт уже подключен. При необходимости можно выпустить новый QR."
+          : "Нажмите кнопку ниже, чтобы выпустить новый QR-код.";
+        if (payload.qr_image_data_uri) {
+          imageNode.src = payload.qr_image_data_uri;
+          imageNode.style.display = "";
+        } else {
+          imageNode.style.display = "none";
+        }
+        if (passwordBlock) {
+          passwordBlock.style.display = payload.requires_password ? "" : "none";
+        }
+        if (payload.pending) {
+          window.setTimeout(function () { loadCard(card, false).catch(function () {}); }, 4000);
+        }
+        return payload;
+      }
+
+      cards.forEach(function (card) {
+        const refreshButton = card.querySelector(".telegram-qr-card-refresh");
+        const passwordInput = card.querySelector(".telegram-qr-card-password-input");
+        const passwordSubmit = card.querySelector(".telegram-qr-card-password-submit");
+        if (refreshButton) {
+          refreshButton.addEventListener("click", function (event) {
+            event.preventDefault();
+            refreshButton.disabled = true;
+            const messageNode = card.querySelector(".telegram-qr-card-message");
+            messageNode.textContent = "Обновляем QR-код...";
+            loadCard(card, true)
+              .then(function () {
+                messageNode.textContent = "QR-код обновлен. Сканируйте новый код в Telegram.";
+              })
+              .catch(function (error) {
+                messageNode.textContent = "Ошибка QR: " + error;
+              })
+              .finally(function () {
+                refreshButton.disabled = false;
+              });
+          });
+        }
+        if (passwordSubmit && passwordInput && card.dataset.passwordUrl) {
+          passwordSubmit.addEventListener("click", function () {
+            const messageNode = card.querySelector(".telegram-qr-card-message");
+            passwordSubmit.disabled = true;
+            messageNode.textContent = "Проверяем облачный пароль...";
+            fetch(qrRequestUrl(card.dataset.passwordUrl), {
+              method: "POST",
+              credentials: "same-origin",
+              cache: "no-store",
+              headers: {
+                "Content-Type": "application/json",
+                "X-CSRF-Token": siteCsrfToken,
+              },
+              body: JSON.stringify({password: passwordInput.value}),
+            })
+              .then(function (response) {
+                if (!response.ok) {
+                  return response.text().then(function (text) { throw new Error(text); });
+                }
+                return response.json();
+              })
+              .then(function (payload) {
+                passwordInput.value = "";
+                if (payload.message) {
+                  messageNode.textContent = payload.message;
+                }
+                const imageNode = card.querySelector(".telegram-qr-card-image");
+                const statusNode = card.querySelector(".telegram-qr-card-status");
+                const expiryNode = card.querySelector(".telegram-qr-card-expiry");
+                const passwordBlock = card.querySelector(".telegram-qr-card-password-block");
+                statusNode.textContent = payload.connected ? "подключен" : payload.pending ? "ожидает вход" : payload.state === "password_required" ? "нужен пароль" : "не подключен";
+                expiryNode.textContent = payload.expires_at
+                  ? `QR действует до ${payload.expires_at}`
+                  : payload.connected
+                  ? "Аккаунт уже подключен. При необходимости можно выпустить новый QR."
+                  : "Нажмите кнопку ниже, чтобы выпустить новый QR-код.";
+                if (payload.qr_image_data_uri) {
+                  imageNode.src = payload.qr_image_data_uri;
+                  imageNode.style.display = "";
+                } else {
+                  imageNode.style.display = "none";
+                }
+                if (passwordBlock) {
+                  passwordBlock.style.display = payload.requires_password ? "" : "none";
+                }
+              })
+              .catch(function (error) {
+                messageNode.textContent = "Ошибка пароля: " + error;
+              })
+              .finally(function () {
+                passwordSubmit.disabled = false;
+              });
+          });
+        }
+        loadCard(card, false)
+          .then(function (payload) {
+            const imageNode = card.querySelector(".telegram-qr-card-image");
+            if (!payload.connected && !payload.pending && !imageNode.getAttribute("src")) {
+              return loadCard(card, true);
+            }
+            return null;
+          })
+          .catch(function (error) {
+            const messageNode = card.querySelector(".telegram-qr-card-message");
+            messageNode.textContent = "Ошибка QR: " + error;
+          });
+      });
+    }());
+  </script>
+</body>
+</html>

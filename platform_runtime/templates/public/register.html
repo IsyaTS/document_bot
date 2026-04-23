@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Регистрация · {{ brand_title }}</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230f172a'/%3E%3Cpath d='M9 10h14v3H9zm0 5h14v3H9zm0 5h9v3H9z' fill='%23fff'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/admin-static/public.css?v={{ admin_asset_version }}">
+</head>
+<body>
+  <main class="public-shell auth-shell">
+    <section class="auth-stage">
+      <article class="hero-card auth-side">
+        <div class="eyebrow">Регистрация</div>
+        <h1>Создать рабочий аккаунт</h1>
+        <p class="lead">Запусти пространство владельца без лишних шагов. Сначала аккаунт и компания, детали можно заполнить уже внутри системы.</p>
+        <div class="auth-badges">
+          <span class="chip">3 минуты на старт</span>
+          <span class="chip">Без лишних полей</span>
+          <span class="chip">Данные можно дополнять позже</span>
+        </div>
+        <div class="auth-points">
+          <div class="auth-point">
+            <strong>1. Аккаунт владельца</strong>
+            <span>Email и имя владельца для первого доступа.</span>
+          </div>
+          <div class="auth-point">
+            <strong>2. Компания</strong>
+            <span>Название компании без лишних деталей на старте.</span>
+          </div>
+          <div class="auth-point">
+            <strong>3. Установка пароля</strong>
+            <span>После регистрации сразу откроется экран установки пароля без ожидания письма.</span>
+          </div>
+        </div>
+      </article>
+
+      <article class="hero-card auth-panel">
+        <div class="section-head">
+          <div>
+            <div class="eyebrow">Новый аккаунт</div>
+            <h2>Регистрация</h2>
+          </div>
+          <a class="button ghost" href="{{ login_href }}">Уже есть вход</a>
+        </div>
+        {% if error_message %}
+        <div class="notice bad" style="margin-top: 16px;">{{ error_message }}</div>
+        {% endif %}
+        <form class="auth-form" method="post" action="/register">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <div class="auth-form-grid">
+            <label class="auth-field">
+              <span>Имя</span>
+              <input type="text" name="first_name" value="{{ form_values.first_name or '' }}" placeholder="Как к вам обращаться" required>
+            </label>
+            <label class="auth-field">
+              <span>Фамилия</span>
+              <input type="text" name="last_name" value="{{ form_values.last_name or '' }}" placeholder="Фамилия">
+            </label>
+          </div>
+          <label class="auth-field">
+            <span>Email</span>
+            <input type="email" name="email" value="{{ form_values.email or '' }}" placeholder="name@company.ru" required>
+          </label>
+          <div class="notice" style="margin-top: 12px;">
+            Пароль на этом шаге не нужен. После регистрации сразу откроется установка пароля.
+          </div>
+          <label class="auth-field">
+            <span>Название компании</span>
+            <input type="text" name="company_name" value="{{ form_values.company_name or '' }}" placeholder="Как называется компания" required>
+          </label>
+          <label class="auth-field auth-field-check">
+            <input type="checkbox" name="agree_rules" {% if form_values.agree_rules != '' or not error_message %}checked{% endif %}>
+            <span>Согласен с правилами и обработкой данных</span>
+          </label>
+          <div class="cta-row auth-actions">
+            <button class="button" type="submit">Создать аккаунт</button>
+            <a class="button secondary" href="{{ login_href }}">Войти</a>
+          </div>
+        </form>
+        <div class="auth-footer">
+          <span>После установки пароля откроется обычный вход в рабочее пространство.</span>
+        </div>
+      </article>
+    </section>
+  </main>
+</body>
+</html>

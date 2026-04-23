@@ -168,11 +168,17 @@ class AvitoAdsProviderAdapter(AdsProvider):
                 "account_ref": self._account_ref(credentials) if credentials.get("account_external_id") else None,
             }
         account_ref = self._account_ref(credentials)
-        profile: dict[str, Any] = {}
         try:
-            profile = self._client(credentials).fetch_json("/core/v1/accounts/self")
-        except requests.RequestException:
-            profile = {}
+            client = self._client(credentials)
+            profile = client.fetch_json("/core/v1/accounts/self")
+            campaigns, next_cursor = client.fetch_paginated(
+                self.campaigns_path_template.format(account_ref=account_ref),
+                params=self._query_params(credentials, "campaigns"),
+                items_key="campaigns",
+                max_pages=1,
+            )
+        except Exception as exc:
+            raise ValueError(f"Avito preflight failed: {exc}") from exc
         return {
             "provider_name": self.provider_name,
             "mode": "live",
@@ -180,6 +186,8 @@ class AvitoAdsProviderAdapter(AdsProvider):
             "account_ref": account_ref,
             "profile_name": self._string_field(profile, "name"),
             "profile_url": self._string_field(profile, "profile_url"),
+            "campaigns_sampled": len(campaigns),
+            "campaigns_next_cursor": next_cursor,
         }
 
     def _cursor_token(self, cursor: SyncCursor | None, key: str) -> str | None:
@@ -899,12 +907,26 @@ class MoySkladERPProviderAdapter(ERPProvider):
                 "mode": "fixture",
                 "connected": True,
             }
-        products, _ = self.fetch_products(credentials)
+        client = self._client(credentials)
+        preflight_checks = {
+            "products": ("entity/assortment", {"limit": 1}),
+            "stock": ("report/stock/bystore", {"limit": 1}),
+            "transfers": ("entity/move", {"limit": 1, "expand": "positions,targetStore,sourceStore"}),
+            "shipments": ("entity/demand", {"limit": 1, "expand": "positions,store,agent"}),
+            "purchases": ("entity/supply", {"limit": 1, "expand": "agent,store"}),
+        }
+        samples: dict[str, int] = {}
+        for check_name, (path, params) in preflight_checks.items():
+            try:
+                rows = client.fetch_rows(path, params=params)
+            except Exception as exc:
+                raise ValueError(f"MoySklad preflight failed on {check_name} ({path}): {exc}") from exc
+            samples[f"{check_name}_sampled"] = len(rows)
         return {
             "provider_name": self.provider_name,
             "mode": "live",
             "connected": True,
-            "products_sampled": len(products),
+            **samples,
         }
 
     def fetch_products(self, credentials: dict[str, object], cursor=None):

@@ -1,0 +1,306 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>{{ brand_title }} Mini App</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230f172a'/%3E%3Cpath d='M9 10h14v3H9zm0 5h14v3H9zm0 5h9v3H9z' fill='%23fff'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/admin-static/public.css?v={{ admin_asset_version }}">
+</head>
+<body class="tgapp-body">
+  <main class="tgapp-shell">
+    <section class="hero-card compact hero-stage mini-stage">
+      <div class="eyebrow">Telegram</div>
+      <h1>{{ brand_title }}</h1>
+      <p class="lead">{{ brand_subtitle }}</p>
+      <p class="muted">Экран нужен для быстрого входа в аккаунт и перехода к подключению Telegram через обычный аккаунт, без бота.</p>
+      {% if requires_login %}
+      <div class="cta-stack">
+        <a class="button" href="{{ login_href }}">Войти и открыть панель</a>
+      </div>
+      <div class="notice" style="margin-top: 14px;">После входа откройте интеграции и подключите Telegram через QR: Telegram → Настройки → Устройства → Подключить устройство.</div>
+      {% elif membership_error %}
+      <div class="notice bad">{{ membership_error }}</div>
+      <div class="notice" style="margin-top: 14px;">Telegram-подключение работает только внутри активного аккаунта. Войдите в нужный аккаунт и откройте интеграции.</div>
+      {% else %}
+      <div class="chips">
+        <span class="chip">{{ runtime.account.name }}</span>
+        <span class="chip">{{ runtime.role_code }}</span>
+        <span class="chip">{{ delivery.status }}</span>
+      </div>
+      {% endif %}
+    </section>
+
+    {% if not requires_login and not membership_error %}
+    <section class="public-card compact">
+      <div class="section-head compact">
+        <div>
+          <div class="eyebrow">Сегодня</div>
+          <h2>{{ runtime.account.name }}</h2>
+          <p class="muted">{{ runtime.actor_user.full_name or runtime.actor_user.email }}</p>
+        </div>
+        <a class="button secondary" href="/admin/{{ runtime.account.slug }}/dashboard">Полный web app</a>
+      </div>
+      <div class="metric-grid">
+        <div class="metric-box">
+          <span class="metric-label">Сделать сейчас</span>
+          <strong>{{ brief.must_do_now|length }}</strong>
+        </div>
+        <div class="metric-box">
+          <span class="metric-label">Критичные алерты</span>
+          <strong>{{ brief.critical_alerts|length }}</strong>
+        </div>
+        <div class="metric-box">
+          <span class="metric-label">Просроченные задачи</span>
+          <strong>{{ brief.overdue_tasks|length }}</strong>
+        </div>
+        <div class="metric-box">
+          <span class="metric-label">Цели под риском</span>
+          <strong>{{ brief.goals_at_risk|length }}</strong>
+        </div>
+      </div>
+    </section>
+
+    <section class="public-card compact">
+      <div class="section-head compact">
+        <div>
+          <div class="eyebrow">Контуры работы</div>
+          <h2>Куда идти дальше</h2>
+        </div>
+      </div>
+      <div class="action-grid">
+        <a class="action-card" href="/admin/{{ runtime.account.slug }}/people">
+          <strong>Команда</strong>
+          <span>Люди, задачи, KPI и зарплата.</span>
+        </a>
+        <a class="action-card" href="/admin/{{ runtime.account.slug }}/dashboard">
+          <strong>Деньги</strong>
+          <span>Выручка, расходы, обязательства и сводка.</span>
+        </a>
+        <a class="action-card" href="/admin/{{ runtime.account.slug }}/inventory">
+          <strong>Склад</strong>
+          <span>Остатки, пополнение, закупка и приемка.</span>
+        </a>
+        <a class="action-card" href="/admin/{{ runtime.account.slug }}/ai-workspace">
+          <strong>Контроль</strong>
+          <span>Панель, ИИ и понятный маршрут ввода.</span>
+        </a>
+      </div>
+    </section>
+
+    <section class="public-card compact">
+      <div class="section-head compact">
+        <div>
+          <div class="eyebrow">Быстрые действия</div>
+          <h2>Основные переходы</h2>
+        </div>
+      </div>
+      <div class="action-grid">
+        {% for item in quick_actions %}
+        <a class="action-card" href="{{ item.href }}">
+          <strong>{{ item.label }}</strong>
+          <span>{{ item.hint }}</span>
+        </a>
+        {% endfor %}
+      </div>
+    </section>
+
+    <section class="public-card compact">
+      <div class="section-head compact">
+        <div>
+          <div class="eyebrow">Действия без перехода</div>
+          <h2>Критичные алерты</h2>
+        </div>
+        <a class="button ghost" href="/admin/{{ runtime.account.slug }}/alerts-tasks?severity=critical">Все алерты</a>
+      </div>
+      <div class="stack-list">
+        {% if critical_alert_rows %}
+          {% for item in critical_alert_rows %}
+          <div class="stack-item action-item" id="alert-row-{{ item.id }}">
+            <strong>{{ item.title }}</strong>
+            <span>{{ item.code or item.severity }} · {{ item.status }}</span>
+            <div class="inline-actions">
+              <button type="button" class="button secondary mini-status-action" data-kind="alert" data-id="{{ item.id }}" data-status="acknowledged">Подтвердить</button>
+              <button type="button" class="button ghost mini-status-action" data-kind="alert" data-id="{{ item.id }}" data-status="dismissed">Скрыть</button>
+            </div>
+          </div>
+          {% endfor %}
+        {% else %}
+          <div class="empty-state">Критичных алертов сейчас нет.</div>
+        {% endif %}
+      </div>
+    </section>
+
+    <section class="public-card compact">
+      <div class="section-head compact">
+        <div>
+          <div class="eyebrow">Действия без перехода</div>
+          <h2>Просроченные задачи</h2>
+        </div>
+        <a class="button ghost" href="/admin/{{ runtime.account.slug }}/alerts-tasks?overdue=1">Все задачи</a>
+      </div>
+      <div class="stack-list">
+        {% if overdue_task_rows %}
+          {% for item in overdue_task_rows %}
+          <div class="stack-item action-item" id="task-row-{{ item.id }}">
+            <strong>{{ item.title }}</strong>
+            <span>{{ item.priority }} · {{ item.status }}{% if item.due_at %} · срок {{ item.due_at.strftime('%Y-%m-%d %H:%M') if item.due_at.strftime else item.due_at }}{% endif %}</span>
+            <div class="inline-actions">
+              <button type="button" class="button secondary mini-status-action" data-kind="task" data-id="{{ item.id }}" data-status="done">Выполнено</button>
+              <button type="button" class="button ghost mini-status-action" data-kind="task" data-id="{{ item.id }}" data-status="open">Вернуть</button>
+            </div>
+          </div>
+          {% endfor %}
+        {% else %}
+          <div class="empty-state">Просроченных задач сейчас нет.</div>
+        {% endif %}
+      </div>
+    </section>
+
+    <section class="public-card compact">
+      <div class="section-head compact">
+        <div>
+          <div class="eyebrow">Telegram</div>
+          <h2>Подключение аккаунтов</h2>
+        </div>
+        <a class="button ghost" href="/admin/{{ runtime.account.slug }}/integrations">Открыть интеграции</a>
+      </div>
+      <p class="muted">Telegram подключается только обычными аккаунтами через QR. Для входа откройте интеграции, выберите Telegram и отсканируйте код в приложении: Telegram → Настройки → Устройства → Подключить устройство.</p>
+    </section>
+
+    {% if legacy_summary %}
+    <section class="public-card compact">
+      <div class="section-head compact">
+        <div>
+          <div class="eyebrow">Старые данные</div>
+          <h2>Что перенесено из старых ботов</h2>
+        </div>
+        <a class="button ghost" href="/admin/{{ runtime.account.slug }}/legacy">Открыть раздел</a>
+      </div>
+      <div class="metric-grid">
+        <div class="metric-box">
+          <span class="metric-label">Скопированные файлы</span>
+          <strong>{{ legacy_summary.inventory_copied_files or 0 }}</strong>
+        </div>
+        <div class="metric-box">
+          <span class="metric-label">Записи журнала</span>
+          <strong>{{ legacy_summary.goal_bot.journal_count or 0 }}</strong>
+        </div>
+        <div class="metric-box">
+          <span class="metric-label">Финансовые строки</span>
+          <strong>{{ legacy_summary.finance.ceo_summary_rows or 0 }}</strong>
+        </div>
+        <div class="metric-box">
+          <span class="metric-label">Складские счета</span>
+          <strong>{{ legacy_summary.warehouse.invoice_history_rows or 0 }}</strong>
+        </div>
+      </div>
+    </section>
+    {% endif %}
+
+    <section class="public-card compact">
+      <div class="section-head compact">
+        <div>
+          <div class="eyebrow">Сделать сейчас</div>
+          <h2>Что требует внимания</h2>
+        </div>
+      </div>
+      <div class="stack-list">
+        {% if attention_rows %}
+          {% for item in attention_rows %}
+          <a class="stack-item" href="{{ item.href }}">
+            <strong>{{ item.title }}</strong>
+            <span>{{ item.type }} · {{ item.context }}</span>
+          </a>
+          {% endfor %}
+        {% else %}
+          <div class="empty-state">Срочных действий сейчас нет. Для полного контекста открой панель.</div>
+        {% endif %}
+      </div>
+    </section>
+
+    <section class="public-card compact">
+      <div class="section-head compact">
+        <div>
+          <div class="eyebrow">Следующие шаги</div>
+          <h2>Что еще довести</h2>
+        </div>
+        <a class="button ghost" href="/admin/{{ runtime.account.slug }}/delivery">Открыть передачу</a>
+      </div>
+      <div class="stack-list">
+        {% for item in delivery.setup_gaps[:5] %}
+        <a class="stack-item" href="{{ item.href }}">
+          <strong>{{ item.label }}</strong>
+          <span>Открой нужный экран и закрой этот пробел в настройке.</span>
+        </a>
+        {% endfor %}
+      </div>
+    </section>
+
+    {% if accounts|length > 1 %}
+    <section class="public-card compact">
+      <div class="section-head compact">
+        <div>
+          <div class="eyebrow">Аккаунты</div>
+          <h2>Сменить активный аккаунт</h2>
+        </div>
+      </div>
+      <div class="chips">
+        {% for account in accounts %}
+        <a class="chip" href="/admin/switch-account/{{ account.slug }}?next=/tgapp">{{ account.name }}</a>
+        {% endfor %}
+      </div>
+    </section>
+    {% endif %}
+    {% endif %}
+  </main>
+  {% if not requires_login and not membership_error %}
+  <script>
+    const miniActionCsrfToken = {{ csrf_token|tojson }};
+    const miniAccountSlug = {{ runtime.account.slug|tojson }};
+
+    async function runMiniStatusAction(kind, id, nextStatus, button) {
+      const endpoint = kind === "alert"
+        ? `/admin/${miniAccountSlug}/alerts/${id}/status`
+        : `/admin/${miniAccountSlug}/tasks/${id}/status`;
+      button.disabled = true;
+      try {
+        const response = await fetch(endpoint, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-CSRF-Token": miniActionCsrfToken,
+          },
+          body: JSON.stringify({status: nextStatus, note: "mini_app_inline_action"}),
+          credentials: "same-origin",
+        });
+        if (!response.ok) {
+          throw new Error(await response.text());
+        }
+        const row = document.getElementById(`${kind}-row-${id}`);
+        if (row) {
+          row.classList.add("action-item-done");
+          const statusLine = row.querySelector("span");
+          if (statusLine) {
+            const parts = statusLine.textContent.split("·").map((item) => item.trim()).filter(Boolean);
+            if (parts.length >= 2) {
+              parts[parts.length - 1] = nextStatus;
+              statusLine.textContent = parts.join(" · ");
+            } else {
+              statusLine.textContent = `${statusLine.textContent} · ${nextStatus}`;
+            }
+          }
+        }
+      } catch (error) {
+        button.disabled = false;
+        alert(`Не удалось выполнить действие: ${error}`);
+      }
+    }
+
+    for (const button of document.querySelectorAll(".mini-status-action")) {
+      button.addEventListener("click", () => runMiniStatusAction(button.dataset.kind, button.dataset.id, button.dataset.status, button));
+    }
+  </script>
+  {% endif %}
+</body>
+</html>
