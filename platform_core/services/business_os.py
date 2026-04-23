@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from email.message import EmailMessage
 from pathlib import Path
+import logging
 import re
 import smtplib
 
@@ -37,6 +38,8 @@ from platform_core.services.runtime import (
     RuntimeIntegrationService,
     build_provider_registry,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -566,6 +569,7 @@ class BusinessOSService:
         delivered = 0
         delivered_integrations: list[int] = []
         delivered_chat_ids: list[str] = []
+        delivery_errors: list[str] = []
 
         if integration_targets:
             service = RuntimeIntegrationService(self.session)
@@ -574,21 +578,31 @@ class BusinessOSService:
             if adapter is None:
                 raise ValueError("Telegram messaging provider is not registered.")
             for integration_id_raw in integration_targets:
-                integration = service._get_integration(runtime.account.id, int(integration_id_raw))
-                if integration.provider_kind != "messaging" or integration.provider_name != "telegram":
-                    raise ValueError(f"Integration {integration.id} is not a Telegram messaging integration.")
-                credentials = service._load_credentials(integration)
-                adapter.send(
-                    credentials,
-                    MessageSendRequest(
-                        channel="telegram",
-                        recipient_external_id="me",
-                        body=text,
-                        metadata={"notification_event_id": event.id},
-                    ),
-                )
-                delivered += 1
-                delivered_integrations.append(integration.id)
+                try:
+                    integration = service._get_integration(runtime.account.id, int(integration_id_raw))
+                    if integration.provider_kind != "messaging" or integration.provider_name != "telegram":
+                        raise ValueError(f"Integration {integration.id} is not a Telegram messaging integration.")
+                    credentials = service._load_credentials(integration)
+                    adapter.send(
+                        credentials,
+                        MessageSendRequest(
+                            channel="telegram",
+                            recipient_external_id="me",
+                            body=text,
+                            metadata={"notification_event_id": event.id},
+                        ),
+                    )
+                    delivered += 1
+                    delivered_integrations.append(integration.id)
+                except Exception as exc:
+                    logger.warning(
+                        "telegram_dispatch_target_failed account_id=%s integration_id=%s event_id=%s error=%s",
+                        runtime.account.id,
+                        integration_id_raw,
+                        event.id,
+                        exc,
+                    )
+                    delivery_errors.append(f"integration {integration_id_raw}: {exc}")
 
         if chat_targets:
             settings = load_platform_settings()
@@ -596,16 +610,28 @@ class BusinessOSService:
             if not bot_token:
                 raise ValueError("PLATFORM_NOTIFICATION_TELEGRAM_BOT_TOKEN is not configured.")
             for chat_id in chat_targets:
-                response = requests.post(
-                    f"https://api.telegram.org/bot{bot_token}/sendMessage",
-                    json={"chat_id": chat_id, "text": text},
-                    timeout=10,
-                )
-                response.raise_for_status()
-                delivered += 1
-                delivered_chat_ids.append(chat_id)
+                try:
+                    response = requests.post(
+                        f"https://api.telegram.org/bot{bot_token}/sendMessage",
+                        json={"chat_id": chat_id, "text": text},
+                        timeout=10,
+                    )
+                    response.raise_for_status()
+                    delivered += 1
+                    delivered_chat_ids.append(chat_id)
+                except Exception as exc:
+                    logger.warning(
+                        "telegram_dispatch_chat_failed account_id=%s chat_id=%s event_id=%s error=%s",
+                        runtime.account.id,
+                        chat_id,
+                        event.id,
+                        exc,
+                    )
+                    delivery_errors.append(f"chat {chat_id}: {exc}")
 
         if delivered <= 0:
+            if delivery_errors:
+                raise ValueError("; ".join(delivery_errors))
             raise ValueError("Telegram delivery target is not configured.")
         self._export_dispatch_obsidian(
             runtime,
@@ -620,6 +646,7 @@ class BusinessOSService:
             "delivered_count": delivered,
             "integration_ids": delivered_integrations,
             "chat_ids": delivered_chat_ids,
+            "failed_targets": delivery_errors,
         }
 
     def _deliver_email(
