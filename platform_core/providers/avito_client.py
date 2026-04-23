@@ -76,6 +76,9 @@ class AvitoAPIClient:
             current_cursor = next_cursor
         return rows, last_cursor
 
+    def fetch_json(self, path: str, *, params: dict[str, object] | None = None) -> dict[str, Any]:
+        return self._request_json(path, params=params)
+
     def _request_json(self, path: str, *, params: dict[str, object] | None = None) -> dict[str, Any]:
         url = f"{self.base_url.rstrip('/')}/{path.lstrip('/')}"
         for attempt in range(1, self.max_retries + 1):

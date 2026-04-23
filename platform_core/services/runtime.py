@@ -680,6 +680,7 @@ class RuntimeIntegrationService:
         lease_key: str | None = None
         acquired = False
         attempt_after_start = 0
+        checkpoint_cursor_json: dict[str, object] | None = None
         try:
             job = self.session.execute(select(SyncJob).where(SyncJob.id == job_id)).scalar_one_or_none()
             if job is None:
@@ -831,6 +832,8 @@ class RuntimeIntegrationService:
             self.session.flush()
             return JobExecutionResult(job_id=job.id, status="completed", lease_acquired=True, message="Job completed.")
         except Exception as exc:
+            if "job" in locals() and job is not None and isinstance(job.cursor_json, dict) and job.cursor_json:
+                checkpoint_cursor_json = dict(job.cursor_json)
             self.session.rollback()
             job = self.session.execute(select(SyncJob).where(SyncJob.id == job_id)).scalar_one_or_none()
             integration = (
@@ -863,6 +866,8 @@ class RuntimeIntegrationService:
                 job.scheduled_at = datetime.now(timezone.utc) + timedelta(seconds=min(300, 15 * max(1, job.attempts_count)))
             job.error_code = exc.__class__.__name__
             job.error_message = str(exc)
+            if checkpoint_cursor_json:
+                job.cursor_json = checkpoint_cursor_json
             provider_value = (
                 f"{integration.provider_kind}:{integration.provider_name}"
                 if integration is not None
@@ -895,6 +900,18 @@ class RuntimeIntegrationService:
                 job.error_code,
                 job.error_message,
             )
+            if checkpoint_cursor_json:
+                logger.info(
+                    "runtime_sync_job_checkpoint tenant_id=%s integration_id=%s provider=%s sync_job_id=%s stage=%s result=%s error_code=%s error_message=%s",
+                    tenant_value,
+                    job.integration_id,
+                    provider_value,
+                    job.id,
+                    "checkpoint_cursor",
+                    "preserved",
+                    "",
+                    "",
+                )
             self.session.flush()
             return JobExecutionResult(job_id=job.id, status=job.status, lease_acquired=True, message=str(exc))
         finally:

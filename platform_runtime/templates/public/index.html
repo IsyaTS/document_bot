@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ brand_title }}</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230f172a'/%3E%3Cpath d='M9 10h14v3H9zm0 5h14v3H9zm0 5h9v3H9z' fill='%23fff'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/admin-static/public.css?v={{ admin_asset_version }}">
+</head>
+<body>
+  <main class="public-shell" style="max-width: 720px;">
+    <section class="hero-card" style="text-align: center; padding: 48px 32px;">
+      <div class="eyebrow">Старт</div>
+      <h1>{{ brand_title }}</h1>
+      <p class="lead">{{ brand_subtitle }}</p>
+      <p class="muted">Сайт обнулен. Дальше собираем заново.</p>
+      <div class="cta-row" style="justify-content: center; margin-top: 24px;">
+        <a class="button" href="{{ account_href }}">Аккаунт</a>
+        <a class="button secondary" href="{{ login_href }}">Вход</a>
+        <a class="button ghost" href="{{ register_href }}">Регистрация</a>
+      </div>
+    </section>
+  </main>
+</body>
+</html>
