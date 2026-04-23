@@ -6,6 +6,7 @@ import logging
 from time import perf_counter
 from typing import Any
 
+import requests
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -433,6 +434,7 @@ class RuntimeIntegrationService:
     ) -> dict[str, object]:
         integration = self._get_integration(context.account_id, integration_id)
         credentials = self._load_credentials(integration)
+        credentials = self._refresh_avito_credentials_if_needed(context, integration, credentials)
         if override_payload:
             credentials = self._merge_credentials(credentials, override_payload)
         if not credentials:
@@ -931,6 +933,11 @@ class RuntimeIntegrationService:
             }
 
         credentials = self._load_credentials(integration)
+        credentials = self._refresh_avito_credentials_if_needed(
+            TenantContext(account_id=integration.account_id, actor_user_id=None, source="worker", is_system=True),
+            integration,
+            credentials,
+        )
         provider_input = {**credentials, "_settings": settings, "_job_scope": job.scope_json}
         adapter = self._registry.get(integration.provider_kind, integration.provider_name)
         if adapter is None:
@@ -1428,6 +1435,115 @@ class RuntimeIntegrationService:
         if credential is None:
             return {}
         return self._crypto.decrypt_mapping(credential.secret_ciphertext)
+
+    def _refresh_avito_credentials_if_needed(
+        self,
+        context: TenantContext,
+        integration: Integration,
+        credentials: dict[str, object],
+    ) -> dict[str, object]:
+        if integration.provider_kind != "ads" or integration.provider_name != "avito":
+            return credentials
+        refresh_token = str(credentials.get("refresh_token") or "").strip()
+        expires_at_raw = str(credentials.get("expires_at") or "").strip()
+        if not refresh_token or not expires_at_raw:
+            return credentials
+        try:
+            expires_at = datetime.fromisoformat(expires_at_raw.replace("Z", "+00:00"))
+        except ValueError:
+            return credentials
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        else:
+            expires_at = expires_at.astimezone(timezone.utc)
+        if expires_at > datetime.now(timezone.utc) + timedelta(minutes=5):
+            return credentials
+
+        settings = load_platform_settings()
+        client_id = str(settings.avito_client_id or "").strip()
+        client_secret = str(settings.avito_client_secret or "").strip()
+        if not client_id or not client_secret:
+            logger.warning(
+                "runtime_avito_token_refresh integration_id=%s result=%s error_code=%s error_message=%s",
+                integration.id,
+                "skipped",
+                "AvitoOAuthConfigMissing",
+                "PLATFORM_AVITO_CLIENT_ID or PLATFORM_AVITO_CLIENT_SECRET is not configured.",
+            )
+            return credentials
+
+        endpoints = (
+            "https://api.avito.ru/token",
+            "https://api.avito.ru/token/",
+        )
+        last_error = "Avito token refresh failed."
+        for endpoint in endpoints:
+            try:
+                response = requests.post(
+                    endpoint,
+                    data={
+                        "grant_type": "refresh_token",
+                        "client_id": client_id,
+                        "client_secret": client_secret,
+                        "refresh_token": refresh_token,
+                    },
+                    headers={"Accept": "application/json"},
+                    timeout=30,
+                )
+            except requests.RequestException as exc:
+                last_error = str(exc)
+                continue
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = {}
+            access_token = str(payload.get("access_token") or "").strip() if isinstance(payload, dict) else ""
+            if response.ok and access_token:
+                expires_in = int(payload.get("expires_in") or 0) if isinstance(payload, dict) else 0
+                refreshed_payload = {
+                    "access_token": access_token,
+                    "refresh_token": str(payload.get("refresh_token") or refresh_token).strip(),
+                    "token_type": str(payload.get("token_type") or credentials.get("token_type") or "").strip(),
+                    "expires_in": expires_in,
+                    "expires_at": (
+                        datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+                    ).isoformat()
+                    if expires_in > 0
+                    else expires_at.isoformat(),
+                }
+                if credentials.get("account_external_id"):
+                    refreshed_payload["account_external_id"] = credentials.get("account_external_id")
+                self.save_credentials(
+                    context,
+                    integration_id=integration.id,
+                    secret_payload=refreshed_payload,
+                    replace_mode="merge",
+                )
+                logger.info(
+                    "runtime_avito_token_refresh integration_id=%s result=%s expires_at=%s",
+                    integration.id,
+                    "ok",
+                    refreshed_payload["expires_at"],
+                )
+                return self._merge_credentials(credentials, refreshed_payload)
+            if isinstance(payload, dict):
+                last_error = str(
+                    payload.get("error_description")
+                    or payload.get("error")
+                    or payload.get("message")
+                    or f"HTTP {response.status_code}"
+                ).strip()
+            else:
+                last_error = f"HTTP {response.status_code}"
+
+        logger.warning(
+            "runtime_avito_token_refresh integration_id=%s result=%s error_code=%s error_message=%s",
+            integration.id,
+            "failed",
+            "AvitoTokenRefreshFailed",
+            last_error,
+        )
+        return credentials
 
     def _active_credential(self, integration_id: int, account_id: int | None = None) -> IntegrationCredential | None:
         filters = [IntegrationCredential.integration_id == integration_id, IntegrationCredential.status == "active"]
