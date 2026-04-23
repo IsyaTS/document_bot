@@ -3,9 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
+import hashlib
+import logging
 import re
+from time import perf_counter
 
-from sqlalchemy import select
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from platform_core.models import (
@@ -38,6 +41,8 @@ from platform_core.providers.contracts import (
     ERPStockMovementRecord,
     ERPStockRecord,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -846,22 +851,80 @@ class ERPSyncService:
         self.mapping_service = IntegrationMappingService(session)
 
     def sync_products(self, integration: Integration, records: list[ERPProductRecord]) -> SyncStats:
+        started = perf_counter()
         created = updated = skipped = 0
+        mapping_reused = 0
+        category_cache_hits = 0
+        category_cache_misses = 0
+        batch_size = 100
+
+        external_ids = [record.external_id for record in records if record.external_id]
+        sku_values = [record.sku for record in records if record.sku]
+        category_codes = [record.category_code for record in records if record.category_code]
+
+        mapping_by_external_id = self._prefetch_mappings(
+            account_id=integration.account_id,
+            integration_id=integration.id,
+            provider_entity_type="product",
+            external_ids=external_ids,
+        )
+        category_mapping_by_external_id = self._prefetch_mappings(
+            account_id=integration.account_id,
+            integration_id=integration.id,
+            provider_entity_type="product_category",
+            external_ids=category_codes,
+        )
+
+        product_ids = [
+            int(mapping.canonical_entity_id)
+            for mapping in mapping_by_external_id.values()
+            if str(mapping.canonical_entity_id or "").isdigit()
+        ]
+        products_by_id = self._prefetch_products_by_id(integration.account_id, product_ids)
+        products_by_sku = self._prefetch_products_by_sku(integration.account_id, sku_values)
+        categories_by_id = self._prefetch_categories_by_id(
+            [
+                int(mapping.canonical_entity_id)
+                for mapping in category_mapping_by_external_id.values()
+                if str(mapping.canonical_entity_id or "").isdigit()
+            ]
+        )
+        categories_by_code = self._prefetch_categories_by_code(
+            integration.account_id,
+            [self._slug(code) for code in category_codes if code],
+        )
+
+        pending_product_mapping_rows: list[tuple[str, Product, dict[str, object]]] = []
+        pending_existing_mapping_rows: list[tuple[IntegrationEntityMapping, Product, dict[str, object]]] = []
+        pending_mapping_inserts: list[dict[str, object]] = []
+        pending_mapping_updates: list[dict[str, object]] = []
+        pending_mapping_touch_ids: list[int] = []
+        processed = 0
+
         for record in records:
-            category_id = self._resolve_category(integration, record)
-            mapping = self.mapping_service.resolve(
-                account_id=integration.account_id,
-                integration_id=integration.id,
-                provider_entity_type="product",
-                external_id=record.external_id,
+            category_id, cache_hit = self._resolve_category_cached(
+                integration,
+                record,
+                category_mapping_by_external_id=category_mapping_by_external_id,
+                categories_by_id=categories_by_id,
+                categories_by_code=categories_by_code,
             )
+            if cache_hit:
+                category_cache_hits += 1
+            else:
+                category_cache_misses += 1
+            mapping = mapping_by_external_id.get(record.external_id)
             product = None
             if mapping is not None:
-                product = self.session.get(Product, int(mapping.canonical_entity_id))
+                mapping_reused += 1
+                canonical_id = int(mapping.canonical_entity_id) if str(mapping.canonical_entity_id or "").isdigit() else None
+                product = products_by_id.get(canonical_id) if canonical_id is not None else None
+                if product is None and canonical_id is not None:
+                    product = self.session.get(Product, canonical_id)
+                    if product is not None:
+                        products_by_id[canonical_id] = product
             if product is None and record.sku:
-                product = self.session.execute(
-                    select(Product).where(Product.account_id == integration.account_id, Product.sku == record.sku)
-                ).scalar_one_or_none()
+                product = products_by_sku.get(record.sku)
             if product is None:
                 product = Product(
                     account_id=integration.account_id,
@@ -875,10 +938,13 @@ class ERPSyncService:
                     attributes_json=record.metadata,
                 )
                 self.session.add(product)
-                self.session.flush()
                 created += 1
+                pending_product_mapping_rows.append(
+                    (record.external_id, product, {"sku": record.sku, "name": record.name})
+                )
             else:
                 changed = False
+                previous_sku = product.sku
                 for attr, value in {
                     "category_id": category_id,
                     "sku": record.sku,
@@ -894,16 +960,123 @@ class ERPSyncService:
                         changed = True
                 updated += 1 if changed else 0
                 skipped += 0 if changed else 1
-            self.mapping_service.upsert(
-                account_id=integration.account_id,
-                integration_id=integration.id,
-                provider_entity_type="product",
-                external_id=record.external_id,
-                canonical_entity_type="product",
-                canonical_entity_id=product.id,
-                metadata={"sku": record.sku, "name": record.name},
-            )
-        self.session.flush()
+                if previous_sku and previous_sku != record.sku:
+                    products_by_sku.pop(previous_sku, None)
+            if product.id is not None:
+                products_by_id[product.id] = product
+            if record.sku:
+                products_by_sku[record.sku] = product
+            if mapping is not None:
+                metadata = {"sku": record.sku, "name": record.name}
+                if product.id is None:
+                    pending_existing_mapping_rows.append((mapping, product, metadata))
+                else:
+                    canonical_entity_id = str(product.id)
+                    if (
+                        str(mapping.canonical_entity_type) != "product"
+                        or str(mapping.canonical_entity_id) != canonical_entity_id
+                        or dict(mapping.metadata_json or {}) != metadata
+                    ):
+                        pending_mapping_updates.append(
+                            {
+                                "id": mapping.id,
+                                "canonical_entity_type": "product",
+                                "canonical_entity_id": canonical_entity_id,
+                                "metadata_json": metadata,
+                                "last_seen_at": datetime.now(timezone.utc),
+                            }
+                        )
+                    else:
+                        pending_mapping_touch_ids.append(int(mapping.id))
+            elif product.id is not None:
+                pending_mapping_inserts.append(
+                    {
+                        "account_id": integration.account_id,
+                        "integration_id": integration.id,
+                        "provider_entity_type": "product",
+                        "external_id": record.external_id,
+                        "canonical_entity_type": "product",
+                        "canonical_entity_id": str(product.id),
+                        "metadata_json": {"sku": record.sku, "name": record.name},
+                        "last_seen_at": datetime.now(timezone.utc),
+                    }
+                )
+            processed = created + updated + skipped
+            if processed % 25 == 0:
+                logger.info(
+                    "erp_sync_products_progress tenant_id=%s integration_id=%s provider=%s processed=%s total_input=%s created=%s updated=%s skipped=%s elapsed_ms=%s",
+                    integration.account_id,
+                    integration.id,
+                    f"{integration.provider_kind}:{integration.provider_name}",
+                    processed,
+                    len(records),
+                    created,
+                    updated,
+                    skipped,
+                    int((perf_counter() - started) * 1000),
+                )
+            if (created + updated + skipped) % batch_size == 0:
+                batch_started = perf_counter()
+                self._flush_product_batch(
+                    integration=integration,
+                    pending_product_mapping_rows=pending_product_mapping_rows,
+                    pending_existing_mapping_rows=pending_existing_mapping_rows,
+                    products_by_id=products_by_id,
+                    pending_mapping_inserts=pending_mapping_inserts,
+                    pending_mapping_updates=pending_mapping_updates,
+                    pending_mapping_touch_ids=pending_mapping_touch_ids,
+                )
+                logger.info(
+                    "erp_sync_products_batch tenant_id=%s integration_id=%s provider=%s processed=%s total_input=%s created=%s updated=%s skipped=%s pending_mappings=%s duration_ms=%s",
+                    integration.account_id,
+                    integration.id,
+                    f"{integration.provider_kind}:{integration.provider_name}",
+                    processed,
+                    len(records),
+                    created,
+                    updated,
+                    skipped,
+                    len(pending_product_mapping_rows),
+                    int((perf_counter() - batch_started) * 1000),
+                )
+        batch_started = perf_counter()
+        self._flush_product_batch(
+            integration=integration,
+            pending_product_mapping_rows=pending_product_mapping_rows,
+            pending_existing_mapping_rows=pending_existing_mapping_rows,
+            products_by_id=products_by_id,
+            pending_mapping_inserts=pending_mapping_inserts,
+            pending_mapping_updates=pending_mapping_updates,
+            pending_mapping_touch_ids=pending_mapping_touch_ids,
+        )
+        logger.info(
+            "erp_sync_products_batch tenant_id=%s integration_id=%s provider=%s processed=%s total_input=%s created=%s updated=%s skipped=%s pending_mappings=%s duration_ms=%s",
+            integration.account_id,
+            integration.id,
+            f"{integration.provider_kind}:{integration.provider_name}",
+            created + updated + skipped,
+            len(records),
+            created,
+            updated,
+            skipped,
+            len(pending_product_mapping_rows),
+            int((perf_counter() - batch_started) * 1000),
+        )
+        duration_ms = int((perf_counter() - started) * 1000)
+        logger.info(
+            "erp_sync_products_perf tenant_id=%s integration_id=%s provider=%s input_count=%s created=%s updated=%s skipped=%s mapping_reused_count=%s category_cache_hits=%s category_cache_misses=%s duration_ms=%s",
+            integration.account_id,
+            integration.id,
+            f"{integration.provider_kind}:{integration.provider_name}",
+            len(records),
+            created,
+            updated,
+            skipped,
+            mapping_reused,
+            category_cache_hits,
+            category_cache_misses,
+            duration_ms,
+        )
         return SyncStats(created=created, updated=updated, skipped=skipped)
 
     def sync_stock(self, integration: Integration, records: list[ERPStockRecord]) -> SyncStats:
@@ -928,7 +1101,6 @@ class ERPSyncService:
                     product_id=product.id,
                     quantity_on_hand=record.quantity_on_hand,
                     quantity_reserved=record.quantity_reserved,
-                    last_movement_at=datetime.now(timezone.utc),
                 )
                 self.session.add(stock_item)
                 created += 1
@@ -940,7 +1112,6 @@ class ERPSyncService:
                 if stock_item.quantity_reserved != record.quantity_reserved:
                     stock_item.quantity_reserved = record.quantity_reserved
                     changed = True
-                stock_item.last_movement_at = datetime.now(timezone.utc)
                 updated += 1 if changed else 0
                 skipped += 0 if changed else 1
         self.session.flush()
@@ -1023,11 +1194,28 @@ class ERPSyncService:
         created = updated = skipped = 0
         for record in records:
             product = self._resolve_entity(integration, "product", record.external_product_id, Product)
-            warehouse = self._resolve_warehouse(integration, record.external_warehouse_id, record.metadata)
+            warehouse = self._resolve_warehouse(integration, record.external_warehouse_id, record.metadata, allow_create=False)
             if product is None or warehouse is None:
                 skipped += 1
                 continue
+            customer_external_id = str(
+                record.metadata.get("customer_external_id")
+                or record.metadata.get("counterparty_id")
+                or record.metadata.get("agent_id")
+                or ""
+            ).strip()
+            customer_name = str(
+                record.metadata.get("customer_name")
+                or record.metadata.get("counterparty_name")
+                or record.metadata.get("agent_name")
+                or ""
+            ).strip()
+            if not customer_external_id and customer_name:
+                customer_external_id = f"name:{self._slug(customer_name)}"
+            customer = self._resolve_customer(integration, customer_external_id, customer_name, allow_create=bool(customer_name)) if customer_external_id else None
             external_ref = record.external_reference_id or self._synthetic_reference(record)
+            storage_ref = self._storage_reference_id(external_ref)
+            unit_cost = record.unit_cost if record.unit_cost is not None else Decimal(product.cost_price or 0)
             mapping = self.mapping_service.resolve(
                 account_id=integration.account_id,
                 integration_id=integration.id,
@@ -1035,6 +1223,14 @@ class ERPSyncService:
                 external_id=external_ref,
             )
             movement = self.session.get(StockMovement, int(mapping.canonical_entity_id)) if mapping is not None else None
+            movement_notes = {
+                **record.metadata,
+                "external_reference_id": external_ref,
+                "customer_id": customer.id if customer is not None else None,
+                "customer_name": customer.name if customer is not None else None,
+                "warehouse_name": warehouse.name,
+                "product_name": product.name,
+            }
             if movement is None:
                 movement = StockMovement(
                     account_id=integration.account_id,
@@ -1042,11 +1238,11 @@ class ERPSyncService:
                     product_id=product.id,
                     movement_type=record.movement_type,
                     reference_type="provider_sync",
-                    reference_id=external_ref,
+                    reference_id=storage_ref,
                     quantity_delta=record.quantity_delta,
-                    unit_cost=record.unit_cost or Decimal("0"),
+                    unit_cost=unit_cost,
                     occurred_at=record.occurred_at,
-                    notes_json=record.metadata,
+                    notes_json=movement_notes,
                 )
                 self.session.add(movement)
                 self.session.flush()
@@ -1055,16 +1251,28 @@ class ERPSyncService:
                 changed = False
                 for attr, value in {
                     "movement_type": record.movement_type,
+                    "reference_id": storage_ref,
                     "quantity_delta": record.quantity_delta,
-                    "unit_cost": record.unit_cost or Decimal("0"),
+                    "unit_cost": unit_cost,
                     "occurred_at": record.occurred_at,
-                    "notes_json": record.metadata,
+                    "notes_json": movement_notes,
                 }.items():
                     if getattr(movement, attr) != value:
                         setattr(movement, attr, value)
                         changed = True
                 updated += 1 if changed else 0
                 skipped += 0 if changed else 1
+            stock_item = self.session.execute(
+                select(StockItem).where(
+                    StockItem.account_id == integration.account_id,
+                    StockItem.product_id == product.id,
+                    StockItem.warehouse_id == warehouse.id,
+                )
+            ).scalar_one_or_none()
+            if stock_item is not None:
+                current_movement_at = stock_item.last_movement_at
+                if current_movement_at is None or record.occurred_at > current_movement_at:
+                    stock_item.last_movement_at = record.occurred_at
             self.mapping_service.upsert(
                 account_id=integration.account_id,
                 integration_id=integration.id,
@@ -1115,11 +1323,196 @@ class ERPSyncService:
         )
         return category.id
 
+    def _resolve_category_cached(
+        self,
+        integration: Integration,
+        record: ERPProductRecord,
+        *,
+        category_mapping_by_external_id: dict[str, IntegrationEntityMapping],
+        categories_by_id: dict[int, ProductCategory],
+        categories_by_code: dict[str, ProductCategory],
+    ) -> tuple[int | None, bool]:
+        if not record.category_code:
+            return None, True
+        mapping = category_mapping_by_external_id.get(record.category_code)
+        category = None
+        if mapping is not None and str(mapping.canonical_entity_id or "").isdigit():
+            category = categories_by_id.get(int(mapping.canonical_entity_id))
+        category_code_slug = self._slug(record.category_code)
+        if category is None:
+            category = categories_by_code.get(category_code_slug)
+        if category is not None:
+            return category.id, True
+        category = ProductCategory(
+            account_id=integration.account_id,
+            code=category_code_slug,
+            name=str(record.metadata.get("category_name") or record.category_code),
+            status="active",
+        )
+        self.session.add(category)
+        self.session.flush()
+        categories_by_id[category.id] = category
+        categories_by_code[category.code] = category
+        now = datetime.now(timezone.utc)
+        if mapping is None:
+            mapping = IntegrationEntityMapping(
+                account_id=integration.account_id,
+                integration_id=integration.id,
+                provider_entity_type="product_category",
+                external_id=record.category_code,
+                canonical_entity_type="product_category",
+                canonical_entity_id=str(category.id),
+                metadata_json={"name": category.name},
+                last_seen_at=now,
+            )
+            self.session.add(mapping)
+            category_mapping_by_external_id[record.category_code] = mapping
+        else:
+            mapping.canonical_entity_type = "product_category"
+            mapping.canonical_entity_id = str(category.id)
+            mapping.metadata_json = {"name": category.name}
+            mapping.last_seen_at = now
+        return category.id, False
+
+    def _prefetch_mappings(
+        self,
+        *,
+        account_id: int,
+        integration_id: int,
+        provider_entity_type: str,
+        external_ids: list[str | None],
+    ) -> dict[str, IntegrationEntityMapping]:
+        normalized = sorted({str(item).strip() for item in external_ids if str(item or "").strip()})
+        if not normalized:
+            return {}
+        rows = self.session.execute(
+            select(IntegrationEntityMapping).where(
+                IntegrationEntityMapping.account_id == account_id,
+                IntegrationEntityMapping.integration_id == integration_id,
+                IntegrationEntityMapping.provider_entity_type == provider_entity_type,
+                IntegrationEntityMapping.external_id.in_(normalized),
+            )
+        ).scalars().all()
+        return {str(item.external_id): item for item in rows}
+
+    def _prefetch_products_by_id(self, account_id: int, product_ids: list[int]) -> dict[int, Product]:
+        normalized = sorted({int(item) for item in product_ids if item})
+        if not normalized:
+            return {}
+        rows = self.session.execute(
+            select(Product).where(Product.account_id == account_id, Product.id.in_(normalized))
+        ).scalars().all()
+        return {int(item.id): item for item in rows}
+
+    def _prefetch_products_by_sku(self, account_id: int, skus: list[str | None]) -> dict[str, Product]:
+        normalized = sorted({str(item).strip() for item in skus if str(item or "").strip()})
+        if not normalized:
+            return {}
+        rows = self.session.execute(
+            select(Product).where(Product.account_id == account_id, Product.sku.in_(normalized))
+        ).scalars().all()
+        return {str(item.sku): item for item in rows if item.sku}
+
+    def _prefetch_categories_by_id(self, category_ids: list[int]) -> dict[int, ProductCategory]:
+        normalized = sorted({int(item) for item in category_ids if item})
+        if not normalized:
+            return {}
+        rows = self.session.execute(
+            select(ProductCategory).where(ProductCategory.id.in_(normalized))
+        ).scalars().all()
+        return {int(item.id): item for item in rows}
+
+    def _prefetch_categories_by_code(self, account_id: int, category_codes: list[str]) -> dict[str, ProductCategory]:
+        normalized = sorted({str(item).strip() for item in category_codes if str(item or "").strip()})
+        if not normalized:
+            return {}
+        rows = self.session.execute(
+            select(ProductCategory).where(
+                ProductCategory.account_id == account_id,
+                ProductCategory.code.in_(normalized),
+            )
+        ).scalars().all()
+        return {str(item.code): item for item in rows}
+
+    def _flush_product_batch(
+        self,
+        *,
+        integration: Integration,
+        pending_product_mapping_rows: list[tuple[str, Product, dict[str, object]]],
+        pending_existing_mapping_rows: list[tuple[IntegrationEntityMapping, Product, dict[str, object]]],
+        products_by_id: dict[int, Product],
+        pending_mapping_inserts: list[dict[str, object]],
+        pending_mapping_updates: list[dict[str, object]],
+        pending_mapping_touch_ids: list[int],
+    ) -> None:
+        self.session.flush()
+        if pending_product_mapping_rows:
+            now = datetime.now(timezone.utc)
+            for external_id, product, metadata in pending_product_mapping_rows:
+                if product.id is None:
+                    continue
+                pending_mapping_inserts.append(
+                    {
+                        "account_id": integration.account_id,
+                        "integration_id": integration.id,
+                        "provider_entity_type": "product",
+                        "external_id": external_id,
+                        "canonical_entity_type": "product",
+                        "canonical_entity_id": str(product.id),
+                        "metadata_json": metadata,
+                        "last_seen_at": now,
+                    }
+                )
+                products_by_id[product.id] = product
+            pending_product_mapping_rows.clear()
+        if pending_existing_mapping_rows:
+            for mapping, product, metadata in pending_existing_mapping_rows:
+                if product.id is None:
+                    continue
+                canonical_entity_id = str(product.id)
+                if (
+                    str(mapping.canonical_entity_type) != "product"
+                    or str(mapping.canonical_entity_id) != canonical_entity_id
+                    or dict(mapping.metadata_json or {}) != metadata
+                ):
+                    pending_mapping_updates.append(
+                        {
+                            "id": mapping.id,
+                            "canonical_entity_type": "product",
+                            "canonical_entity_id": canonical_entity_id,
+                            "metadata_json": metadata,
+                            "last_seen_at": datetime.now(timezone.utc),
+                        }
+                    )
+                else:
+                    pending_mapping_touch_ids.append(int(mapping.id))
+            pending_existing_mapping_rows.clear()
+        if pending_mapping_updates:
+            self.session.bulk_update_mappings(IntegrationEntityMapping, pending_mapping_updates)
+            pending_mapping_updates.clear()
+        if pending_mapping_touch_ids:
+            now = datetime.now(timezone.utc)
+            touch_ids = sorted({int(item) for item in pending_mapping_touch_ids if item})
+            for index in range(0, len(touch_ids), 500):
+                chunk = touch_ids[index : index + 500]
+                self.session.execute(
+                    update(IntegrationEntityMapping)
+                    .where(IntegrationEntityMapping.id.in_(chunk))
+                    .values(last_seen_at=now, updated_at=func.now())
+                )
+            pending_mapping_touch_ids.clear()
+        if pending_mapping_inserts:
+            self.session.bulk_insert_mappings(IntegrationEntityMapping, pending_mapping_inserts)
+            pending_mapping_inserts.clear()
+        self.session.flush()
+
     def _resolve_warehouse(
         self,
         integration: Integration,
         external_warehouse_id: str | None,
         metadata: dict[str, object] | None,
+        *,
+        allow_create: bool = True,
     ) -> Warehouse | None:
         if not external_warehouse_id:
             return None
@@ -1135,14 +1528,31 @@ class ERPSyncService:
             warehouse = self.session.execute(
                 select(Warehouse).where(Warehouse.account_id == integration.account_id, Warehouse.code == code)
             ).scalar_one_or_none()
+        warehouse_name = str((metadata or {}).get("warehouse_name") or "").strip()
+        if warehouse is None and warehouse_name:
+            warehouse = self.session.execute(
+                select(Warehouse).where(Warehouse.account_id == integration.account_id, Warehouse.name == warehouse_name)
+            ).scalar_one_or_none()
+        if warehouse is None and not allow_create:
+            return None
         if warehouse is None:
             warehouse = Warehouse(
                 account_id=integration.account_id,
                 code=self._slug(external_warehouse_id),
-                name=str((metadata or {}).get("warehouse_name") or f"Warehouse {external_warehouse_id[:8]}"),
+                name=warehouse_name or f"Не сопоставленный склад {external_warehouse_id[:8]}",
                 status="active",
             )
             self.session.add(warehouse)
+            self.session.flush()
+        elif warehouse_name and (
+            warehouse.name != warehouse_name
+            and (
+                warehouse.name.startswith("Не сопоставленный склад ")
+                or warehouse.name == external_warehouse_id
+                or warehouse.name == self._slug(external_warehouse_id)
+            )
+        ):
+            warehouse.name = warehouse_name
             self.session.flush()
         self.mapping_service.upsert(
             account_id=integration.account_id,
@@ -1151,11 +1561,18 @@ class ERPSyncService:
             external_id=external_warehouse_id,
             canonical_entity_type="warehouse",
             canonical_entity_id=warehouse.id,
-            metadata={"name": warehouse.name},
+            metadata={"name": warehouse_name or warehouse.name},
         )
         return warehouse
 
-    def _resolve_customer(self, integration: Integration, external_customer_id: str, customer_name: str) -> Customer:
+    def _resolve_customer(
+        self,
+        integration: Integration,
+        external_customer_id: str,
+        customer_name: str,
+        *,
+        allow_create: bool = True,
+    ) -> Customer | None:
         mapping = self.mapping_service.resolve(
             account_id=integration.account_id,
             integration_id=integration.id,
@@ -1163,8 +1580,14 @@ class ERPSyncService:
             external_id=external_customer_id,
         )
         customer = self.session.get(Customer, int(mapping.canonical_entity_id)) if mapping is not None else None
+        if customer is None and customer_name:
+            customer = self.session.execute(
+                select(Customer).where(Customer.account_id == integration.account_id, Customer.name == customer_name)
+            ).scalar_one_or_none()
+        if customer is None and not allow_create:
+            return None
         if customer is None:
-            customer = Customer(account_id=integration.account_id, name=customer_name)
+            customer = Customer(account_id=integration.account_id, name=customer_name or f"Не сопоставленный контрагент {external_customer_id[:8]}")
             self.session.add(customer)
             self.session.flush()
         elif customer.name != customer_name and customer_name:
@@ -1194,6 +1617,14 @@ class ERPSyncService:
 
     def _synthetic_reference(self, record: ERPStockMovementRecord) -> str:
         return f"{record.external_product_id}:{record.external_warehouse_id}:{record.movement_type}:{record.occurred_at.isoformat()}:{record.quantity_delta}"
+
+    def _storage_reference_id(self, external_ref: str) -> str:
+        normalized = str(external_ref or "").strip()
+        if len(normalized) <= 64:
+            return normalized
+        digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:32]
+        prefix = normalized[:31]
+        return f"{prefix}:{digest}"
 
     def _slug(self, value: str) -> str:
         cleaned = re.sub(r"[^a-zA-Z0-9]+", "-", value).strip("-").lower()

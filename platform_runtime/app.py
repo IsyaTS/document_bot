@@ -1,14 +1,24 @@
 from __future__ import annotations
 
+import csv
 import hashlib
+import hmac
 import json
 import mimetypes
+import os
+import re
 import secrets
-from io import BytesIO
+import base64
+import smtplib
+import requests
+import asyncio
+from collections import defaultdict
+from email.message import EmailMessage
+from io import BytesIO, StringIO
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
-from urllib.parse import parse_qs, urlencode
+from urllib.parse import parse_qs, parse_qsl, quote, urlencode
 from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
@@ -19,27 +29,37 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
+import qrcode
 from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.storage import Storage
 from platform_core.models import (
     Account,
     AccountUser,
+    AdMetric,
     Alert,
+    BalanceSnapshot,
+    BankAccount,
+    Campaign,
     CommunicationImportBatch,
     CommunicationReview,
     CopilotReport,
     Customer,
+    DailyKPI,
     Deal,
     Document,
     DocumentSettlement,
     Employee,
     EmployeeKPI,
+    Expense,
     Goal,
     GoalTarget,
     InstallationRequest,
     Integration,
+    IntegrationEntityMapping,
+    IntegrationLog,
     KnowledgeItem,
     Lead,
     NotificationEvent,
@@ -51,6 +71,8 @@ from platform_core.models import (
     Purchase,
     Role,
     RuntimeLease,
+    StockItem,
+    StockMovement,
     Task,
     TaskCheckin,
     TaskEvent,
@@ -61,6 +83,12 @@ from platform_core.runtime_delivery import write_delivery_bundle
 from platform_core.runtime_obsidian import export_account_delivery_note, export_portfolio_brief_note
 from platform_core.exceptions import AuthorizationError, PlatformCoreError, TenantContextError
 from platform_core.runtime_status import read_runtime_status, write_runtime_status
+from platform_core.telegram_accounts import (
+    TelegramClientUnavailableError,
+    TelegramQrLoginError,
+    describe_session_sync,
+    telegram_qr_login_manager,
+)
 from platform_core.services import (
     AuditLogService,
     BillingService,
@@ -79,6 +107,7 @@ from platform_core.services import (
     PayrollService,
     PeopleService,
 )
+from platform_core.services.bootstrap import CoreBootstrapService
 from platform_core.services.accounts import AccountService, MembershipService, UserService
 from platform_core.services.user_security import UserSecurityService
 from platform_core.services.runtime import (
@@ -93,6 +122,38 @@ from platform_core.services.runtime import (
 from platform_core.settings import load_platform_settings
 from platform_core.tenancy import TenantContext
 from platform_runtime.deps import get_db_session, get_runtime_context
+from platform_runtime.public_site_constants import (
+    DOCUMENT_COUNTERPARTIES,
+    DOCUMENT_GOODS,
+    DOCUMENT_REQUISITES_SCOPES,
+    DOCUMENT_STATUSES,
+    EMPLOYEE_DIRECTORY,
+    INVENTORY_COUNTERPARTIES,
+    INVENTORY_PURCHASE_RULE_ITEMS,
+    INVENTORY_WAREHOUSES,
+    KPI_GOAL_STATES,
+    KPI_PLAN_SCOPES,
+    KNOWLEDGE_ARTICLE_IMPORT_OPTIONS,
+    KNOWLEDGE_COMPANY_IMPORT_OPTIONS,
+    KNOWLEDGE_DOCUMENT_TEMPLATE_TYPES,
+    KNOWLEDGE_ISSUER_ENTITY_TYPES,
+    KNOWLEDGE_PARTNER_CARD_TYPES,
+    KNOWLEDGE_REGULATION_IMPORT_OPTIONS,
+    KNOWLEDGE_TEMPLATE_IMPORT_OPTIONS,
+    MARKETING_CITY_OPTIONS,
+    MARKETING_CITY_ROWS,
+    MARKETING_QUANTITY_OPTIONS,
+    MARKETING_SOURCES,
+    NOTIFICATION_CHANNELS,
+    NOTIFICATION_FREQUENCIES,
+    NOTIFICATION_INTENSITIES,
+    NOTIFICATION_ROLES,
+    NOTIFICATION_TIMES,
+    NOTIFICATION_TOPICS,
+    NOTIFICATION_USERS,
+    SALES_CITY_ROWS,
+    SALES_SOURCES,
+)
 from platform_runtime.schemas import (
     CredentialSaveRequest,
     GoalCreateRequest,
@@ -109,6 +170,12 @@ from platform_runtime.schemas import (
 def create_app() -> FastAPI:
     settings = load_platform_settings()
     knowledge_upload_root = (Path(__file__).resolve().parent.parent / "data" / "runtime_knowledge_uploads").resolve()
+    legacy_archive_root = (Path(__file__).resolve().parent.parent / "data" / "legacy_bot_import").resolve()
+    legacy_archive_files_root = (legacy_archive_root / "files").resolve()
+    bot_storage_path = Path(os.getenv("DATABASE_PATH") or "data/bot.sqlite3")
+    if not bot_storage_path.is_absolute():
+        bot_storage_path = (Path(__file__).resolve().parent.parent / bot_storage_path).resolve()
+    bot_storage = Storage(bot_storage_path)
     app = FastAPI(title="Platform Runtime API", version="0.1.0")
     app.add_middleware(
         SessionMiddleware,
@@ -117,8 +184,880 @@ def create_app() -> FastAPI:
         same_site="lax",
         https_only=settings.environment == "production",
     )
+
+    @app.middleware("http")
+    async def _minimal_public_gate(request: Request, call_next):
+        path = request.url.path.rstrip("/") or "/"
+        allowed_exact = {
+            "/",
+            "/register",
+            "/admin",
+            "/admin/login",
+            "/admin/logout",
+            "/admin/password/claim",
+        }
+        allowed_prefixes = {
+            "/admin-static",
+        }
+        if path in allowed_exact:
+            return await call_next(request)
+        if any(path.startswith(f"{prefix}/") or path == prefix for prefix in allowed_prefixes):
+            return await call_next(request)
+        return await call_next(request)
+
     templates = Jinja2Templates(directory=str(Path(__file__).resolve().parent / "templates"))
     app.mount("/admin-static", StaticFiles(directory=str(Path(__file__).resolve().parent / "static")), name="admin-static")
+
+    def _human_dt(value: datetime | date | None, timezone_name: str | None = None) -> str:
+        if value is None:
+            return "—"
+        if isinstance(value, date) and not isinstance(value, datetime):
+            return value.strftime("%d.%m.%Y")
+        current = value
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=timezone.utc)
+        target_timezone = timezone.utc
+        if timezone_name:
+            try:
+                target_timezone = ZoneInfo(str(timezone_name))
+            except Exception:
+                target_timezone = timezone.utc
+        return current.astimezone(target_timezone).strftime("%d.%m.%Y %H:%M")
+
+    templates.env.filters["human_dt"] = _human_dt
+
+    def _legacy_archive_json(relative_path: str) -> dict[str, object] | None:
+        target = (legacy_archive_root / relative_path).resolve()
+        if not str(target).startswith(str(legacy_archive_root)) or not target.is_file():
+            return None
+        try:
+            payload = json.loads(target.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def _legacy_archive_relative_path(source_path: str | None) -> str | None:
+        if not source_path:
+            return None
+        try:
+            relative = Path(source_path).resolve().relative_to(Path("/opt/aidar").resolve()).as_posix()
+        except Exception:
+            return None
+        target = (legacy_archive_files_root / relative).resolve()
+        if not str(target).startswith(str(legacy_archive_files_root)) or not target.is_file():
+            return None
+        return relative
+
+    def _refresh_legacy_archive(*, import_account_slug: str | None = None, actor_email: str | None = None) -> dict[str, object]:
+        from scripts.import_legacy_bot_data import refresh_archive
+
+        payload = refresh_archive(
+            source_root=Path("/opt/aidar"),
+            archive_dir=legacy_archive_root,
+            import_account_slug=import_account_slug,
+            actor_email=actor_email,
+        )
+        return payload if isinstance(payload, dict) else {}
+
+    def _account_slug_safe(account_slug: str) -> str:
+        cleaned = re.sub(r"[^0-9A-Za-zА-Яа-я._-]+", "-", (account_slug or "").strip())
+        return cleaned.strip("._-") or "default"
+
+    def _public_registration_account_slug(session: Session, company_name: str, email: str) -> str:
+        source = (company_name or "").strip() or email.split("@", 1)[0]
+        base_slug = _account_slug_safe(source).lower()[:100] or "account"
+        account_service = AccountService(session)
+        candidate = base_slug
+        suffix = 2
+        while account_service.get_by_slug(candidate) is not None:
+            candidate_suffix = f"-{suffix}"
+            candidate = f"{base_slug[: max(1, 100 - len(candidate_suffix))]}{candidate_suffix}"
+            suffix += 1
+        return candidate
+
+    def _send_public_registration_email(
+        *,
+        recipient_email: str,
+        recipient_name: str,
+        company_name: str,
+        access_url: str,
+        link_mode: str,
+    ) -> None:
+        if not settings.smtp_host or not settings.smtp_from_email:
+            raise PlatformCoreError("SMTP не настроен. Укажи PLATFORM_SMTP_* и повтори регистрацию.")
+        subject = f"{_public_brand_title()} · доступ к аккаунту"
+        intro = "Подтверди доступ и задай пароль" if link_mode == "claim" else "Аккаунт создан, можно войти"
+        message = EmailMessage()
+        message["From"] = settings.smtp_from_email
+        message["To"] = recipient_email
+        message["Subject"] = subject
+        greeting_name = recipient_name.strip() or recipient_email
+        body_lines = [
+            f"Здравствуйте, {greeting_name}.",
+            "",
+            f"Для компании «{company_name}» подготовлен рабочий аккаунт в {_public_brand_title()}.",
+            intro + ":",
+            access_url,
+            "",
+        ]
+        if link_mode == "claim":
+            body_lines.extend(
+                [
+                    "Ссылка одноразовая. После перехода нужно будет установить пароль.",
+                    "",
+                ]
+            )
+        else:
+            body_lines.extend(
+                [
+                    "Если пароль уже был создан раньше, используй обычный вход по email и паролю.",
+                    "",
+                ]
+            )
+        body_lines.extend(
+            [
+                "Если это письмо пришло по ошибке, просто проигнорируйте его.",
+                "",
+                _public_brand_title(),
+            ]
+        )
+        message.set_content("\n".join(body_lines))
+        with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=settings.smtp_timeout_seconds) as smtp:
+            if settings.smtp_use_starttls:
+                smtp.starttls()
+            if settings.smtp_username:
+                smtp.login(settings.smtp_username, settings.smtp_password or "")
+            smtp.send_message(message)
+
+    def _public_register_response(
+        request: Request,
+        *,
+        form_values: dict[str, str] | None = None,
+        error_message: str | None = None,
+        success_message: str | None = None,
+        status_code: int = status.HTTP_200_OK,
+    ) -> HTMLResponse:
+        values = form_values or {}
+        return templates.TemplateResponse(
+            request,
+            "public/register.html",
+            {
+                "brand_title": _public_brand_title(),
+                "brand_subtitle": _public_brand_subtitle(),
+                "account_href": "/admin",
+                "login_href": "/admin/login",
+                "csrf_token": _ensure_session_csrf_token(request),
+                "error_message": error_message,
+                "success_message": success_message,
+                "form_values": values,
+                "admin_asset_version": settings.app_version,
+            },
+            status_code=status_code,
+            headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0", "Pragma": "no-cache"},
+        )
+
+    def _public_html_headers() -> dict[str, str]:
+        return {
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+        }
+
+    def _finance_accounting_roots(account_slug: str) -> list[Path]:
+        repo_root = Path(__file__).resolve().parent.parent
+        roots = [
+            repo_root / "data" / "bot_accounts" / _account_slug_safe(account_slug) / "finance_accounting_new",
+            Path("/opt/aidar/finance_accounting_new"),
+            Path("/opt/aidar/finance_accounting"),
+            legacy_archive_files_root / "finance_accounting_new",
+            legacy_archive_files_root / "finance_accounting",
+        ]
+        unique_roots: list[Path] = []
+        seen: set[str] = set()
+        for root in roots:
+            key = str(root.resolve(strict=False))
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_roots.append(root)
+        return unique_roots
+
+    def _finance_find_file(account_slug: str, relative_path: str) -> Path | None:
+        first_existing: Path | None = None
+        for root in _finance_accounting_roots(account_slug):
+            candidate = root / relative_path
+            if not candidate.is_file():
+                continue
+            if first_existing is None:
+                first_existing = candidate
+            if candidate.suffix.lower() != ".csv":
+                return candidate
+            if _finance_csv_rows(candidate):
+                return candidate
+        return first_existing
+
+    def _finance_find_latest_glob(account_slug: str, pattern: str) -> Path | None:
+        matches: list[Path] = []
+        for root in _finance_accounting_roots(account_slug):
+            matches.extend(path for path in root.glob(pattern) if path.is_file())
+        if not matches:
+            return None
+        return max(matches, key=lambda item: (item.stat().st_mtime, item.name))
+
+    def _finance_csv_rows(path: Path | None) -> list[dict[str, str]]:
+        if path is None or not path.is_file():
+            return []
+        for encoding in ("utf-8-sig", "utf-8", "cp1251"):
+            try:
+                with path.open("r", encoding=encoding, newline="") as fh:
+                    return list(csv.DictReader(fh))
+            except (OSError, UnicodeDecodeError):
+                continue
+        return []
+
+    def _finance_csv_rows_for(account_slug: str, relative_path: str) -> list[dict[str, str]]:
+        merged: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for root in _finance_accounting_roots(account_slug):
+            rows = _finance_csv_rows(root / relative_path)
+            for row in rows:
+                signature = json.dumps(row, sort_keys=True, ensure_ascii=False)
+                if signature in seen:
+                    continue
+                seen.add(signature)
+                merged.append(row)
+        return merged
+
+    def _finance_decimal(value: object) -> Decimal:
+        text = str(value or "").strip().replace(" ", "").replace(",", ".")
+        if not text:
+            return Decimal("0")
+        try:
+            return Decimal(text)
+        except Exception:
+            return Decimal("0")
+
+    def _load_finance_accounting_snapshot(account_slug: str) -> dict[str, object]:
+        ceo_summary_path = _finance_find_file(account_slug, "reports/ceo_summary_latest.csv")
+        daily_summary_path = _finance_find_file(account_slug, "reports/daily_summary_latest.csv")
+        shipments_path = _finance_find_file(account_slug, "reports/moysklad_sales_enriched_latest.csv")
+        top_counterparties_path = _finance_find_latest_glob(account_slug, "reports/management_monthly_top20_*_latest.csv")
+        payables_path = _finance_find_file(account_slug, "inbox/finance_payables_registry.csv")
+
+        ceo_rows = _finance_csv_rows(ceo_summary_path)
+        daily_rows = _finance_csv_rows(daily_summary_path)
+        shipments_rows = _finance_csv_rows(shipments_path)
+        top_rows = _finance_csv_rows(top_counterparties_path)
+        payables_rows = _finance_csv_rows(payables_path)
+
+        finance_metrics = [
+            row for row in ceo_rows
+            if str(row.get("section") or "").strip().lower() == "финансы"
+        ][:6]
+        daily_summary = [
+            row for row in daily_rows
+            if str(row.get("date") or "").strip().lower() != "итого"
+        ][:14]
+        shipments = sorted(
+            shipments_rows,
+            key=lambda row: (
+                str(row.get("sale_date") or ""),
+                str(row.get("demand_name") or ""),
+            ),
+            reverse=True,
+        )[:25]
+        top_counterparties = [
+            row for row in top_rows
+            if "контрагенты" in str(row.get("секция") or "").strip().lower()
+        ][:20]
+
+        if not top_counterparties and shipments_rows:
+            aggregate: dict[str, dict[str, object]] = {}
+            for row in shipments_rows:
+                name = str(row.get("counterparty") or "").strip() or "Без названия"
+                item = aggregate.setdefault(name, {"name": name, "revenue": Decimal("0"), "quantity": Decimal("0")})
+                item["revenue"] = Decimal(item["revenue"]) + _finance_decimal(row.get("sale_sum_rub"))
+                item["quantity"] = Decimal(item["quantity"]) + _finance_decimal(row.get("quantity"))
+            top_counterparties = sorted(
+                (
+                    {
+                        "наименование": item["name"],
+                        "выручка": f"{Decimal(item['revenue']):.2f}",
+                        "количество": f"{Decimal(item['quantity']):.2f}",
+                    }
+                    for item in aggregate.values()
+                ),
+                key=lambda row: _finance_decimal(row.get("выручка")),
+                reverse=True,
+            )[:20]
+
+        payables_open = [
+            row for row in payables_rows
+            if "оплачен" not in str(row.get("статус") or "").strip().lower()
+        ]
+        payables_open.sort(key=lambda row: _finance_decimal(row.get("сумма")), reverse=True)
+
+        return {
+            "finance_metrics": finance_metrics,
+            "daily_summary": daily_summary,
+            "shipments": shipments,
+            "top_counterparties": top_counterparties,
+            "payables_open": payables_open[:20],
+            "sources": {
+                "ceo_summary": ceo_summary_path,
+                "daily_summary": daily_summary_path,
+                "shipments": shipments_path,
+                "top_counterparties": top_counterparties_path,
+                "payables": payables_path,
+            },
+        }
+
+    def _finance_text_key(value: object) -> str:
+        return re.sub(r"[^a-zа-я0-9]+", "", str(value or "").strip().lower())
+
+    def _finance_csv_value(row: dict[str, str], *keys: str) -> str:
+        direct = {str(key): str(value or "").strip() for key, value in row.items()}
+        normalized = {_finance_text_key(key): str(value or "").strip() for key, value in row.items()}
+        for key in keys:
+            direct_value = direct.get(key, "")
+            if direct_value:
+                return direct_value
+            normalized_value = normalized.get(_finance_text_key(key), "")
+            if normalized_value:
+                return normalized_value
+        return ""
+
+    def _finance_format_decimal(value: Decimal | float | int | str) -> str:
+        amount = value if isinstance(value, Decimal) else Decimal(str(value or "0"))
+        normalized = amount.quantize(Decimal("0.01"))
+        if normalized == normalized.to_integral():
+            return str(int(normalized))
+        return f"{normalized:.2f}".rstrip("0").rstrip(".")
+
+    def _finance_parse_decimal_or_zero(value: object) -> Decimal:
+        amount = _finance_decimal(value)
+        return amount.quantize(Decimal("0.01"))
+
+    def _finance_parse_date_flexible(value: object) -> date | None:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        for fmt in ("%d.%m.%Y", "%Y-%m-%d", "%Y/%m/%d"):
+            try:
+                return datetime.strptime(text, fmt).date()
+            except ValueError:
+                continue
+        return None
+
+    def _finance_daily_summary_rows(account_slug: str) -> list[dict[str, str]]:
+        rows = [
+            row
+            for row in _finance_csv_rows_for(account_slug, "reports/daily_summary_latest.csv")
+            if _finance_csv_value(row, "date").strip().lower() != "итого"
+        ]
+        rows.sort(key=lambda item: _finance_parse_date_flexible(_finance_csv_value(item, "date")) or date.min)
+        return rows
+
+    def _finance_latest_available_daily_date(account_slug: str) -> date | None:
+        rows = _finance_daily_summary_rows(account_slug)
+        if not rows:
+            return None
+        return _finance_parse_date_flexible(_finance_csv_value(rows[-1], "date"))
+
+    def _finance_resolve_daily_summary_row(account_slug: str, target_date: date | None = None) -> dict[str, object]:
+        rows = _finance_daily_summary_rows(account_slug)
+        if not rows:
+            return {"row": None, "requested_date": target_date, "actual_date": None, "mode": "missing"}
+        if target_date is None:
+            row = rows[-1]
+            actual_date = _finance_parse_date_flexible(_finance_csv_value(row, "date"))
+            return {"row": row, "requested_date": None, "actual_date": actual_date, "mode": "latest"}
+        exact = next(
+            (
+                row
+                for row in reversed(rows)
+                if _finance_parse_date_flexible(_finance_csv_value(row, "date")) == target_date
+            ),
+            None,
+        )
+        if exact is not None:
+            return {"row": exact, "requested_date": target_date, "actual_date": target_date, "mode": "exact"}
+        fallback = next(
+            (
+                row
+                for row in reversed(rows)
+                if (_finance_parse_date_flexible(_finance_csv_value(row, "date")) or date.min) <= target_date
+            ),
+            rows[-1],
+        )
+        actual_date = _finance_parse_date_flexible(_finance_csv_value(fallback, "date"))
+        return {"row": fallback, "requested_date": target_date, "actual_date": actual_date, "mode": "fallback"}
+
+    def _finance_ceo_metrics(account_slug: str, period: str) -> list[dict[str, object]]:
+        source_path = _finance_find_file(account_slug, "reports/ceo_summary_latest.csv")
+        period_label = {"day": "День", "week": "Неделя", "month": "Месяц"}.get((period or "day").strip().lower(), "День")
+        rows = _finance_csv_rows(source_path)
+        metrics = [
+            row for row in rows
+            if _finance_text_key(row.get("section")) == _finance_text_key("Финансы")
+            and _finance_text_key(row.get("period")) == _finance_text_key(period_label)
+        ]
+        result: list[dict[str, object]] = []
+        for row in metrics:
+            result.append(
+                {
+                    "metric": _finance_csv_value(row, "metric") or "Показатель",
+                    "value": _finance_csv_value(row, "value") or "0",
+                    "unit": _finance_csv_value(row, "unit"),
+                    "period": _finance_csv_value(row, "period") or period_label,
+                }
+            )
+        return result
+
+    def _finance_period_range(period: str, selected_date: date) -> tuple[date, date]:
+        normalized = (period or "day").strip().lower()
+        if normalized == "week":
+            return selected_date - timedelta(days=6), selected_date
+        if normalized == "month":
+            month_start = selected_date.replace(day=1)
+            if selected_date.month == 12:
+                next_month_start = date(selected_date.year + 1, 1, 1)
+            else:
+                next_month_start = date(selected_date.year, selected_date.month + 1, 1)
+            return month_start, next_month_start - timedelta(days=1)
+        return selected_date, selected_date
+
+    def _finance_db_metrics(
+        session: Session,
+        account_id: int,
+        start_date: date,
+        end_date: date,
+        period_label: str,
+    ) -> list[dict[str, object]]:
+        start_at = datetime.combine(start_date, datetime.min.time(), tzinfo=timezone.utc)
+        end_exclusive = datetime.combine(end_date + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc)
+        shipments = session.execute(
+            select(StockMovement).where(
+                StockMovement.account_id == account_id,
+                StockMovement.movement_type == "shipment_dispatch",
+                StockMovement.occurred_at >= start_at,
+                StockMovement.occurred_at < end_exclusive,
+            )
+        ).scalars().all()
+        expenses = session.execute(
+            select(Expense).where(
+                Expense.account_id == account_id,
+                Expense.expense_date >= start_date,
+                Expense.expense_date <= end_date,
+            )
+        ).scalars().all()
+        revenue = Decimal("0")
+        gross_profit = Decimal("0")
+        for shipment in shipments:
+            notes = shipment.notes_json or {}
+            quantity = abs(Decimal(shipment.quantity_delta or 0))
+            shipment_revenue = _finance_parse_decimal_or_zero(notes.get("total_amount"))
+            if shipment_revenue == Decimal("0"):
+                shipment_revenue = quantity * _finance_parse_decimal_or_zero(notes.get("unit_price"))
+            shipment_cost = quantity * _finance_parse_decimal_or_zero(shipment.unit_cost)
+            revenue += shipment_revenue
+            gross_profit += shipment_revenue - shipment_cost
+        net_profit = gross_profit - sum((_finance_parse_decimal_or_zero(item.amount) for item in expenses), Decimal("0"))
+        margin_pct = Decimal("0") if revenue <= 0 else ((gross_profit / revenue) * Decimal("100")).quantize(Decimal("0.01"))
+        profitability_pct = Decimal("0") if revenue <= 0 else ((net_profit / revenue) * Decimal("100")).quantize(Decimal("0.01"))
+        return [
+            {"metric": "Выручка", "value": _finance_format_decimal(revenue), "unit": "₽", "period": period_label},
+            {"metric": "Валовая прибыль", "value": _finance_format_decimal(gross_profit), "unit": "₽", "period": period_label},
+            {"metric": "Чистая прибыль", "value": _finance_format_decimal(net_profit), "unit": "₽", "period": period_label},
+            {"metric": "Маржинальность", "value": _finance_format_decimal(margin_pct), "unit": "%", "period": period_label},
+            {"metric": "Прибыльность", "value": _finance_format_decimal(profitability_pct), "unit": "%", "period": period_label},
+        ]
+
+    def _finance_db_fact_summary(
+        session: Session,
+        account_id: int,
+        start_date: date,
+        end_date: date,
+    ) -> dict[str, object]:
+        start_at = datetime.combine(start_date, datetime.min.time(), tzinfo=timezone.utc)
+        end_exclusive = datetime.combine(end_date + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc)
+        shipments = session.execute(
+            select(StockMovement).where(
+                StockMovement.account_id == account_id,
+                StockMovement.movement_type == "shipment_dispatch",
+                StockMovement.occurred_at >= start_at,
+                StockMovement.occurred_at < end_exclusive,
+            )
+        ).scalars().all()
+        expenses = session.execute(
+            select(Expense).where(
+                Expense.account_id == account_id,
+                Expense.expense_date >= start_date,
+                Expense.expense_date <= end_date,
+            )
+        ).scalars().all()
+        revenue = Decimal("0")
+        gross_profit = Decimal("0")
+        provider_sync_count = 0
+        counterparties: set[str] = set()
+        for shipment in shipments:
+            notes = shipment.notes_json or {}
+            quantity = abs(_finance_parse_decimal_or_zero(shipment.quantity_delta))
+            shipment_revenue = _finance_parse_decimal_or_zero(notes.get("total_amount"))
+            if shipment_revenue == Decimal("0"):
+                shipment_revenue = quantity * _finance_parse_decimal_or_zero(notes.get("unit_price"))
+            shipment_cost = quantity * _finance_parse_decimal_or_zero(shipment.unit_cost)
+            revenue += shipment_revenue
+            gross_profit += shipment_revenue - shipment_cost
+            if str(shipment.reference_type or "").strip() == "provider_sync":
+                provider_sync_count += 1
+            counterparty_name = str(notes.get("customer_name") or notes.get("counterparty_name") or "").strip()
+            if counterparty_name:
+                counterparties.add(counterparty_name)
+        expense_total = sum((_finance_parse_decimal_or_zero(item.amount) for item in expenses), Decimal("0"))
+        net_profit = gross_profit - expense_total
+        return {
+            "shipments_count": len(shipments),
+            "provider_sync_count": provider_sync_count,
+            "counterparties_count": len(counterparties),
+            "revenue": _finance_format_decimal(revenue),
+            "gross_profit": _finance_format_decimal(gross_profit),
+            "net_profit": _finance_format_decimal(net_profit),
+            "expenses": _finance_format_decimal(expense_total),
+            "has_data": bool(shipments or expenses),
+        }
+
+    def _finance_period_metrics(
+        account_slug: str,
+        selected_date: date,
+        period: str,
+        *,
+        session: Session | None = None,
+        account_id: int | None = None,
+    ) -> tuple[list[dict[str, object]], str]:
+        start_date, end_date = _finance_period_range(period, selected_date)
+        period_label = {"day": "День", "week": "Неделя", "month": "Месяц"}.get((period or "day").strip().lower(), "День")
+        rows = []
+        for row in _finance_daily_summary_rows(account_slug):
+            row_date = _finance_parse_date_flexible(_finance_csv_value(row, "date"))
+            if row_date is None or row_date < start_date or row_date > end_date:
+                continue
+            rows.append(row)
+        if not rows:
+            if session is not None and account_id is not None:
+                db_metrics = _finance_db_metrics(session, account_id, start_date, end_date, period_label)
+                if any(_finance_parse_decimal_or_zero(item["value"]) != Decimal("0") for item in db_metrics):
+                    return db_metrics, "db_shipments"
+            fallback = _finance_ceo_metrics(account_slug, period)
+            if fallback:
+                return fallback, "ceo_latest"
+            return [], "missing"
+        revenue = sum((_finance_parse_decimal_or_zero(_finance_csv_value(row, "revenue")) for row in rows), Decimal("0"))
+        gross_profit = sum((_finance_parse_decimal_or_zero(_finance_csv_value(row, "gross_profit")) for row in rows), Decimal("0"))
+        net_profit = sum((_finance_parse_decimal_or_zero(_finance_csv_value(row, "net_profit")) for row in rows), Decimal("0"))
+        margin_pct = Decimal("0") if revenue <= 0 else ((gross_profit / revenue) * Decimal("100")).quantize(Decimal("0.01"))
+        profitability_pct = Decimal("0") if revenue <= 0 else ((net_profit / revenue) * Decimal("100")).quantize(Decimal("0.01"))
+        return [
+            {"metric": "Выручка", "value": _finance_format_decimal(revenue), "unit": "₽", "period": period_label},
+            {"metric": "Валовая прибыль", "value": _finance_format_decimal(gross_profit), "unit": "₽", "period": period_label},
+            {"metric": "Чистая прибыль", "value": _finance_format_decimal(net_profit), "unit": "₽", "period": period_label},
+            {"metric": "Маржинальность", "value": _finance_format_decimal(margin_pct), "unit": "%", "period": period_label},
+            {"metric": "Прибыльность", "value": _finance_format_decimal(profitability_pct), "unit": "%", "period": period_label},
+        ], "daily_summary"
+
+    def _finance_today_expense_summary(account_slug: str, target_date: date | None = None) -> tuple[Decimal, int, dict[str, Decimal]]:
+        selected = target_date or datetime.now().astimezone().date()
+        today_value = selected.strftime("%d.%m.%Y")
+        rows = _finance_csv_rows_for(account_slug, "inbox/finance_expense_log.csv")
+        total = Decimal("0")
+        count = 0
+        by_category: dict[str, Decimal] = {}
+        for row in rows:
+            if _finance_csv_value(row, "date") != today_value:
+                continue
+            amount = _finance_parse_decimal_or_zero(_finance_csv_value(row, "amount"))
+            category = _finance_csv_value(row, "category") or "прочее"
+            total += amount
+            count += 1
+            by_category[category] = by_category.get(category, Decimal("0")) + amount
+        return total, count, by_category
+
+    def _finance_recent_expense_rows(account_slug: str, limit: int = 12) -> list[dict[str, object]]:
+        rows = _finance_csv_rows_for(account_slug, "inbox/finance_expense_log.csv")
+        parsed_rows: list[dict[str, object]] = []
+        for index, row in enumerate(rows):
+            created_raw = _finance_csv_value(row, "created_at")
+            created_at = None
+            if created_raw:
+                try:
+                    created_at = datetime.fromisoformat(created_raw.replace("Z", "+00:00"))
+                except ValueError:
+                    created_at = None
+            parsed_rows.append(
+                {
+                    "date": _finance_csv_value(row, "date"),
+                    "amount": _finance_parse_decimal_or_zero(_finance_csv_value(row, "amount")),
+                    "category": _finance_csv_value(row, "category") or "прочее",
+                    "city": _finance_csv_value(row, "city"),
+                    "comment": _finance_csv_value(row, "comment"),
+                    "source": _finance_csv_value(row, "source"),
+                    "created_at": created_at,
+                    "_seq": index,
+                }
+            )
+        parsed_rows.sort(
+            key=lambda item: (
+                item["created_at"] if isinstance(item["created_at"], datetime) else datetime.min.replace(tzinfo=timezone.utc),
+                int(item["_seq"]),
+            ),
+            reverse=True,
+        )
+        return parsed_rows[:limit]
+
+    def _finance_bank_accounts(session: Session, account_id: int) -> list[BankAccount]:
+        stmt = (
+            select(BankAccount)
+            .where(BankAccount.account_id == account_id)
+            .order_by(BankAccount.status.asc(), BankAccount.name.asc(), BankAccount.id.asc())
+        )
+        return session.execute(stmt).scalars().all()
+
+    def _finance_recent_bank_transactions(
+        session: Session,
+        account_id: int,
+        *,
+        limit: int = 12,
+    ) -> dict[str, object]:
+        stmt = (
+            select(BankTransaction, BankAccount)
+            .join(BankAccount, BankAccount.id == BankTransaction.bank_account_id)
+            .where(BankTransaction.account_id == account_id)
+            .order_by(BankTransaction.posted_at.desc(), BankTransaction.id.desc())
+            .limit(limit)
+        )
+        rows = session.execute(stmt).all()
+        items: list[dict[str, object]] = []
+        incoming_total = Decimal("0")
+        outgoing_total = Decimal("0")
+        for transaction, bank_account in rows:
+            direction = str(transaction.direction or "").strip().lower()
+            amount = _finance_parse_decimal_or_zero(transaction.amount)
+            if direction == "incoming":
+                incoming_total += amount
+            elif direction == "outgoing":
+                outgoing_total += amount
+            items.append(
+                {
+                    "id": transaction.id,
+                    "posted_at": transaction.posted_at.astimezone().strftime("%d.%m.%Y %H:%M") if transaction.posted_at else "—",
+                    "direction": "приход" if direction == "incoming" else "расход" if direction == "outgoing" else direction or "—",
+                    "amount": _finance_format_decimal(amount),
+                    "currency": transaction.currency or "RUB",
+                    "account": bank_account.name,
+                    "counterparty": transaction.counterparty_name or "—",
+                    "description": transaction.description or "—",
+                    "is_manual": str(transaction.provider_transaction_id or "").startswith("manual-web-"),
+                }
+            )
+        return {
+            "rows": items,
+            "incoming_total": _finance_format_decimal(incoming_total),
+            "outgoing_total": _finance_format_decimal(outgoing_total),
+        }
+
+    def _normalize_liquidity_bucket(raw: str) -> str:
+        value = _finance_text_key(raw)
+        if "карт" in value or "card" in value:
+            return "Карты"
+        if "нал" in value or "cash" in value or "касс" in value:
+            return "Наличные"
+        if "эквай" in value or "кошел" in value:
+            return "Эквайринг/кошельки"
+        if "депозит" in value:
+            return "Депозиты"
+        if "расчет" in value or "расч" in value or "bank" in value or "счет" in value or "счёт" in value:
+            return "Расчетные счета"
+        return "Прочее"
+
+    def _finance_liquidity_rows(account_slug: str) -> list[dict[str, object]]:
+        rows: list[dict[str, object]] = []
+        for row in _finance_csv_rows_for(account_slug, "inbox/finance_liquidity_registry.csv"):
+            account_name = _finance_csv_value(row, "счет", "счёт", "источник", "наименование", "account", "name", "source")
+            amount = _finance_parse_decimal_or_zero(_finance_csv_value(row, "сумма", "остаток", "баланс", "amount", "balance"))
+            if not account_name or amount == Decimal("0"):
+                continue
+            rows.append(
+                {
+                    "account": account_name,
+                    "bucket": _normalize_liquidity_bucket(_finance_csv_value(row, "тип", "категория", "bucket", "type") or account_name),
+                    "amount": amount,
+                    "updated": _finance_csv_value(row, "обновлено", "updated_at", "дата", "as_of"),
+                }
+            )
+        rows.sort(key=lambda item: (str(item["bucket"]), -Decimal(item["amount"]), str(item["account"])))
+        return rows
+
+    def _normalize_debt_direction(raw: str) -> str:
+        value = _finance_text_key(raw)
+        if any(token in value for token in ["мыдолжны", "коплате", "кредитор", "payable", "supplier"]):
+            return "payable"
+        if any(token in value for token in ["намдолжны", "кполучению", "дебитор", "receivable"]):
+            return "receivable"
+        return "unknown"
+
+    def _finance_payables_rows(account_slug: str) -> list[dict[str, object]]:
+        paid_statuses = {"paid", "closed", "оплачен", "оплачено", "закрыт", "закрыто", "погашен", "погашено"}
+        today_value = datetime.now().astimezone().date()
+        rows: list[dict[str, object]] = []
+        for row in _finance_csv_rows_for(account_slug, "inbox/finance_payables_registry.csv"):
+            amount = _finance_parse_decimal_or_zero(_finance_csv_value(row, "сумма", "amount", "долг", "debt"))
+            if amount <= 0:
+                continue
+            status = _finance_text_key(_finance_csv_value(row, "статус", "status"))
+            if status in paid_statuses:
+                continue
+            direction = _normalize_debt_direction(_finance_csv_value(row, "тип", "направление", "direction", "debt_type"))
+            if direction == "receivable":
+                continue
+            due = _finance_parse_date_flexible(_finance_csv_value(row, "срок оплаты", "due_date", "дата оплаты", "дедлайн"))
+            rows.append(
+                {
+                    "id": _finance_csv_value(row, "id"),
+                    "name": _finance_csv_value(row, "контрагент", "counterparty", "клиент", "name") or "Без названия",
+                    "amount": amount,
+                    "due": due,
+                    "comment": _finance_csv_value(row, "комментарий", "comment"),
+                    "status": _finance_csv_value(row, "статус", "status") or "open",
+                    "overdue_days": (today_value - due).days if due and due < today_value else 0,
+                }
+            )
+        rows.sort(key=lambda item: (item["due"] or date.max, -Decimal(item["amount"]), str(item["name"])))
+        return rows
+
+    def _finance_preferred_file(account_slug: str, relative_path: str) -> Path:
+        for root in _finance_accounting_roots(account_slug):
+            candidate = root / relative_path
+            if candidate.is_file():
+                candidate.parent.mkdir(parents=True, exist_ok=True)
+                return candidate
+        primary = _finance_accounting_roots(account_slug)[0] / relative_path
+        primary.parent.mkdir(parents=True, exist_ok=True)
+        return primary
+
+    def _append_finance_csv_row(path: Path, fieldnames: list[str], row: dict[str, str]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        file_exists = path.exists() and path.stat().st_size > 0
+        with path.open("a", encoding="utf-8-sig", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=fieldnames)
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(row)
+
+    def _finance_console_snapshot(
+        account_slug: str,
+        selected_date: date | None = None,
+        period: str = "day",
+        *,
+        session: Session | None = None,
+        account_id: int | None = None,
+    ) -> dict[str, object]:
+        focus_date = selected_date or datetime.now().astimezone().date()
+        daily_resolution = _finance_resolve_daily_summary_row(account_slug, focus_date)
+        daily_row = daily_resolution.get("row") if isinstance(daily_resolution.get("row"), dict) else None
+        actual_daily_date = daily_resolution.get("actual_date")
+        today_expense_total, today_expense_count, today_categories = _finance_today_expense_summary(account_slug, focus_date)
+        liquidity_rows = _finance_liquidity_rows(account_slug)
+        payables_rows = _finance_payables_rows(account_slug)
+        payables_total = sum((Decimal(row["amount"]) for row in payables_rows), Decimal("0"))
+        overdue_rows = [row for row in payables_rows if int(row["overdue_days"]) > 0]
+        overdue_total = sum((Decimal(row["amount"]) for row in overdue_rows), Decimal("0"))
+        liquidity_total = sum((Decimal(row["amount"]) for row in liquidity_rows), Decimal("0"))
+        liquidity_by_bucket: dict[str, Decimal] = defaultdict(lambda: Decimal("0"))
+        updated_values: list[str] = []
+        for row in liquidity_rows:
+            bucket = str(row["bucket"])
+            liquidity_by_bucket[bucket] += Decimal(row["amount"])
+            updated = str(row["updated"] or "").strip()
+            if updated:
+                updated_values.append(updated)
+        bot_snapshot = _load_finance_accounting_snapshot(account_slug)
+        finance_metrics, metrics_source = _finance_period_metrics(
+            account_slug,
+            focus_date,
+            period,
+            session=session,
+            account_id=account_id,
+        )
+        start_date, end_date = _finance_period_range(period, focus_date)
+        shipment_fact_summary = (
+            _finance_db_fact_summary(session, account_id, start_date, end_date)
+            if session is not None and account_id is not None
+            else {
+                "shipments_count": 0,
+                "provider_sync_count": 0,
+                "counterparties_count": 0,
+                "revenue": "0",
+                "gross_profit": "0",
+                "net_profit": "0",
+                "expenses": "0",
+                "has_data": False,
+            }
+        )
+        if daily_row is None and session is not None and account_id is not None:
+            daily_metrics = _finance_db_metrics(session, account_id, focus_date, focus_date, "День")
+            if any(_finance_parse_decimal_or_zero(item["value"]) != Decimal("0") for item in daily_metrics):
+                daily_map = {str(item["metric"]): str(item["value"]) for item in daily_metrics}
+                daily_row = {
+                    "date": focus_date.strftime("%d.%m.%Y"),
+                    "revenue": daily_map.get("Выручка", "0"),
+                    "gross_profit": daily_map.get("Валовая прибыль", "0"),
+                    "net_profit": daily_map.get("Чистая прибыль", "0"),
+                    "profitability_pct": daily_map.get("Прибыльность", "0"),
+                }
+                actual_daily_date = focus_date
+                daily_resolution = {"mode": "db_fallback"}
+        return {
+            "latest_daily": daily_row,
+            "today": {
+                "date": focus_date.strftime("%d.%m.%Y"),
+                "iso_date": focus_date.isoformat(),
+                "actual_daily_date": actual_daily_date.strftime("%d.%m.%Y") if isinstance(actual_daily_date, date) else "",
+                "daily_mode": str(daily_resolution.get("mode") or "missing"),
+                "expense_total": today_expense_total,
+                "expense_count": today_expense_count,
+                "expense_categories": [
+                    {"category": name, "amount": amount}
+                    for name, amount in sorted(today_categories.items(), key=lambda item: item[0])
+                ],
+                "revenue": _finance_csv_value(daily_row, "revenue") if daily_row else "",
+                "gross_profit": _finance_csv_value(daily_row, "gross_profit") if daily_row else "",
+                "net_profit": _finance_csv_value(daily_row, "net_profit") if daily_row else "",
+                "profitability_pct": _finance_csv_value(daily_row, "profitability_pct") if daily_row else "",
+            },
+            "selected_period": (period or "day").strip().lower(),
+            "metrics_source": metrics_source,
+            "shipment_fact": shipment_fact_summary,
+            "balance": {
+                "liquidity_total": liquidity_total,
+                "payables_total": payables_total,
+                "overdue_total": overdue_total,
+                "updated_at": updated_values[-1] if updated_values else "",
+                "bucket_rows": [
+                    {"bucket": bucket, "amount": amount}
+                    for bucket, amount in sorted(liquidity_by_bucket.items(), key=lambda item: item[0])
+                ],
+                "account_rows": liquidity_rows,
+            },
+            "debts": {
+                "rows": payables_rows,
+                "open_count": len(payables_rows),
+                "overdue_count": len(overdue_rows),
+                "open_total": payables_total,
+                "overdue_total": overdue_total,
+            },
+            "recent_expenses": _finance_recent_expense_rows(account_slug),
+            "finance_metrics": finance_metrics,
+            "sources": bot_snapshot.get("sources") or {},
+        }
 
     def ensure_permission(runtime: ResolvedRuntimeContext, permission_code: str) -> None:
         if "*" in runtime.permissions or permission_code in runtime.permissions:
@@ -210,6 +1149,12 @@ def create_app() -> FastAPI:
         if supplied != expected:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="CSRF token mismatch.")
 
+    def _require_supplied_csrf(request: Request, supplied: str | None) -> None:
+        expected = _ensure_session_csrf_token(request)
+        value = str(supplied or "").strip()
+        if value != expected:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="CSRF token mismatch.")
+
     def _current_session_user(session: Session, request: Request) -> User | None:
         actor_email = _session_actor_email(request)
         if actor_email is None:
@@ -225,6 +1170,377 @@ def create_app() -> FastAPI:
         if user.status != "active":
             return None
         return user
+
+    def _public_site_runtime(session: Session, request: Request) -> ResolvedRuntimeContext | None:
+        user = _current_session_user(session, request)
+        if user is None:
+            return None
+        account_slug = _session_account_slug(request)
+        if not account_slug:
+            memberships = _actor_membership_accounts(session, user.email)
+            if not memberships:
+                return None
+            first_membership = memberships[0]
+            account = session.execute(select(Account).where(Account.id == first_membership.account_id)).scalar_one_or_none()
+            if account is None:
+                return None
+            account_slug = account.slug
+            request.session["admin_account_slug"] = account_slug
+        try:
+            return resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=user.email)
+        except HTTPException:
+            return None
+
+    def _public_site_redirect_url(
+        section_key: str,
+        *,
+        workspace_id: str,
+        tab: str | None = None,
+        detail: str | None = None,
+        period: str | None = None,
+        selected_date: str | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+        scope: str | None = None,
+    ) -> str:
+        params: dict[str, str] = {}
+        if tab:
+            params["tab"] = tab
+        if detail:
+            params["detail"] = detail
+        if period:
+            params["period"] = period
+        if selected_date:
+            params["selected_date"] = selected_date
+        if date_from:
+            params["date_from"] = date_from
+        if date_to:
+            params["date_to"] = date_to
+        if scope:
+            params["scope"] = scope
+        query = f"?{urlencode(params)}" if params else ""
+        return f"/site/{section_key}{query}#{workspace_id}"
+
+    def _push_public_site_message(request: Request, *, level: str, message: str) -> None:
+        request.session["public_site_message"] = {"level": level, "message": message}
+
+    def _pop_public_site_message(request: Request) -> dict[str, str] | None:
+        payload = request.session.pop("public_site_message", None)
+        if not isinstance(payload, dict):
+            return None
+        level = str(payload.get("level") or "info").strip() or "info"
+        message = str(payload.get("message") or "").strip()
+        if not message:
+            return None
+        return {"level": level, "message": message}
+
+    def _avito_client_credentials_token(*, client_id: str, client_secret: str) -> dict[str, object]:
+        endpoints = (
+            "https://api.avito.ru/token",
+            "https://api.avito.ru/token/",
+        )
+        last_error: str | None = None
+        for endpoint in endpoints:
+            try:
+                response = requests.post(
+                    endpoint,
+                    data={
+                        "grant_type": "client_credentials",
+                        "client_id": client_id,
+                        "client_secret": client_secret,
+                    },
+                    headers={"Accept": "application/json"},
+                    timeout=30,
+                )
+            except requests.RequestException as exc:
+                last_error = str(exc)
+                continue
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = {}
+            if response.ok and isinstance(payload, dict) and str(payload.get("access_token") or "").strip():
+                return payload
+            if isinstance(payload, dict):
+                last_error = str(
+                    payload.get("error_description")
+                    or payload.get("error")
+                    or payload.get("message")
+                    or f"HTTP {response.status_code}"
+                ).strip()
+            else:
+                last_error = f"HTTP {response.status_code}"
+        raise PlatformCoreError(last_error or "Не удалось получить access token Авито.")
+
+    def _avito_authorization_code_token(
+        *,
+        client_id: str,
+        client_secret: str,
+        code: str,
+        redirect_uri: str,
+    ) -> dict[str, object]:
+        endpoints = (
+            "https://api.avito.ru/token",
+            "https://api.avito.ru/token/",
+        )
+        last_error: str | None = None
+        for endpoint in endpoints:
+            try:
+                response = requests.post(
+                    endpoint,
+                    data={
+                        "grant_type": "authorization_code",
+                        "client_id": client_id,
+                        "client_secret": client_secret,
+                        "code": code,
+                        "redirect_uri": redirect_uri,
+                    },
+                    headers={"Accept": "application/json"},
+                    timeout=30,
+                )
+            except requests.RequestException as exc:
+                last_error = str(exc)
+                continue
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = {}
+            if response.ok and isinstance(payload, dict) and str(payload.get("access_token") or "").strip():
+                return payload
+            if isinstance(payload, dict):
+                last_error = str(
+                    payload.get("error_description")
+                    or payload.get("error")
+                    or payload.get("message")
+                    or f"HTTP {response.status_code}"
+                ).strip()
+            else:
+                last_error = f"HTTP {response.status_code}"
+        raise PlatformCoreError(last_error or "Не удалось обменять код Авито на access token.")
+
+    def _avito_resolve_account_external_id(access_token: str) -> str | None:
+        token_value = str(access_token or "").strip()
+        if not token_value:
+            return None
+
+        candidate_endpoints = (
+            "https://api.avito.ru/core/v1/accounts/self",
+            "https://api.avito.ru/core/v1/accounts",
+            "https://api.avito.ru/messenger/v1/accounts",
+        )
+
+        def _pick_id(payload: object) -> str | None:
+            if isinstance(payload, dict):
+                for key in ("id", "user_id", "account_id", "accountId", "userId"):
+                    value = payload.get(key)
+                    if value is not None and str(value).strip():
+                        return str(value).strip()
+                for key in ("accounts", "items", "results", "data"):
+                    nested = payload.get(key)
+                    if isinstance(nested, list):
+                        for row in nested:
+                            picked = _pick_id(row)
+                            if picked:
+                                return picked
+                    if isinstance(nested, dict):
+                        picked = _pick_id(nested)
+                        if picked:
+                            return picked
+            if isinstance(payload, list):
+                for row in payload:
+                    picked = _pick_id(row)
+                    if picked:
+                        return picked
+            return None
+
+        headers = {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {token_value}",
+        }
+        for endpoint in candidate_endpoints:
+            try:
+                response = requests.get(endpoint, headers=headers, timeout=20)
+            except requests.RequestException:
+                continue
+            if response.status_code >= 400:
+                continue
+            try:
+                payload = response.json()
+            except ValueError:
+                continue
+            resolved = _pick_id(payload)
+            if resolved:
+                return resolved
+        return None
+
+    def _public_site_find_integration(
+        integrations: list[Integration],
+        *,
+        provider_kind: str,
+        provider_name: str,
+        display_name: str | None = None,
+        exact_display_name: bool = False,
+        include_archived: bool = False,
+    ) -> Integration | None:
+        matching = [
+            item
+            for item in integrations
+            if item.provider_kind == provider_kind and item.provider_name == provider_name
+            and (include_archived or item.status != "archived")
+        ]
+        if display_name:
+            wanted = display_name.strip().lower()
+            for item in matching:
+                if str(item.display_name or "").strip().lower() == wanted:
+                    return item
+            if exact_display_name:
+                return None
+        prioritized = sorted(
+            matching,
+            key=lambda item: (
+                0 if item.status == "active" else 1,
+                0 if isinstance(item.settings_json, dict) and item.settings_json.get("is_primary") else 1,
+                item.id,
+            ),
+        )
+        return prioritized[0] if prioritized else None
+
+    def _public_site_mark_primary_integration(
+        service: RuntimeIntegrationService,
+        runtime: ResolvedRuntimeContext,
+        integrations: list[Integration],
+        *,
+        provider_kind: str,
+        provider_name: str,
+        display_name: str,
+    ) -> None:
+        for integration in integrations:
+            if integration.provider_kind != provider_kind or integration.provider_name != provider_name:
+                continue
+            settings_json = dict(integration.settings_json) if isinstance(integration.settings_json, dict) else {}
+            should_be_primary = str(integration.display_name or "").strip() == display_name.strip()
+            settings_json["is_primary"] = should_be_primary
+            service.update_integration(
+                runtime.context,
+                integration_id=integration.id,
+                settings_json=settings_json,
+            )
+
+    def _public_site_upsert_integration(
+        service: RuntimeIntegrationService,
+        runtime: ResolvedRuntimeContext,
+        *,
+        provider_kind: str,
+        provider_name: str,
+        display_name: str,
+        credentials: dict[str, object] | None = None,
+        settings_updates: dict[str, object] | None = None,
+    ) -> Integration:
+        integrations = service.list_integrations(runtime.context)
+        integration = _public_site_find_integration(
+            integrations,
+            provider_kind=provider_kind,
+            provider_name=provider_name,
+            display_name=display_name,
+            exact_display_name=True,
+            include_archived=True,
+        )
+        if integration is None:
+            integration = service.create_integration(
+                runtime.context,
+                provider_kind=provider_kind,
+                provider_name=provider_name,
+                display_name=display_name,
+                status="active",
+                connection_mode="webhook" if provider_kind == "messaging" else "polling",
+                sync_mode="manual",
+                settings_json=settings_updates or {"is_primary": True},
+            )
+            integrations = service.list_integrations(runtime.context)
+            if provider_kind != "messaging":
+                _public_site_mark_primary_integration(
+                    service,
+                    runtime,
+                    integrations,
+                    provider_kind=provider_kind,
+                    provider_name=provider_name,
+                    display_name=display_name,
+                )
+        else:
+            merged_settings = dict(integration.settings_json) if isinstance(integration.settings_json, dict) else {}
+            if settings_updates:
+                merged_settings.update(settings_updates)
+            if integration.status == "archived":
+                integration = service.update_integration(
+                    runtime.context,
+                    integration_id=integration.id,
+                    status="active",
+                    settings_json=merged_settings or {"is_primary": True},
+                )
+                integrations = service.list_integrations(runtime.context)
+                if provider_kind != "messaging":
+                    _public_site_mark_primary_integration(
+                        service,
+                        runtime,
+                        integrations,
+                        provider_kind=provider_kind,
+                        provider_name=provider_name,
+                        display_name=display_name,
+                    )
+            elif settings_updates:
+                integration = service.update_integration(
+                    runtime.context,
+                    integration_id=integration.id,
+                    settings_json=merged_settings,
+                )
+        if credentials:
+            service.save_credentials(
+                runtime.context,
+                integration_id=integration.id,
+                secret_payload=credentials,
+                replace_mode="merge",
+            )
+        return integration
+
+    def _public_site_rename_integration(
+        service: RuntimeIntegrationService,
+        runtime: ResolvedRuntimeContext,
+        *,
+        provider_kind: str,
+        provider_name: str,
+        current_display_name: str,
+        new_display_name: str,
+    ) -> Integration:
+        current_name = current_display_name.strip()
+        next_name = new_display_name.strip()
+        if not current_name:
+            raise PlatformCoreError("Не выбрано текущее название аккаунта.")
+        if not next_name:
+            raise PlatformCoreError("Новое название аккаунта не заполнено.")
+        integrations = service.list_integrations(runtime.context)
+        target = _public_site_find_integration(
+            integrations,
+            provider_kind=provider_kind,
+            provider_name=provider_name,
+            display_name=current_name,
+            exact_display_name=True,
+        )
+        if target is None:
+            raise PlatformCoreError("Аккаунт для переименования не найден.")
+        duplicate = _public_site_find_integration(
+            integrations,
+            provider_kind=provider_kind,
+            provider_name=provider_name,
+            display_name=next_name,
+            exact_display_name=True,
+        )
+        if duplicate is not None and duplicate.id != target.id:
+            raise PlatformCoreError("Аккаунт с таким названием уже существует.")
+        return service.update_integration(
+            runtime.context,
+            integration_id=target.id,
+            display_name=next_name,
+        )
 
     def _actor_membership_accounts(session: Session, actor_email: str) -> list[AccountUser]:
         return session.execute(
@@ -285,6 +1601,5981 @@ def create_app() -> FastAPI:
             suffix = f"?{urlencode({'next': next_path})}"
         return RedirectResponse(url=f"/admin/login{suffix}", status_code=status.HTTP_302_FOUND)
 
+    def _public_brand_title() -> str:
+        return "Financeavio"
+
+    def _public_brand_subtitle() -> str:
+        return "Рабочая система для владельца: все показатели в одном месте"
+
+    def _site_shell_sections() -> list[dict[str, object]]:
+        return [
+            {
+                "key": "dashboard",
+                "label": "Показатели",
+                "eyebrow": "Owner console",
+                "title": "Главный экран управления",
+                "description": "Деньги, риски, просрочки, критические остатки, проблемы и контроль компании в одном месте.",
+                "later": ["Что горит сейчас", "Деньги", "Команда", "KPI", "Критические точки"],
+                "actions": ["Открыть риск", "Перейти в домен", "Принять решение"],
+            },
+            {
+                "key": "finance",
+                "label": "Финансы",
+                "eyebrow": "Money",
+                "title": "Денежный контур",
+                "description": "Приход, расход, баланс, ликвидность, долги, оплаты, банк и cashflow без складского мусора.",
+                "finance_items": [
+                    {"code": "summary", "label": "Сводка"},
+                    {"code": "expense_add", "label": "Добавить расход", "icon": "+"},
+                    {"code": "income_add", "label": "Добавить приход", "icon": "+"},
+                    {"code": "balance", "label": "Баланс"},
+                    {"code": "capital", "label": "Капитал"},
+                    {"code": "purchase", "label": "Закуп"},
+                    {"code": "expenses", "label": "Расходы"},
+                    {"code": "margin", "label": "Маржинальность"},
+                    {"code": "revenue", "label": "Выручка"},
+                    {"code": "cost", "label": "Себестоимость"},
+                    {"code": "payable", "label": "Кредиторка (добавить/изменить)", "icon": "+/-"},
+                    {"code": "receivable", "label": "Дебиторка (добавить/изменить)", "icon": "+/-"},
+                    {"code": "anomalies", "label": "Аномалии"},
+                    {"code": "charts", "label": "Графики", "href": "/site/finance?view=charts"},
+                ],
+                "later": [],
+                "actions": [],
+            },
+            {
+                "key": "inventory",
+                "label": "Склад",
+                "eyebrow": "Warehouse",
+                "title": "Полный складской контур",
+                "description": "Товары, склады, закупка, приемка, отгрузки, возвраты, пополнение, движения, инвентаризация.",
+                "inventory_items": [
+                    {"code": "summary", "label": "Сводка"},
+                    {"code": "receiving", "label": "Приемка"},
+                    {"code": "inventory_count", "label": "Инвентаризация"},
+                    {"code": "purchase_request", "label": "Сформировать закуп"},
+                    {"code": "transfer", "label": "Перемещение"},
+                    {"code": "find", "label": "Найти товар"},
+                    {"code": "dispatch", "label": "Отгрузить"},
+                    {"code": "return", "label": "Возврат"},
+                    {"code": "products", "label": "Товары"},
+                    {"code": "stock", "label": "Остатки"},
+                    {"code": "counterparties", "label": "Контрагенты"},
+                    {"code": "charts", "label": "Графики", "href": "/site/inventory?view=charts"},
+                ],
+                "later": ["Обзор", "Товары", "Закупка", "Приемка", "Отгрузки", "Пополнение", "Движение"],
+                "actions": ["Создать закупку", "Принять товар", "Оформить отгрузку"],
+            },
+            {
+                "key": "employees",
+                "label": "Сотрудники",
+                "eyebrow": "People",
+                "title": "Сотрудники и роли",
+                "description": "Сотрудники, отделы, роли, доступы, зарплата, активность и рабочие карточки команды.",
+                "employee_items": [
+                    {"code": "kpi", "label": "KPI"},
+                    {"code": "overdue", "label": "Просроченные задачи"},
+                    {"code": "on_time", "label": "Исполнение в срок"},
+                    {"code": "workload", "label": "Загрузка команды"},
+                    {"code": "reaction", "label": "Средняя реакция"},
+                    {"code": "all_employees", "label": "Все сотрудники"},
+                    {"code": "employee_add", "label": "Добавить сотрудника"},
+                    {"code": "task_assign", "label": "Поставить задачу"},
+                    {"code": "summary", "label": "Сводка"},
+                    {"code": "charts", "label": "Графики", "href": "/site/employees?view=charts"},
+                ],
+                "later": ["Сотрудники", "Отделы", "Роли", "Зарплата", "Активность"],
+                "actions": ["Открыть сотрудника", "Назначить роль", "Проверить активность"],
+            },
+            {
+                "key": "documents",
+                "label": "Документы",
+                "eyebrow": "Documents",
+                "title": "Контур документов",
+                "description": "КП, счета, договоры, акты, акты выполненных работ, гарантия, претензии, реквизиты, контрагенты и история.",
+                "document_items": [
+                    {"code": "quote", "label": "КП"},
+                    {"code": "invoice", "label": "Счета"},
+                    {"code": "contract", "label": "Договоры"},
+                    {"code": "act", "label": "Акты"},
+                    {"code": "completed_act", "label": "Акт выполненных работ"},
+                    {"code": "warranty", "label": "Гарантия"},
+                    {"code": "claim", "label": "Претензии"},
+                    {"code": "requisites", "label": "Реквизиты"},
+                    {"code": "counterparties", "label": "Контрагенты"},
+                    {"code": "history", "label": "История"},
+                ],
+                "later": ["Шаблоны", "История", "Документы по клиенту", "PDF-preview", "Отправка"],
+                "actions": ["Создать счет", "Собрать договор", "Скачать PDF"],
+            },
+            {
+                "key": "marketing",
+                "label": "Маркетинг",
+                "eyebrow": "Advertising",
+                "title": "Маркетинг и Авито",
+                "description": "Расходы, лиды, продажи, CPL, CAC, конверсия, аккаунты, города и сравнение периодов.",
+                "marketing_items": [
+                    {"code": "summary", "label": "Сводка"},
+                    {"code": "fill_data", "label": "Заполнить данные"},
+                    {"code": "source", "label": "Источники"},
+                    {"code": "expenses", "label": "Расходы"},
+                    {"code": "cac", "label": "Стоимость клиента"},
+                    {"code": "cpl", "label": "Стоимость лида"},
+                    {"code": "leads", "label": "Лиды"},
+                    {"code": "cities", "label": "Города"},
+                    {"code": "conversion", "label": "Конверсия"},
+                    {"code": "charts", "label": "Графики", "href": "/site/marketing?view=charts&source=all"},
+                ],
+                "later": ["Аккаунты", "Города", "Периоды", "CPL/CAC", "Top-источники"],
+                "actions": ["Открыть аккаунт", "Сравнить период", "Проверить прибыльность"],
+            },
+            {
+                "key": "sales",
+                "label": "Продажи",
+                "eyebrow": "CRM",
+                "title": "Лиды, клиенты и сделки",
+                "description": "CRM-контур с воронкой, клиентами, сделками, задачами, документами и оплатами.",
+                "sales_items": [
+                    {"code": "summary", "label": "Сводка"},
+                    {"code": "source", "label": "Источники"},
+                    {"code": "avg_check", "label": "Средний чек"},
+                    {"code": "days", "label": "Дни"},
+                    {"code": "cities", "label": "Города"},
+                    {"code": "charts", "label": "Графики", "href": "/site/sales?view=charts&source=all"},
+                ],
+                "later": ["Лиды", "Сделки", "Клиенты", "Воронка", "Связанные документы"],
+                "actions": ["Создать сделку", "Передвинуть стадию", "Открыть клиента"],
+            },
+            {
+                "key": "kpi",
+                "label": "KPI",
+                "eyebrow": "Goals",
+                "title": "Цели и plan/fact",
+                "description": "Цели компании, отделов и сотрудников, веса KPI, отклонения и рейтинги.",
+                "kpi_items": [
+                    {"code": "summary", "label": "Сводка"},
+                    {"code": "plan_fact", "label": "План/факт"},
+                    {"code": "company_goals", "label": "Цели компании"},
+                    {"code": "plans", "label": "Планы"},
+                    {"code": "top", "label": "Топы"},
+                    {"code": "anti_top", "label": "Антитопы"},
+                    {"code": "company", "label": "Компания"},
+                    {"code": "departments", "label": "Отделы"},
+                    {"code": "employees", "label": "Сотрудники"},
+                ],
+                "later": ["Цели компании", "Цели отделов", "Цели сотрудников", "Plan/fact", "Сигналы"],
+                "actions": ["Поставить цель", "Открыть отклонение", "Снять рейтинг"],
+            },
+            {
+                "key": "integrations",
+                "label": "Интеграции",
+                "eyebrow": "Data pipes",
+                "title": "Интеграции как домены данных",
+                "description": "Банк, Авито, МойСклад, Telegram и статус их реальной работы.",
+                "integration_items": [
+                    {"code": "telegram", "label": "Telegram"},
+                    {"code": "max", "label": "MAX"},
+                    {"code": "avito", "label": "Авито"},
+                    {"code": "moysklad", "label": "МойСклад"},
+                    {"code": "bank", "label": "Банк"},
+                ],
+                "later": ["Банк", "Авито", "МойСклад", "Telegram", "Sync health", "Ошибки"],
+                "actions": ["Проверить sync", "Открыть ошибку", "Запустить повтор"],
+            },
+            {
+                "key": "settings",
+                "label": "Настройки",
+                "eyebrow": "Admin",
+                "title": "Настройка аккаунта",
+                "description": "Права, роли, реквизиты, справочники, бренд и параметры системы.",
+                "settings_items": [
+                    {"code": "company", "label": "Компания"},
+                    {"code": "roles", "label": "Роли и доступы"},
+                    {"code": "notifications", "label": "Уведомления"},
+                    {"code": "directories", "label": "Справочники"},
+                    {"code": "brand", "label": "Бренд"},
+                    {"code": "system", "label": "Система"},
+                ],
+                "later": ["Роли", "Реквизиты", "Справочники", "Бренд", "Параметры"],
+                "actions": ["Изменить настройку", "Проверить доступы", "Обновить реквизиты"],
+            },
+            {
+                "key": "knowledge",
+                "label": "База знаний",
+                "eyebrow": "Knowledge",
+                "title": "Внутренняя база знаний",
+                "description": "Регламенты, ответы, инструкции, шаблоны и справка по процессам компании.",
+                "knowledge_items": [
+                    {"code": "summary", "label": "Сводка"},
+                    {"code": "company_context", "label": "О компании"},
+                    {"code": "articles", "label": "Статьи"},
+                    {"code": "regulations", "label": "Регламенты"},
+                    {"code": "templates", "label": "Шаблоны"},
+                    {"code": "partner_map", "label": "Карта партнеров для документов"},
+                    {"code": "search", "label": "Поиск"},
+                ],
+                "later": ["Статьи", "Регламенты", "Шаблоны", "Поиск"],
+                "actions": ["Открыть статью", "Найти инструкцию", "Создать материал"],
+            },
+            {
+                "key": "ai",
+                "label": "ИИ",
+                "eyebrow": "AI workspace",
+                "title": "Советы и сценарии ИИ",
+                "description": "Подсказки для владельца, разбор рисков, следующие действия по доменам и рабочие сценарии с ИИ.",
+                "ai_items": [
+                    {"code": "summary", "label": "Сводка"},
+                    {"code": "workspace", "label": "Умный ввод"},
+                    {"code": "output", "label": "Вывод ИИ"},
+                    {"code": "advice", "label": "Советы"},
+                    {"code": "risks", "label": "Риски"},
+                    {"code": "forecasts", "label": "Прогнозы"},
+                    {"code": "scenarios", "label": "Сценарии"},
+                    {"code": "history", "label": "История"},
+                ],
+                "later": ["Советы дня", "Разбор рисков", "Следующие действия", "Сценарии", "История запросов"],
+                "actions": ["Открыть совет", "Разобрать риск", "Сформировать следующий шаг"],
+            },
+            {
+                "key": "help",
+                "label": "Помощь",
+                "eyebrow": "Support",
+                "title": "Помощь и поддержка",
+                "description": "Справка по системе, маршрутам, ролям и сценариям работы для команды и владельца.",
+                "help_items": [
+                    {"code": "summary", "label": "Сводка"},
+                    {"code": "guides", "label": "Гайды"},
+                    {"code": "faq", "label": "FAQ"},
+                    {"code": "support", "label": "Поддержка"},
+                    {"code": "requests", "label": "Запросы"},
+                ],
+                "later": ["FAQ", "Как работать", "Частые ошибки", "Маршруты по ролям"],
+                "actions": ["Открыть справку", "Найти ответ", "Понять следующий шаг"],
+            },
+        ]
+
+    def _site_section(section_key: str) -> dict[str, object]:
+        sections = _site_shell_sections()
+        lookup = {str(item["key"]): item for item in sections}
+        return lookup.get(section_key, sections[0])
+
+    def _site_section_items(section: dict[str, object]) -> list[dict[str, object]]:
+        for key in (
+            "finance_items",
+            "inventory_items",
+            "marketing_items",
+            "sales_items",
+            "employee_items",
+            "document_items",
+            "kpi_items",
+            "integration_items",
+            "settings_items",
+            "knowledge_items",
+            "ai_items",
+            "help_items",
+        ):
+            value = section.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+        return []
+
+    def _public_site_breadcrumbs(
+        section: dict[str, object],
+        workspace_surface: dict[str, object] | None,
+        domain_charts: dict[str, object] | None,
+    ) -> list[dict[str, str | None]]:
+        section_key = str(section.get("key") or "dashboard")
+        section_label = str(section.get("label") or "Раздел")
+        breadcrumbs: list[dict[str, str | None]] = [
+            {"label": "Главная", "href": "/site/dashboard"},
+        ]
+        if section_key != "dashboard":
+            breadcrumbs.append({"label": section_label, "href": f"/site/{section_key}"})
+        else:
+            breadcrumbs.append({"label": section_label, "href": None})
+        if domain_charts is not None:
+            breadcrumbs.append({"label": "Графики", "href": None})
+        elif workspace_surface is not None:
+            current_title = str(workspace_surface.get("title") or "").strip()
+            current_section_label = str(workspace_surface.get("section_label") or "").strip()
+            if current_title and current_title != current_section_label and current_title != section_label:
+                breadcrumbs.append({"label": current_title, "href": None})
+        return breadcrumbs
+
+    def _public_site_section_status(section: dict[str, object]) -> dict[str, str] | None:
+        section_key = str(section.get("key") or "")
+        if section_key in {"marketing", "sales", "employees", "documents", "kpi", "settings", "knowledge", "ai", "help"}:
+            return None
+        mapping = {
+            "finance": {"label": "Статус раздела", "value": "Частично", "meta": "основные формы собраны, наполнение еще расширяется", "tone": "warning"},
+            "inventory": {"label": "Статус раздела", "value": "Частично", "meta": "контур склада собран, сценарии еще уточняются", "tone": "warning"},
+            "integrations": {"label": "Статус раздела", "value": "Частично", "meta": "структура подключений собрана, сценарии еще расширяются", "tone": "warning"},
+        }
+        return mapping.get(section_key)
+
+    def _public_site_workspace_back_button(section: dict[str, object], workspace_surface: dict[str, object] | None) -> dict[str, str] | None:
+        if workspace_surface is None:
+            return None
+        section_key = str(section.get("key") or "")
+        section_label = str(section.get("label") or "раздел")
+        top_items = _site_section_items(section)
+        default_tab = str(top_items[0].get("code") or "") if top_items else ""
+        active_tab = str(workspace_surface.get("active_tab") or "")
+        active_detail = str(workspace_surface.get("active_detail") or "")
+        if active_tab and (active_tab != default_tab or active_detail not in {"", "period", "date", "profile", "list", "active", "owner", "company", "roles", "workspace", "quick", "advice", "channels", "query"}):
+            return {"label": f"Назад в {section_label.lower()}", "href": f"/site/{section_key}"}
+        return None
+
+    def _site_dashboard_filters(
+        selected_date_raw: str | None,
+        period_raw: str | None,
+        date_from_raw: str | None = None,
+        date_to_raw: str | None = None,
+    ) -> dict[str, object]:
+        today = datetime.now(timezone.utc).date()
+        selected_date = today
+        if selected_date_raw:
+            try:
+                selected_date = datetime.strptime(selected_date_raw, "%Y-%m-%d").date()
+            except ValueError:
+                selected_date = today
+        date_from = today - timedelta(days=6)
+        date_to = today
+        if date_from_raw:
+            try:
+                date_from = datetime.strptime(date_from_raw, "%Y-%m-%d").date()
+            except ValueError:
+                date_from = today - timedelta(days=6)
+        if date_to_raw:
+            try:
+                date_to = datetime.strptime(date_to_raw, "%Y-%m-%d").date()
+            except ValueError:
+                date_to = today
+        if date_from > date_to:
+            date_from, date_to = date_to, date_from
+        period_code = str(period_raw or "day").strip().lower()
+        if period_code not in {"day", "yesterday", "week", "month", "custom"}:
+            period_code = "day"
+        anchor_date = selected_date
+        if period_code == "day":
+            date_from = anchor_date
+            date_to = anchor_date
+        elif period_code == "yesterday":
+            selected_date = anchor_date - timedelta(days=1)
+            date_from = selected_date
+            date_to = selected_date
+        elif period_code == "week":
+            selected_date = anchor_date
+            date_from = anchor_date - timedelta(days=6)
+            date_to = anchor_date
+        elif period_code == "month":
+            selected_date = anchor_date
+            date_from = anchor_date - timedelta(days=29)
+            date_to = anchor_date
+        else:
+            selected_date = date_to
+        return {
+            "anchor_date": anchor_date.isoformat(),
+            "selected_date": selected_date.isoformat(),
+            "selected_date_label": selected_date.strftime("%d.%m.%Y"),
+            "date_from": date_from.isoformat(),
+            "date_to": date_to.isoformat(),
+            "date_from_label": date_from.strftime("%d.%m.%Y"),
+            "date_to_label": date_to.strftime("%d.%m.%Y"),
+            "today": today.isoformat(),
+            "yesterday": (today - timedelta(days=1)).isoformat(),
+            "period_code": period_code,
+            "period_label": {
+                "day": "Сегодня",
+                "yesterday": "Вчера",
+                "week": "Неделя",
+                "month": "Месяц",
+                "custom": "Период",
+            }[period_code],
+            "periods": [
+                {"code": "day", "label": "Сегодня"},
+                {"code": "yesterday", "label": "Вчера"},
+                {"code": "week", "label": "Неделя"},
+                {"code": "month", "label": "Месяц"},
+                {"code": "custom", "label": "Период"},
+            ],
+        }
+
+    def _site_period_meta(period_code: str, date_from_label: str | None = None, date_to_label: str | None = None) -> dict[str, str]:
+        meta = {
+            "day": {
+                "label": "Сегодня",
+                "window": "за сегодня",
+                "kpi": "за сегодня",
+                "charts": "за сегодня",
+            },
+            "yesterday": {
+                "label": "Вчера",
+                "window": "за вчера",
+                "kpi": "за вчера",
+                "charts": "за вчера",
+            },
+            "week": {
+                "label": "Текущая неделя",
+                "window": "за текущую неделю",
+                "kpi": "за текущую неделю",
+                "charts": "за текущую неделю",
+            },
+            "month": {
+                "label": "Текущий месяц",
+                "window": "за текущий месяц",
+                "kpi": "за текущий месяц",
+                "charts": "за текущий месяц",
+            },
+            "custom": {
+                "label": "Период",
+                "window": f"за период {date_from_label} - {date_to_label}" if date_from_label and date_to_label else "за выбранный период",
+                "kpi": f"за период {date_from_label} - {date_to_label}" if date_from_label and date_to_label else "за выбранный период",
+                "charts": f"за период {date_from_label} - {date_to_label}" if date_from_label and date_to_label else "за выбранный период",
+            },
+        }
+        return meta.get(period_code, meta["day"])
+
+    def _site_periodize_bars(bars: list[int], period_code: str) -> list[int]:
+        adjustments = {
+            "day": (1.0, 0),
+            "yesterday": (0.94, -4),
+            "week": (1.1, 5),
+            "month": (1.18, 8),
+            "custom": (1.14, 6),
+        }
+        factor, shift = adjustments.get(period_code, adjustments["day"])
+        values: list[int] = []
+        for index, value in enumerate(bars):
+            adjusted = int(round(value * factor + shift - (len(bars) - index - 1)))
+            values.append(max(16, min(84, adjusted)))
+        return values
+
+    def _site_period_query(period_code: str, date_from: str | None = None, date_to: str | None = None) -> str:
+        params: dict[str, str] = {"period": period_code}
+        if period_code == "custom":
+            params["date_from"] = date_from or ""
+            params["date_to"] = date_to or ""
+        return urlencode(params)
+
+    def _site_source_query(period_query: str, source: str | None = None) -> str:
+        params = dict(parse_qsl(period_query, keep_blank_values=True))
+        if source:
+            params["source"] = source
+        return urlencode(params)
+
+    def _site_dashboard_model(
+        selected_date_raw: str | None = None,
+        period_raw: str | None = None,
+        date_from_raw: str | None = None,
+        date_to_raw: str | None = None,
+    ) -> dict[str, object]:
+        filters = _site_dashboard_filters(selected_date_raw, period_raw, date_from_raw, date_to_raw)
+        period_code = str(filters["period_code"])
+        period_meta = _site_period_meta(period_code, str(filters["date_from_label"]), str(filters["date_to_label"]))
+        charts_model = _site_charts_model(
+            period_code=period_code,
+            selected_date_label=str(filters["selected_date_label"]),
+            selected_date=str(filters["selected_date"]),
+            date_from=str(filters["date_from"]),
+            date_to=str(filters["date_to"]),
+        )
+        top_metrics = [
+            {
+                "label": "Баланс",
+                "value": {
+                    "day": "3.48 млн ₽",
+                    "yesterday": "3.31 млн ₽",
+                    "week": "3.92 млн ₽",
+                    "month": "4.26 млн ₽",
+                    "custom": "4.08 млн ₽",
+                }[period_code],
+                "meta": f"баланс денежных средств {period_meta['kpi']}",
+                "tone": "default",
+                "priority": "primary",
+            },
+            {
+                "label": "Выручка",
+                "value": {
+                    "day": "1.24 млн ₽",
+                    "yesterday": "1.08 млн ₽",
+                    "week": "6.84 млн ₽",
+                    "month": "27.6 млн ₽",
+                    "custom": "19.4 млн ₽",
+                }[period_code],
+                "meta": f"выручка {period_meta['kpi']}",
+                "tone": "default",
+                "priority": "primary",
+            },
+            {
+                "label": "Расходы",
+                "value": {
+                    "day": "682 тыс ₽",
+                    "yesterday": "705 тыс ₽",
+                    "week": "3.76 млн ₽",
+                    "month": "14.8 млн ₽",
+                    "custom": "10.9 млн ₽",
+                }[period_code],
+                "meta": f"расходы {period_meta['kpi']}",
+                "tone": "default",
+                "priority": "primary",
+            },
+            {
+                "label": "Просроченные задачи",
+                "value": {
+                    "day": "14",
+                    "yesterday": "17",
+                    "week": "39",
+                    "month": "62",
+                    "custom": "48",
+                }[period_code],
+                "meta": f"просрочки {period_meta['kpi']}",
+                "tone": "danger",
+                "priority": "primary",
+            },
+            {
+                "label": "Капитал",
+                "value": {
+                    "day": "5.92 млн ₽",
+                    "yesterday": "5.84 млн ₽",
+                    "week": "6.11 млн ₽",
+                    "month": "6.34 млн ₽",
+                    "custom": "6.22 млн ₽",
+                }[period_code],
+                "meta": f"текущее значение капитала {period_meta['kpi']}",
+                "tone": "default",
+                "priority": "secondary",
+            },
+            {
+                "label": "Прибыльность",
+                "value": {
+                    "day": "18.4%",
+                    "yesterday": "17.1%",
+                    "week": "19.6%",
+                    "month": "21.3%",
+                    "custom": "20.4%",
+                }[period_code],
+                "meta": f"прибыльность {period_meta['kpi']}",
+                "tone": "default",
+                "priority": "secondary",
+            },
+            {
+                "label": "Критические остатки",
+                "value": {
+                    "day": "27 SKU",
+                    "yesterday": "31 SKU",
+                    "week": "22 SKU",
+                    "month": "18 SKU",
+                    "custom": "20 SKU",
+                }[period_code],
+                "meta": f"критические позиции {period_meta['kpi']}",
+                "tone": "warning",
+                "priority": "secondary",
+            },
+            {
+                "label": "Цена клиента общая",
+                "value": {
+                    "day": "3 620 ₽",
+                    "yesterday": "3 740 ₽",
+                    "week": "3 410 ₽",
+                    "month": "3 280 ₽",
+                    "custom": "3 350 ₽",
+                }[period_code],
+                "meta": f"CAC {period_meta['kpi']}",
+                "tone": "default",
+                "priority": "secondary",
+            },
+        ]
+        return {
+            "filters": filters,
+            "summary": f"Главные деньги и контроль компании {period_meta['window']}.",
+            "quick_actions": [
+                {
+                    "label": "Советы ИИ",
+                    "href": "/site/ai",
+                    "tone": "primary",
+                },
+            ],
+            "top_metrics": top_metrics,
+            "charts_title": f"Графики {period_meta['charts']}",
+            "charts_description": f"Данные меняются вместе с периодом: сейчас показан срез {period_meta['window']}.",
+            "charts": charts_model["charts"],
+        }
+
+    def _site_finance_surface_model(
+        selected_date_raw: str | None = None,
+        period_raw: str | None = None,
+        date_from_raw: str | None = None,
+        date_to_raw: str | None = None,
+        tab_raw: str | None = None,
+        detail_raw: str | None = None,
+        scope_raw: str | None = None,
+        request_params: dict[str, str] | None = None,
+        session: Session | None = None,
+        runtime: ResolvedRuntimeContext | None = None,
+    ) -> dict[str, object]:
+        request_params = request_params or {}
+        filters = _site_dashboard_filters(selected_date_raw, period_raw, date_from_raw, date_to_raw)
+        period_code = str(filters["period_code"])
+        period_meta = _site_period_meta(period_code, str(filters["date_from_label"]), str(filters["date_to_label"]))
+        period_query = _site_period_query(period_code, str(filters["date_from"]), str(filters["date_to"]))
+        finance_section = _site_section("finance")
+        raw_tabs = list(finance_section.get("finance_items", []))
+        allowed_codes = {str(item.get("code")) for item in raw_tabs if item.get("code")}
+        active_tab = str(tab_raw or "balance").strip().lower()
+        if active_tab not in allowed_codes or active_tab == "charts":
+            active_tab = "balance"
+
+        def pick(values: dict[str, str]) -> str:
+            return str(values.get(period_code, values.get("day", "")))
+
+        def metric(label: str, values: dict[str, str], meta: str, tone: str = "default") -> dict[str, str]:
+            return {"label": label, "value": pick(values), "meta": meta, "tone": tone}
+
+        def rows_panel(title: str, subtitle: str, rows: list[tuple[str, object]]) -> dict[str, object]:
+            items = []
+            for row_label, row_value in rows:
+                if isinstance(row_value, dict):
+                    value = pick({str(key): str(value) for key, value in row_value.items()})
+                else:
+                    value = str(row_value)
+                items.append({"label": row_label, "value": value})
+            return {"kind": "rows", "title": title, "subtitle": subtitle, "items": items}
+
+        def chips_panel(title: str, subtitle: str, chips: list[dict[str, object]]) -> dict[str, object]:
+            return {"kind": "chips", "title": title, "subtitle": subtitle, "items": chips}
+
+        def form_panel(title: str, subtitle: str, fields: list[dict[str, object]], button_label: str, period_value: str | None = None) -> dict[str, object]:
+            normalized_fields: list[dict[str, object]] = []
+            for field in fields:
+                field_copy = dict(field)
+                field_name = str(field_copy.get("name") or "")
+                if field_name and str(field_copy.get("type") or "") != "file" and field_name in request_params:
+                    field_copy["value"] = request_params[field_name]
+                normalized_fields.append(field_copy)
+            hidden = [
+                {"name": "tab", "value": active_tab},
+                {"name": "detail", "value": detail_code},
+                {"name": "period", "value": period_value or period_code},
+            ]
+            if active_scope:
+                hidden.append({"name": "scope", "value": active_scope})
+            if (period_value or period_code) == "custom":
+                hidden.append({"name": "date_from", "value": request_params.get("date_from", str(filters["date_from"]))})
+                hidden.append({"name": "date_to", "value": request_params.get("date_to", str(filters["date_to"]))})
+            return {
+                "kind": "form",
+                "title": title,
+                "subtitle": subtitle,
+                "items": normalized_fields,
+                "button_label": button_label,
+                "action": "/site/finance#finance-workspace",
+                "hidden": hidden,
+            }
+
+        def finance_href(tab_code: str, detail_code: str | None = None, scope_code: str | None = None, period_override: str | None = None) -> str:
+            params: dict[str, str] = {"tab": tab_code, "period": period_override or period_code, "selected_date": str(filters["anchor_date"])}
+            if detail_code:
+                params["detail"] = detail_code
+            if scope_code:
+                params["scope"] = scope_code
+            if params["period"] == "custom":
+                params["date_from"] = str(filters["date_from"])
+                params["date_to"] = str(filters["date_to"])
+            return f"/site/finance?{urlencode(params)}#finance-workspace"
+
+        def build_subtab(label: str, code: str | None = None, target_period: str | None = None, active: bool = False, scope_code: str | None = None) -> dict[str, object]:
+            href = finance_href(active_tab, code or detail_code, scope_code, target_period)
+            return {"label": label, "href": href, "active": active}
+
+        expense_types = [
+            "Маркетинг",
+            "ФОТ",
+            "Логистика",
+            "Аренда",
+            "Налоги",
+            "Кредит",
+            "Закуп",
+            "Погашение долга",
+            "Расходные материалы",
+            "Прочее",
+        ]
+        anomaly_categories = [
+            "Все источники финансов",
+            "Баланс",
+            "Капитал",
+            "Расходы",
+            "Маржинальность",
+            "Выручка",
+            "Себестоимость",
+            "Кредиторка",
+            "Дебиторка",
+        ]
+
+        view_defaults = {
+            "summary": "period",
+            "expense_add": "form",
+            "income_add": "form",
+            "balance": "edit",
+            "capital": "capital_total",
+            "purchase": "amount",
+            "expenses": "list",
+            "margin": "avg",
+            "revenue": "top_days",
+            "cost": "structure",
+            "payable": "all",
+            "receivable": "all",
+            "anomalies": "category",
+        }
+        detail_code = str(detail_raw or view_defaults.get(active_tab, "form")).strip().lower()
+        active_scope = str(scope_raw or "").strip()
+        selected_date_value = date.fromisoformat(str(filters["selected_date"]))
+        date_from_value = date.fromisoformat(str(filters["date_from"]))
+        date_to_value = date.fromisoformat(str(filters["date_to"]))
+
+        def money_label(value: object) -> str:
+            amount = _finance_parse_decimal_or_zero(value)
+            return f"{_finance_format_decimal(amount)} ₽"
+
+        def decimal_label(value: Decimal, suffix: str = "") -> str:
+            text = _finance_format_decimal(value)
+            return f"{text}{suffix}"
+
+        live_finance_summary: dict[str, object] | None = None
+        live_balance_snapshot: dict[str, object] | None = None
+        live_revenue_top_days: list[tuple[str, object]] = []
+        live_revenue_top_counterparties: list[tuple[str, object]] = []
+        if session is not None and runtime is not None:
+            live_finance_summary = _finance_db_fact_summary(
+                session,
+                runtime.account.id,
+                date_from_value,
+                date_to_value,
+            )
+            live_console = _finance_console_snapshot(
+                runtime.account.slug,
+                selected_date=selected_date_value,
+                period="month" if period_code == "month" else "week" if period_code == "week" else "day",
+                session=session,
+                account_id=runtime.account.id,
+            )
+            live_balance_snapshot = (
+                dict(live_console.get("balance"))
+                if isinstance(live_console.get("balance"), dict)
+                else None
+            )
+            start_at = datetime.combine(date_from_value, datetime.min.time(), tzinfo=timezone.utc)
+            end_exclusive = datetime.combine(date_to_value + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc)
+            shipments = session.execute(
+                select(StockMovement).where(
+                    StockMovement.account_id == runtime.account.id,
+                    StockMovement.movement_type == "shipment_dispatch",
+                    StockMovement.occurred_at >= start_at,
+                    StockMovement.occurred_at < end_exclusive,
+                )
+            ).scalars().all()
+            revenue_by_day: dict[date, Decimal] = defaultdict(lambda: Decimal("0"))
+            revenue_by_counterparty: dict[str, Decimal] = defaultdict(lambda: Decimal("0"))
+            for shipment in shipments:
+                notes = shipment.notes_json or {}
+                occurred_on = shipment.occurred_at.date() if shipment.occurred_at else None
+                quantity = abs(_finance_parse_decimal_or_zero(shipment.quantity_delta))
+                revenue_amount = _finance_parse_decimal_or_zero(notes.get("total_amount"))
+                if revenue_amount == Decimal("0"):
+                    revenue_amount = quantity * _finance_parse_decimal_or_zero(notes.get("unit_price"))
+                if occurred_on is not None:
+                    revenue_by_day[occurred_on] += revenue_amount
+                counterparty_name = str(notes.get("customer_name") or notes.get("counterparty_name") or "").strip()
+                if counterparty_name:
+                    revenue_by_counterparty[counterparty_name] += revenue_amount
+            live_revenue_top_days = [
+                (day.strftime("%d.%m.%Y"), money_label(amount))
+                for day, amount in sorted(
+                    revenue_by_day.items(),
+                    key=lambda item: (item[1], item[0]),
+                    reverse=True,
+                )[:8]
+            ]
+            live_revenue_top_counterparties = [
+                (name, money_label(amount))
+                for name, amount in sorted(
+                    revenue_by_counterparty.items(),
+                    key=lambda item: (item[1], item[0]),
+                    reverse=True,
+                )[:8]
+            ]
+
+        tabs: list[dict[str, object]] = []
+        for item in raw_tabs:
+            code = str(item.get("code") or "")
+            href = f"/site/finance?view=charts&{period_query}" if code == "charts" else finance_href(code)
+            tabs.append(
+                {
+                    "code": code,
+                    "label": str(item.get("label") or ""),
+                    "icon": str(item.get("icon") or ""),
+                    "href": href,
+                    "active": code == active_tab and code != "charts",
+                }
+            )
+
+        period_links = []
+        for item in list(filters["periods"]):
+            period_links.append(
+                {
+                    **item,
+                    "href": finance_href(active_tab, detail_code, active_scope or None, str(item["code"])),
+                }
+            )
+        filters["periods"] = period_links
+
+        title = "Финансы"
+        description = ""
+        metrics: list[dict[str, str]] = []
+        panels: list[dict[str, object]] = []
+        subtabs: list[dict[str, object]] = []
+
+        if active_tab == "summary":
+            valid = {"date", "period"}
+            detail_code = detail_code if detail_code in valid else "period"
+            subtabs = [
+                build_subtab("Дата", "date", active=detail_code == "date"),
+                build_subtab("Период", "period", active=detail_code == "period"),
+                build_subtab("День", detail_code, target_period="day", active=period_code == "day"),
+                build_subtab("Вчера", detail_code, target_period="yesterday", active=period_code == "yesterday"),
+                build_subtab("Месяц", detail_code, target_period="month", active=period_code == "month"),
+            ]
+            title = "Сводка"
+            description = f"Сводка по финансам {period_meta['window']}."
+            metrics = [
+                {"label": "Дата", "value": str(filters["selected_date_label"]), "meta": f"срез {period_meta['window']}", "tone": "default"},
+                {"label": "Период", "value": str(filters["period_label"]), "meta": f"активно {period_meta['window']}", "tone": "default"},
+                metric("Баланс", {"day": "3.48 млн ₽", "yesterday": "3.31 млн ₽", "week": "3.92 млн ₽", "month": "4.26 млн ₽", "custom": "4.08 млн ₽"}, f"денежные средства {period_meta['window']}"),
+                metric("Выручка", {"day": "1.24 млн ₽", "yesterday": "1.08 млн ₽", "week": "6.84 млн ₽", "month": "27.6 млн ₽", "custom": "19.4 млн ₽"}, f"выручка {period_meta['window']}"),
+            ]
+            if detail_code == "date":
+                panels = [rows_panel("Дата", "Срез финансов по дате", [("Дата", str(filters["selected_date_label"])), ("Баланс", pick({"day": "3.48 млн ₽", "yesterday": "3.31 млн ₽", "week": "3.92 млн ₽", "month": "4.26 млн ₽", "custom": "4.08 млн ₽"})), ("Выручка", pick({"day": "1.24 млн ₽", "yesterday": "1.08 млн ₽", "week": "6.84 млн ₽", "month": "27.6 млн ₽", "custom": "19.4 млн ₽"})), ("Расходы", pick({"day": "682 тыс ₽", "yesterday": "705 тыс ₽", "week": "3.76 млн ₽", "month": "14.8 млн ₽", "custom": "10.9 млн ₽"}))])]
+            else:
+                panels = [
+                    form_panel(
+                        "Период",
+                        "Настроить диапазон сводки",
+                        [
+                            {"label": "С", "name": "date_from", "type": "date", "value": str(filters["date_from"])},
+                            {"label": "По", "name": "date_to", "type": "date", "value": str(filters["date_to"])},
+                        ],
+                        "Сохранить",
+                        period_value="custom",
+                    ),
+                    rows_panel("Период", "Общая сводка по финансам", [("Период", str(filters["period_label"])), ("С", str(filters["date_from_label"])), ("По", str(filters["date_to_label"])), ("Капитал", pick({"day": "5.92 млн ₽", "yesterday": "5.84 млн ₽", "week": "6.11 млн ₽", "month": "6.34 млн ₽", "custom": "6.22 млн ₽"})), ("Маржинальность", pick({"day": "18.4%", "yesterday": "17.1%", "week": "19.6%", "month": "21.3%", "custom": "20.4%"}))]),
+                ]
+            if live_finance_summary is not None and live_balance_snapshot is not None:
+                revenue_decimal = _finance_parse_decimal_or_zero(live_finance_summary.get("revenue"))
+                gross_profit_decimal = _finance_parse_decimal_or_zero(live_finance_summary.get("gross_profit"))
+                net_profit_decimal = _finance_parse_decimal_or_zero(live_finance_summary.get("net_profit"))
+                expenses_decimal = _finance_parse_decimal_or_zero(live_finance_summary.get("expenses"))
+                balance_decimal = Decimal(live_balance_snapshot.get("liquidity_total") or 0)
+                metrics = [
+                    {"label": "Дата", "value": str(filters["selected_date_label"]), "meta": f"срез {period_meta['window']}", "tone": "default"},
+                    {"label": "Период", "value": str(filters["period_label"]), "meta": f"активно {period_meta['window']}", "tone": "default"},
+                    {"label": "Баланс", "value": money_label(balance_decimal), "meta": f"ликвидность {period_meta['window']}", "tone": "default"},
+                    {"label": "Выручка", "value": money_label(revenue_decimal), "meta": f"выручка {period_meta['window']}", "tone": "default"},
+                ]
+                if detail_code == "date":
+                    panels = [
+                        rows_panel(
+                            "Дата",
+                            "Срез финансов по дате",
+                            [
+                                ("Дата", str(filters["selected_date_label"])),
+                                ("Баланс", money_label(balance_decimal)),
+                                ("Выручка", money_label(revenue_decimal)),
+                                ("Расходы", money_label(expenses_decimal)),
+                                ("Чистая прибыль", money_label(net_profit_decimal)),
+                            ],
+                        )
+                    ]
+                else:
+                    margin_pct = Decimal("0") if revenue_decimal <= 0 else ((gross_profit_decimal / revenue_decimal) * Decimal("100")).quantize(Decimal("0.01"))
+                    panels = [
+                        form_panel(
+                            "Период",
+                            "Настроить диапазон сводки",
+                            [
+                                {"label": "С", "name": "date_from", "type": "date", "value": str(filters["date_from"])},
+                                {"label": "По", "name": "date_to", "type": "date", "value": str(filters["date_to"])},
+                            ],
+                            "Сохранить",
+                            period_value="custom",
+                        ),
+                        rows_panel(
+                            "Период",
+                            "Общая сводка по финансам",
+                            [
+                                ("Период", str(filters["period_label"])),
+                                ("С", str(filters["date_from_label"])),
+                                ("По", str(filters["date_to_label"])),
+                                ("Валовая прибыль", money_label(gross_profit_decimal)),
+                                ("Чистая прибыль", money_label(net_profit_decimal)),
+                                ("Маржинальность", decimal_label(margin_pct, "%")),
+                                ("Отгрузок", int(live_finance_summary.get("shipments_count") or 0)),
+                            ],
+                        ),
+                    ]
+        elif active_tab == "expense_add":
+            active_scope = active_scope if active_scope in expense_types else expense_types[0]
+            title = "Добавить расход"
+            description = f"Макет ввода расхода {period_meta['window']}: сумма, тип расхода и дата."
+            metrics = [
+                metric("Сумма", {"day": "0 ₽", "yesterday": "0 ₽", "week": "0 ₽", "month": "0 ₽", "custom": "0 ₽"}, f"новый расход {period_meta['window']}"),
+                {"label": "Тип расхода", "value": active_scope, "meta": f"выбран для формы {period_meta['window']}", "tone": "default"},
+                {"label": "Дата", "value": str(filters["selected_date_label"]), "meta": f"дата записи {period_meta['window']}", "tone": "default"},
+                metric("Расходы", {"day": "682 тыс ₽", "yesterday": "705 тыс ₽", "week": "3.76 млн ₽", "month": "14.8 млн ₽", "custom": "10.9 млн ₽"}, f"уже заведено {period_meta['window']}"),
+            ]
+            panels = [
+                form_panel(
+                    "Поля формы",
+                    "Что нужно заполнить",
+                    [
+                        {"label": "Сумма", "name": "amount", "type": "text", "value": "0 ₽"},
+                        {"label": "Тип расхода", "name": "scope", "type": "select", "value": active_scope, "options": expense_types},
+                        {"label": "Дата", "name": "selected_date", "type": "date", "value": str(filters["selected_date"])},
+                    ],
+                    "Сохранить",
+                ),
+                chips_panel(
+                    "Тип расхода",
+                    "Выбор типа расхода",
+                    [{"label": item, "href": finance_href("expense_add", "form", item), "active": item == active_scope} for item in expense_types],
+                ),
+            ]
+        elif active_tab == "income_add":
+            title = "Добавить приход"
+            description = f"Макет ввода прихода {period_meta['window']}: сумма, тип прихода и дата."
+            metrics = [
+                metric("Сумма", {"day": "0 ₽", "yesterday": "0 ₽", "week": "0 ₽", "month": "0 ₽", "custom": "0 ₽"}, f"новый приход {period_meta['window']}"),
+                {"label": "Тип прихода", "value": "Выбрать тип", "meta": f"для формы {period_meta['window']}", "tone": "default"},
+                {"label": "Дата", "value": str(filters["selected_date_label"]), "meta": f"дата записи {period_meta['window']}", "tone": "default"},
+                metric("Приходы", {"day": "1.24 млн ₽", "yesterday": "1.08 млн ₽", "week": "6.84 млн ₽", "month": "27.6 млн ₽", "custom": "19.4 млн ₽"}, f"уже заведено {period_meta['window']}"),
+            ]
+            panels = [
+                form_panel(
+                    "Поля формы",
+                    "Что нужно заполнить",
+                    [
+                        {"label": "Сумма", "name": "amount", "type": "text", "value": "0 ₽"},
+                        {"label": "Тип прихода", "name": "income_type", "type": "text", "value": "Выбрать тип"},
+                        {"label": "Дата", "name": "selected_date", "type": "date", "value": str(filters["selected_date"])},
+                    ],
+                    "Сохранить",
+                ),
+            ]
+        elif active_tab == "balance":
+            valid = {"date", "period", "edit", "history"}
+            detail_code = detail_code if detail_code in valid else "edit"
+            subtabs = [
+                build_subtab("Дата", "date", active=detail_code == "date"),
+                build_subtab("Период", "period", active=detail_code == "period"),
+                build_subtab("Изменить баланс", "edit", active=detail_code == "edit"),
+                build_subtab("История", "history", active=detail_code == "history"),
+            ]
+            title = "Баланс"
+            description = f"Денежные остатки {period_meta['window']}."
+            metrics = [
+                {"label": "Дата", "value": str(filters["selected_date_label"]), "meta": f"активная дата {period_meta['window']}", "tone": "default"},
+                {"label": "Период", "value": str(filters["period_label"]), "meta": f"активный период {period_meta['window']}", "tone": "default"},
+                metric("Баланс", {"day": "3.48 млн ₽", "yesterday": "3.31 млн ₽", "week": "3.92 млн ₽", "month": "4.26 млн ₽", "custom": "4.08 млн ₽"}, f"общий баланс {period_meta['window']}"),
+                metric("Нал. + карты + ИП + ООО", {"day": "3.48 млн ₽", "yesterday": "3.31 млн ₽", "week": "3.92 млн ₽", "month": "4.26 млн ₽", "custom": "4.08 млн ₽"}, f"сумма контуров {period_meta['window']}"),
+            ]
+            if detail_code == "date":
+                panels = [rows_panel("Дата", "Текущий срез", [("Дата", str(filters["selected_date_label"])), ("Период", str(filters["period_label"]))])]
+            elif detail_code == "period":
+                panels = [
+                    form_panel(
+                        "Период",
+                        "Настроить период баланса",
+                        [
+                            {"label": "С", "name": "date_from", "type": "date", "value": str(filters["date_from"])},
+                            {"label": "По", "name": "date_to", "type": "date", "value": str(filters["date_to"])},
+                        ],
+                        "Сохранить",
+                        period_value="custom",
+                    ),
+                    rows_panel("Период", "Активный период", [("Период", str(filters["period_label"])), ("С", str(filters["date_from_label"])), ("По", str(filters["date_to_label"]))]),
+                ]
+            elif detail_code == "edit":
+                panels = [
+                    form_panel(
+                        "Изменить баланс",
+                        "Окно для забивания баланса",
+                        [
+                            {"label": "Дата", "name": "selected_date", "type": "date", "value": str(filters["selected_date"])},
+                            {"label": "Нал.", "name": "cash", "type": "text", "value": "0 ₽"},
+                            {"label": "Карты", "name": "cards", "type": "text", "value": "0 ₽"},
+                            {"label": "ИП", "name": "ip", "type": "text", "value": "0 ₽"},
+                            {"label": "ООО", "name": "ooo", "type": "text", "value": "0 ₽"},
+                        ],
+                        "Сохранить",
+                    )
+                ]
+            else:
+                panels = [rows_panel("История", "Последние изменения", [("21.04.2026", "3.48 млн ₽"), ("20.04.2026", "3.31 млн ₽"), ("19.04.2026", "3.24 млн ₽"), ("18.04.2026", "3.18 млн ₽")])]
+            if live_balance_snapshot is not None:
+                liquidity_total = Decimal(live_balance_snapshot.get("liquidity_total") or 0)
+                payables_total = Decimal(live_balance_snapshot.get("payables_total") or 0)
+                overdue_total = Decimal(live_balance_snapshot.get("overdue_total") or 0)
+                metrics = [
+                    {"label": "Дата", "value": str(filters["selected_date_label"]), "meta": f"активная дата {period_meta['window']}", "tone": "default"},
+                    {"label": "Период", "value": str(filters["period_label"]), "meta": f"активный период {period_meta['window']}", "tone": "default"},
+                    {"label": "Баланс", "value": money_label(liquidity_total), "meta": f"ликвидность {period_meta['window']}", "tone": "default"},
+                    {"label": "К оплате", "value": money_label(payables_total), "meta": "текущая кредиторка", "tone": "warning" if payables_total > 0 else "default"},
+                ]
+                account_rows = []
+                for item in list(live_balance_snapshot.get("account_rows") or [])[:8]:
+                    if not isinstance(item, dict):
+                        continue
+                    account_rows.append((str(item.get("account") or "Счет"), money_label(item.get("amount"))))
+                summary_rows = [
+                    ("Баланс", money_label(liquidity_total)),
+                    ("Кредиторка", money_label(payables_total)),
+                    ("Просрочено", money_label(overdue_total)),
+                    ("Обновлено", str(live_balance_snapshot.get("updated_at") or "Нет данных")),
+                ]
+                if detail_code == "edit":
+                    panels = [rows_panel("Текущий баланс", "Живые данные по счетам", summary_rows)]
+                    if account_rows:
+                        panels.append(rows_panel("Счета", "Разбивка по источникам", account_rows))
+                elif detail_code == "history":
+                    panels = [rows_panel("Счета", "Разбивка по источникам", account_rows or [("Нет данных", "Не найдено активных счетов")])]
+                else:
+                    panels = [rows_panel("Текущий баланс", "Живые данные по счетам", summary_rows)]
+        elif active_tab == "capital":
+            valid = {"capital_total", "goods", "balance", "receivable", "payable"}
+            detail_code = detail_code if detail_code in valid else "capital_total"
+            subtabs = [
+                build_subtab("Капитал общий", "capital_total", active=detail_code == "capital_total"),
+                build_subtab("Товар", "goods", active=detail_code == "goods"),
+                build_subtab("Баланс", "balance", active=detail_code == "balance"),
+                build_subtab("Дебиторка", "receivable", active=detail_code == "receivable"),
+                build_subtab("Кредиторка", "payable", active=detail_code == "payable"),
+            ]
+            title = "Капитал"
+            description = f"Капитал компании {period_meta['window']}."
+            metrics = [
+                metric("Капитал", {"day": "5.92 млн ₽", "yesterday": "5.84 млн ₽", "week": "6.11 млн ₽", "month": "6.34 млн ₽", "custom": "6.22 млн ₽"}, f"итого {period_meta['window']}"),
+                metric("Товар", {"day": "1.12 млн ₽", "yesterday": "1.08 млн ₽", "week": "1.16 млн ₽", "month": "1.24 млн ₽", "custom": "1.18 млн ₽"}, f"товарный контур {period_meta['window']}"),
+                metric("Баланс", {"day": "3.48 млн ₽", "yesterday": "3.31 млн ₽", "week": "3.92 млн ₽", "month": "4.26 млн ₽", "custom": "4.08 млн ₽"}, f"денежный контур {period_meta['window']}"),
+                {"label": "Дата", "value": str(filters["selected_date_label"]), "meta": f"срез {period_meta['window']}", "tone": "default"},
+            ]
+            if detail_code == "goods":
+                panels = [rows_panel("Товар", "Товар внутри капитала", [("Товар", pick({"day": "1.12 млн ₽", "yesterday": "1.08 млн ₽", "week": "1.16 млн ₽", "month": "1.24 млн ₽", "custom": "1.18 млн ₽"})), ("Остаток", pick({"day": "4 860 шт.", "yesterday": "4 420 шт.", "week": "27 600 шт.", "month": "112 400 шт.", "custom": "79 300 шт."})), ("Средняя партия", pick({"day": "62 тыс ₽", "yesterday": "70 тыс ₽", "week": "76 тыс ₽", "month": "75 тыс ₽", "custom": "77 тыс ₽"}))])]
+            elif detail_code == "balance":
+                panels = [rows_panel("Баланс", "Баланс внутри капитала", [("Баланс", pick({"day": "3.48 млн ₽", "yesterday": "3.31 млн ₽", "week": "3.92 млн ₽", "month": "4.26 млн ₽", "custom": "4.08 млн ₽"})), ("Нал.", pick({"day": "148 тыс ₽", "yesterday": "142 тыс ₽", "week": "166 тыс ₽", "month": "181 тыс ₽", "custom": "171 тыс ₽"})), ("ООО", pick({"day": "2.18 млн ₽", "yesterday": "2.06 млн ₽", "week": "2.34 млн ₽", "month": "2.56 млн ₽", "custom": "2.44 млн ₽"}))])]
+            elif detail_code == "receivable":
+                panels = [rows_panel("Дебиторка", "Дебиторка внутри капитала", [("Дебиторка", pick({"day": "2.14 млн ₽", "yesterday": "2.22 млн ₽", "week": "2.06 млн ₽", "month": "1.88 млн ₽", "custom": "1.96 млн ₽"})), ("Просрочено", pick({"day": "468 тыс ₽", "yesterday": "486 тыс ₽", "week": "434 тыс ₽", "month": "392 тыс ₽", "custom": "414 тыс ₽"})), ("Клиентов", pick({"day": "17", "yesterday": "18", "week": "19", "month": "22", "custom": "20"}))])]
+            elif detail_code == "payable":
+                panels = [rows_panel("Кредиторка", "Кредиторка внутри капитала", [("Кредиторка", pick({"day": "1.36 млн ₽", "yesterday": "1.42 млн ₽", "week": "1.31 млн ₽", "month": "1.24 млн ₽", "custom": "1.28 млн ₽"})), ("Просрочено", pick({"day": "284 тыс ₽", "yesterday": "302 тыс ₽", "week": "248 тыс ₽", "month": "216 тыс ₽", "custom": "238 тыс ₽"})), ("Контрагентов", pick({"day": "11", "yesterday": "12", "week": "13", "month": "16", "custom": "14"}))])]
+            else:
+                panels = [rows_panel("Капитал общий", "Капитал в сборе", [("Капитал", pick({"day": "5.92 млн ₽", "yesterday": "5.84 млн ₽", "week": "6.11 млн ₽", "month": "6.34 млн ₽", "custom": "6.22 млн ₽"})), ("Товар", pick({"day": "1.12 млн ₽", "yesterday": "1.08 млн ₽", "week": "1.16 млн ₽", "month": "1.24 млн ₽", "custom": "1.18 млн ₽"})), ("Баланс", pick({"day": "3.48 млн ₽", "yesterday": "3.31 млн ₽", "week": "3.92 млн ₽", "month": "4.26 млн ₽", "custom": "4.08 млн ₽"})), ("Дебиторка", pick({"day": "2.14 млн ₽", "yesterday": "2.22 млн ₽", "week": "2.06 млн ₽", "month": "1.88 млн ₽", "custom": "1.96 млн ₽"})), ("Кредиторка", pick({"day": "1.36 млн ₽", "yesterday": "1.42 млн ₽", "week": "1.31 млн ₽", "month": "1.24 млн ₽", "custom": "1.28 млн ₽"}))])]
+        elif active_tab == "purchase":
+            valid = {"date", "amount", "history"}
+            detail_code = detail_code if detail_code in valid else "amount"
+            subtabs = [
+                build_subtab("Дата", "date", active=detail_code == "date"),
+                build_subtab("Сумма", "amount", active=detail_code == "amount"),
+                build_subtab("История", "history", active=detail_code == "history"),
+            ]
+            title = "Закуп"
+            description = f"Закуп {period_meta['window']}."
+            metrics = [
+                {"label": "Дата", "value": str(filters["selected_date_label"]), "meta": f"срез {period_meta['window']}", "tone": "default"},
+                metric("Сумма", {"day": "438 тыс ₽", "yesterday": "421 тыс ₽", "week": "2.12 млн ₽", "month": "8.4 млн ₽", "custom": "5.9 млн ₽"}, f"сумма закупа {period_meta['window']}"),
+                metric("Поставки", {"day": "7", "yesterday": "6", "week": "28", "month": "112", "custom": "76"}, f"кол-во закупов {period_meta['window']}"),
+                metric("Средняя партия", {"day": "62 тыс ₽", "yesterday": "70 тыс ₽", "week": "76 тыс ₽", "month": "75 тыс ₽", "custom": "77 тыс ₽"}, f"средняя сумма {period_meta['window']}"),
+            ]
+            if detail_code == "date":
+                panels = [
+                    form_panel(
+                        "Дата",
+                        "Выбор даты закупа",
+                        [
+                            {"label": "Дата", "name": "selected_date", "type": "date", "value": str(filters["selected_date"])},
+                        ],
+                        "Сохранить",
+                    )
+                ]
+            elif detail_code == "history":
+                panels = [
+                    form_panel(
+                        "История",
+                        "Период и дата",
+                        [
+                            {"label": "Период", "name": "period", "type": "text", "value": str(filters["period_label"])},
+                            {"label": "Дата", "name": "selected_date", "type": "date", "value": str(filters["selected_date"])},
+                        ],
+                        "Сохранить",
+                    ),
+                    rows_panel("История закупа", "Последние записи", [("20.04.2026", "421 тыс ₽"), ("18.04.2026", "396 тыс ₽"), ("14.04.2026", "512 тыс ₽"), ("11.04.2026", "288 тыс ₽")]),
+                ]
+            else:
+                panels = [
+                    form_panel(
+                        "Сумма",
+                        "Сумма закупа",
+                        [
+                            {"label": "Дата", "name": "selected_date", "type": "date", "value": str(filters["selected_date"])},
+                            {"label": "Сумма", "name": "amount", "type": "text", "value": "0 ₽"},
+                        ],
+                        "Сохранить",
+                    )
+                ]
+        elif active_tab == "expenses":
+            valid = {"date", "period", "edit", "list", "history"}
+            detail_code = detail_code if detail_code in valid else "list"
+            subtabs = [
+                build_subtab("Дата", "date", active=detail_code == "date"),
+                build_subtab("Период", "period", active=detail_code == "period"),
+                build_subtab("Вчера", detail_code, target_period="yesterday", active=period_code == "yesterday"),
+                build_subtab("Сегодня", detail_code, target_period="day", active=period_code == "day"),
+                build_subtab("Изменить расход", "edit", active=detail_code == "edit"),
+                build_subtab("Посмотреть расходы", "list", active=detail_code == "list"),
+                build_subtab("История", "history", active=detail_code == "history"),
+            ]
+            title = "Расходы"
+            description = f"Расходы {period_meta['window']}."
+            metrics = [
+                metric("Расходы", {"day": "682 тыс ₽", "yesterday": "705 тыс ₽", "week": "3.76 млн ₽", "month": "14.8 млн ₽", "custom": "10.9 млн ₽"}, f"всего {period_meta['window']}"),
+                {"label": "Дата", "value": str(filters["selected_date_label"]), "meta": f"текущий срез {period_meta['window']}", "tone": "default"},
+                {"label": "Период", "value": str(filters["period_label"]), "meta": f"активный период {period_meta['window']}", "tone": "default"},
+                metric("Средний расход", {"day": "38 тыс ₽", "yesterday": "42 тыс ₽", "week": "51 тыс ₽", "month": "48 тыс ₽", "custom": "47 тыс ₽"}, f"средний чек {period_meta['window']}"),
+            ]
+            if detail_code == "date":
+                panels = [rows_panel("Дата", "Дата расходов", [("Дата", str(filters["selected_date_label"])), ("Вчера", str(filters["yesterday"])), ("Сегодня", str(filters["today"]))])]
+            elif detail_code == "period":
+                panels = [
+                    form_panel(
+                        "Период",
+                        "Настроить период расходов",
+                        [
+                            {"label": "С", "name": "date_from", "type": "date", "value": str(filters["date_from"])},
+                            {"label": "По", "name": "date_to", "type": "date", "value": str(filters["date_to"])},
+                        ],
+                        "Сохранить",
+                        period_value="custom",
+                    ),
+                    rows_panel("Период", "Выбранный период", [("Период", str(filters["period_label"])), ("С", str(filters["date_from_label"])), ("По", str(filters["date_to_label"]))]),
+                ]
+            elif detail_code == "edit":
+                panels = [
+                    form_panel(
+                        "Изменить расход",
+                        "Форма изменения расхода",
+                        [
+                            {"label": "Дата", "name": "selected_date", "type": "date", "value": str(filters["selected_date"])},
+                            {"label": "Сумма", "name": "amount", "type": "text", "value": "0 ₽"},
+                            {"label": "Тип расхода", "name": "scope", "type": "select", "value": "Маркетинг", "options": expense_types},
+                        ],
+                        "Сохранить",
+                    )
+                ]
+            elif detail_code == "history":
+                panels = [rows_panel("История", "Последние изменения", [("21.04.2026", "Логистика · 48 тыс ₽"), ("20.04.2026", "Маркетинг · 62 тыс ₽"), ("19.04.2026", "Аренда · 90 тыс ₽"), ("18.04.2026", "ФОТ · 184 тыс ₽")])]
+            else:
+                panels = [rows_panel("Посмотреть расходы", "Текущие расходы", [("Маркетинг", pick({"day": "126 тыс ₽", "yesterday": "118 тыс ₽", "week": "742 тыс ₽", "month": "2.98 млн ₽", "custom": "2.14 млн ₽"})), ("ФОТ", pick({"day": "184 тыс ₽", "yesterday": "176 тыс ₽", "week": "1.02 млн ₽", "month": "4.06 млн ₽", "custom": "2.88 млн ₽"})), ("Логистика", pick({"day": "48 тыс ₽", "yesterday": "53 тыс ₽", "week": "290 тыс ₽", "month": "1.08 млн ₽", "custom": "760 тыс ₽"})), ("Закуп", pick({"day": "214 тыс ₽", "yesterday": "238 тыс ₽", "week": "1.14 млн ₽", "month": "4.82 млн ₽", "custom": "3.54 млн ₽"}))])]
+        elif active_tab == "margin":
+            valid = {"date", "avg", "top_goods", "abc"}
+            detail_code = detail_code if detail_code in valid else "avg"
+            subtabs = [
+                build_subtab("Дата", "date", active=detail_code == "date"),
+                build_subtab("Средняя маржинальность", "avg", active=detail_code == "avg"),
+                build_subtab("Топ товары по прибыльности", "top_goods", active=detail_code == "top_goods"),
+                build_subtab("ABC анализ товаров по прибыльности", "abc", active=detail_code == "abc"),
+            ]
+            title = "Маржинальность"
+            description = f"Маржинальность {period_meta['window']}."
+            metrics = [
+                {"label": "Дата", "value": str(filters["selected_date_label"]), "meta": f"текущий срез {period_meta['window']}", "tone": "default"},
+                metric("Средняя маржинальность", {"day": "18.4%", "yesterday": "17.1%", "week": "19.6%", "month": "21.3%", "custom": "20.4%"}, f"в среднем {period_meta['window']}"),
+                metric("Топ товар", {"day": "Профиль 60x40", "yesterday": "Профиль 60x40", "week": "Профиль 60x40", "month": "Лист оцинкованный", "custom": "Лист оцинкованный"}, f"по прибыльности {period_meta['window']}"),
+                metric("ABC A-класс", {"day": "8 товаров", "yesterday": "8 товаров", "week": "11 товаров", "month": "16 товаров", "custom": "13 товаров"}, f"лидеры {period_meta['window']}"),
+            ]
+            if detail_code == "date":
+                panels = [rows_panel("Дата", "Маржинальность по дате", [("Дата", str(filters["selected_date_label"])), ("Период", str(filters["period_label"]))])]
+            elif detail_code == "top_goods":
+                panels = [rows_panel("Топ товары по прибыльности", "Лидеры периода", [("Профиль 60x40", "24.6%"), ("Лист оцинкованный", "22.8%"), ("Кронштейн усиленный", "21.1%"), ("Комплект крепежа", "19.4%")])]
+            elif detail_code == "abc":
+                panels = [rows_panel("ABC анализ товаров по прибыльности", "Разбивка по классам", [("A", "8 товаров"), ("B", "17 товаров"), ("C", "34 товара"), ("На пересмотр", "6 товаров")])]
+            else:
+                panels = [rows_panel("Средняя маржинальность", "Средний срез", [("Средняя маржа", pick({"day": "18.4%", "yesterday": "17.1%", "week": "19.6%", "month": "21.3%", "custom": "20.4%"})), ("Валовая прибыль", pick({"day": "618 тыс ₽", "yesterday": "574 тыс ₽", "week": "3.84 млн ₽", "month": "15.9 млн ₽", "custom": "11.1 млн ₽"})), ("Чистая прибыль", pick({"day": "432 тыс ₽", "yesterday": "386 тыс ₽", "week": "2.61 млн ₽", "month": "10.8 млн ₽", "custom": "7.7 млн ₽"}))])]
+        elif active_tab == "revenue":
+            valid = {"date", "period", "top_days", "top_counterparties"}
+            detail_code = detail_code if detail_code in valid else "top_days"
+            subtabs = [
+                build_subtab("Дата", "date", active=detail_code == "date"),
+                build_subtab("Период", "period", active=detail_code == "period"),
+                build_subtab("Сегодня", detail_code, target_period="day", active=period_code == "day"),
+                build_subtab("Вчера", detail_code, target_period="yesterday", active=period_code == "yesterday"),
+                build_subtab("Неделя", detail_code, target_period="week", active=period_code == "week"),
+                build_subtab("Месяц", detail_code, target_period="month", active=period_code == "month"),
+                build_subtab("Топ дни", "top_days", active=detail_code == "top_days"),
+                build_subtab("Топ контрагенты", "top_counterparties", active=detail_code == "top_counterparties"),
+            ]
+            title = "Выручка"
+            description = f"Выручка {period_meta['window']}."
+            metrics = [
+                {"label": "Дата", "value": str(filters["selected_date_label"]), "meta": f"срез {period_meta['window']}", "tone": "default"},
+                {"label": "Период", "value": str(filters["period_label"]), "meta": f"активно {period_meta['window']}", "tone": "default"},
+                metric("Выручка", {"day": "1.24 млн ₽", "yesterday": "1.08 млн ₽", "week": "6.84 млн ₽", "month": "27.6 млн ₽", "custom": "19.4 млн ₽"}, f"суммарно {period_meta['window']}"),
+                metric("Средний день", {"day": "1.24 млн ₽", "yesterday": "1.08 млн ₽", "week": "977 тыс ₽", "month": "920 тыс ₽", "custom": "970 тыс ₽"}, f"средний день {period_meta['window']}"),
+            ]
+            if detail_code == "date":
+                panels = [rows_panel("Дата", "Выручка по дате", [("Дата", str(filters["selected_date_label"])), ("Период", str(filters["period_label"]))])]
+            elif detail_code == "period":
+                panels = [
+                    form_panel(
+                        "Период",
+                        "Настроить период выручки",
+                        [
+                            {"label": "С", "name": "date_from", "type": "date", "value": str(filters["date_from"])},
+                            {"label": "По", "name": "date_to", "type": "date", "value": str(filters["date_to"])},
+                        ],
+                        "Сохранить",
+                        period_value="custom",
+                    ),
+                    rows_panel("Период", "Выбранный период", [("Период", str(filters["period_label"])), ("С", str(filters["date_from_label"])), ("По", str(filters["date_to_label"]))]),
+                ]
+            elif detail_code == "top_counterparties":
+                panels = [rows_panel("Топ контрагенты", "Лидеры по выручке", [("СтройИмпульс", "684 тыс ₽"), ("МонтажПро", "472 тыс ₽"), ("ГородСнаб", "386 тыс ₽"), ("СеверПроект", "318 тыс ₽")])]
+            else:
+                panels = [rows_panel("Топ дни", "Лидеры периода", [("18.04.2026", "1.42 млн ₽"), ("21.04.2026", "1.24 млн ₽"), ("16.04.2026", "1.11 млн ₽"), ("20.04.2026", "1.08 млн ₽")])]
+            if live_finance_summary is not None:
+                revenue_decimal = _finance_parse_decimal_or_zero(live_finance_summary.get("revenue"))
+                days_count = max(1, (date_to_value - date_from_value).days + 1)
+                avg_daily = (revenue_decimal / Decimal(days_count)).quantize(Decimal("0.01"))
+                metrics = [
+                    {"label": "Дата", "value": str(filters["selected_date_label"]), "meta": f"срез {period_meta['window']}", "tone": "default"},
+                    {"label": "Период", "value": str(filters["period_label"]), "meta": f"активно {period_meta['window']}", "tone": "default"},
+                    {"label": "Выручка", "value": money_label(revenue_decimal), "meta": f"суммарно {period_meta['window']}", "tone": "default"},
+                    {"label": "Средний день", "value": money_label(avg_daily), "meta": f"средний день {period_meta['window']}", "tone": "default"},
+                ]
+                if detail_code == "date":
+                    panels = [
+                        rows_panel(
+                            "Дата",
+                            "Выручка по дате",
+                            [
+                                ("Дата", str(filters["selected_date_label"])),
+                                ("Выручка", money_label(revenue_decimal)),
+                                ("Отгрузок", int(live_finance_summary.get("shipments_count") or 0)),
+                                ("Контрагентов", int(live_finance_summary.get("counterparties_count") or 0)),
+                            ],
+                        )
+                    ]
+                elif detail_code == "period":
+                    panels = [
+                        form_panel(
+                            "Период",
+                            "Настроить период выручки",
+                            [
+                                {"label": "С", "name": "date_from", "type": "date", "value": str(filters["date_from"])},
+                                {"label": "По", "name": "date_to", "type": "date", "value": str(filters["date_to"])},
+                            ],
+                            "Сохранить",
+                            period_value="custom",
+                        ),
+                        rows_panel(
+                            "Период",
+                            "Выбранный период",
+                            [
+                                ("Период", str(filters["period_label"])),
+                                ("С", str(filters["date_from_label"])),
+                                ("По", str(filters["date_to_label"])),
+                                ("Отгрузок", int(live_finance_summary.get("shipments_count") or 0)),
+                                ("Средний день", money_label(avg_daily)),
+                            ],
+                        ),
+                    ]
+                elif detail_code == "top_counterparties":
+                    panels = [
+                        rows_panel(
+                            "Топ контрагенты",
+                            "Лидеры по выручке",
+                            live_revenue_top_counterparties or [("Нет данных", "За выбранный период отгрузки не найдены")],
+                        )
+                    ]
+                else:
+                    panels = [
+                        rows_panel(
+                            "Топ дни",
+                            "Лидеры периода",
+                            live_revenue_top_days or [("Нет данных", "За выбранный период выручка не найдена")],
+                        )
+                    ]
+        elif active_tab == "cost":
+            valid = {"date", "structure", "growth", "suppliers", "history"}
+            detail_code = detail_code if detail_code in valid else "structure"
+            subtabs = [
+                build_subtab("Дата", "date", active=detail_code == "date"),
+                build_subtab("Структура", "structure", active=detail_code == "structure"),
+                build_subtab("Рост", "growth", active=detail_code == "growth"),
+                build_subtab("Поставщики", "suppliers", active=detail_code == "suppliers"),
+                build_subtab("История", "history", active=detail_code == "history"),
+            ]
+            title = "Себестоимость"
+            description = f"Себестоимость {period_meta['window']}."
+            metrics = [
+                {"label": "Дата", "value": str(filters["selected_date_label"]), "meta": f"срез {period_meta['window']}", "tone": "default"},
+                metric("Себестоимость", {"day": "622 тыс ₽", "yesterday": "594 тыс ₽", "week": "3.00 млн ₽", "month": "11.7 млн ₽", "custom": "8.3 млн ₽"}, f"всего {period_meta['window']}"),
+                metric("Доля в выручке", {"day": "50.2%", "yesterday": "55.0%", "week": "43.8%", "month": "42.4%", "custom": "42.8%"}, f"от выручки {period_meta['window']}"),
+                metric("Средняя себестоимость", {"day": "31.7 тыс ₽", "yesterday": "29.4 тыс ₽", "week": "31.2 тыс ₽", "month": "30.6 тыс ₽", "custom": "30.9 тыс ₽"}, f"на продажу {period_meta['window']}"),
+            ]
+            if detail_code == "date":
+                panels = [rows_panel("Дата", "Себестоимость по дате", [("Дата", str(filters["selected_date_label"])), ("Период", str(filters["period_label"]))])]
+            elif detail_code == "growth":
+                panels = [rows_panel("Рост", "Что дорожает", [("Металл", "+4%"), ("Доставка", "+3%"), ("Упаковка", "+1%"), ("Производство", "+2%")])]
+            elif detail_code == "suppliers":
+                panels = [rows_panel("Поставщики", "Топ по себестоимости", [("МеталлТрейд", "312 тыс ₽"), ("СнабЛогистика", "246 тыс ₽"), ("Упаковка Плюс", "172 тыс ₽"), ("ПроектСервис", "148 тыс ₽")])]
+            elif detail_code == "history":
+                panels = [rows_panel("История", "Последние значения", [("21.04.2026", "622 тыс ₽"), ("20.04.2026", "594 тыс ₽"), ("14.04.2026", "3.00 млн ₽"), ("01.04.2026", "11.7 млн ₽")])]
+            else:
+                panels = [rows_panel("Структура", "Из чего состоит", [("Товар", pick({"day": "438 тыс ₽", "yesterday": "421 тыс ₽", "week": "2.12 млн ₽", "month": "8.4 млн ₽", "custom": "5.9 млн ₽"})), ("Логистика", pick({"day": "48 тыс ₽", "yesterday": "53 тыс ₽", "week": "290 тыс ₽", "month": "1.08 млн ₽", "custom": "760 тыс ₽"})), ("Упаковка", pick({"day": "22 тыс ₽", "yesterday": "19 тыс ₽", "week": "108 тыс ₽", "month": "404 тыс ₽", "custom": "286 тыс ₽"})), ("Производство", pick({"day": "114 тыс ₽", "yesterday": "101 тыс ₽", "week": "482 тыс ₽", "month": "1.82 млн ₽", "custom": "1.36 млн ₽"}))])]
+        elif active_tab == "receivable":
+            valid = {"date", "add", "delete", "all", "total"}
+            detail_code = detail_code if detail_code in valid else "all"
+            subtabs = [
+                build_subtab("Дата", "date", active=detail_code == "date"),
+                build_subtab("Добавить", "add", active=detail_code == "add"),
+                build_subtab("Удалить", "delete", active=detail_code == "delete"),
+                build_subtab("Все", "all", active=detail_code == "all"),
+                build_subtab("Итого", "total", active=detail_code == "total"),
+            ]
+            title = "Дебиторка"
+            description = f"Дебиторская задолженность {period_meta['window']}."
+            metrics = [
+                {"label": "Дата", "value": str(filters["selected_date_label"]), "meta": f"срез {period_meta['window']}", "tone": "default"},
+                metric("Дебиторка", {"day": "2.14 млн ₽", "yesterday": "2.22 млн ₽", "week": "2.06 млн ₽", "month": "1.88 млн ₽", "custom": "1.96 млн ₽"}, f"всего {period_meta['window']}"),
+                metric("Просрочено", {"day": "468 тыс ₽", "yesterday": "486 тыс ₽", "week": "434 тыс ₽", "month": "392 тыс ₽", "custom": "414 тыс ₽"}, f"вне срока {period_meta['window']}", "danger"),
+                metric("Итого", {"day": "2.61 млн ₽", "yesterday": "2.70 млн ₽", "week": "2.49 млн ₽", "month": "2.27 млн ₽", "custom": "2.37 млн ₽"}, f"с резервом {period_meta['window']}"),
+            ]
+            if detail_code == "date":
+                panels = [rows_panel("Дата", "Текущий срез", [("Дата", str(filters["selected_date_label"])), ("Период", str(filters["period_label"]))])]
+            elif detail_code == "add":
+                panels = [
+                    form_panel(
+                        "Добавить",
+                        "Новая дебиторка",
+                        [
+                            {"label": "Дата", "name": "selected_date", "type": "date", "value": str(filters["selected_date"])},
+                            {"label": "Клиент", "name": "customer", "type": "text", "value": "выбрать клиента"},
+                            {"label": "Сумма", "name": "amount", "type": "text", "value": "0 ₽"},
+                        ],
+                        "Сохранить",
+                    )
+                ]
+            elif detail_code == "delete":
+                panels = [rows_panel("Удалить", "Что можно удалить", [("СтройИмпульс", "364 тыс ₽"), ("МонтажПро", "248 тыс ₽"), ("ГородСнаб", "198 тыс ₽"), ("СеверПроект", "142 тыс ₽")])]
+            elif detail_code == "total":
+                panels = [rows_panel("Итого", "Итог по дебиторке", [("Всего", pick({"day": "2.14 млн ₽", "yesterday": "2.22 млн ₽", "week": "2.06 млн ₽", "month": "1.88 млн ₽", "custom": "1.96 млн ₽"})), ("Просрочено", pick({"day": "468 тыс ₽", "yesterday": "486 тыс ₽", "week": "434 тыс ₽", "month": "392 тыс ₽", "custom": "414 тыс ₽"})), ("Ожидается", pick({"day": "286 тыс ₽", "yesterday": "274 тыс ₽", "week": "612 тыс ₽", "month": "1.24 млн ₽", "custom": "918 тыс ₽"}))])]
+            else:
+                panels = [rows_panel("Все", "Все крупные должники", [("СтройИмпульс", "364 тыс ₽"), ("МонтажПро", "248 тыс ₽"), ("ГородСнаб", "198 тыс ₽"), ("СеверПроект", "142 тыс ₽")])]
+        elif active_tab == "payable":
+            valid = {"date", "add", "delete", "all", "total"}
+            detail_code = detail_code if detail_code in valid else "all"
+            subtabs = [
+                build_subtab("Дата", "date", active=detail_code == "date"),
+                build_subtab("Добавить", "add", active=detail_code == "add"),
+                build_subtab("Удалить", "delete", active=detail_code == "delete"),
+                build_subtab("Все", "all", active=detail_code == "all"),
+                build_subtab("Итого", "total", active=detail_code == "total"),
+            ]
+            title = "Кредиторка"
+            description = f"Кредиторская задолженность {period_meta['window']}."
+            metrics = [
+                {"label": "Дата", "value": str(filters["selected_date_label"]), "meta": f"срез {period_meta['window']}", "tone": "default"},
+                metric("Кредиторка", {"day": "1.36 млн ₽", "yesterday": "1.42 млн ₽", "week": "1.31 млн ₽", "month": "1.24 млн ₽", "custom": "1.28 млн ₽"}, f"всего {period_meta['window']}"),
+                metric("Просрочено", {"day": "284 тыс ₽", "yesterday": "302 тыс ₽", "week": "248 тыс ₽", "month": "216 тыс ₽", "custom": "238 тыс ₽"}, f"уже просрочено {period_meta['window']}", "danger"),
+                metric("Итого", {"day": "1.68 млн ₽", "yesterday": "1.76 млн ₽", "week": "1.81 млн ₽", "month": "2.36 млн ₽", "custom": "2.11 млн ₽"}, f"с ближайшими оплатами {period_meta['window']}"),
+            ]
+            if detail_code == "date":
+                panels = [rows_panel("Дата", "Текущий срез", [("Дата", str(filters["selected_date_label"])), ("Период", str(filters["period_label"]))])]
+            elif detail_code == "add":
+                panels = [
+                    form_panel(
+                        "Добавить",
+                        "Новая кредиторка",
+                        [
+                            {"label": "Дата", "name": "selected_date", "type": "date", "value": str(filters["selected_date"])},
+                            {"label": "Контрагент", "name": "vendor", "type": "text", "value": "выбрать контрагента"},
+                            {"label": "Сумма", "name": "amount", "type": "text", "value": "0 ₽"},
+                        ],
+                        "Сохранить",
+                    )
+                ]
+            elif detail_code == "delete":
+                panels = [rows_panel("Удалить", "Что можно удалить", [("МеталлТрейд", "312 тыс ₽"), ("СнабЛогистика", "246 тыс ₽"), ("Упаковка Плюс", "172 тыс ₽"), ("ПроектСервис", "148 тыс ₽")])]
+            elif detail_code == "total":
+                panels = [rows_panel("Итого", "Итог по кредиторке", [("Всего", pick({"day": "1.36 млн ₽", "yesterday": "1.42 млн ₽", "week": "1.31 млн ₽", "month": "1.24 млн ₽", "custom": "1.28 млн ₽"})), ("Просрочено", pick({"day": "284 тыс ₽", "yesterday": "302 тыс ₽", "week": "248 тыс ₽", "month": "216 тыс ₽", "custom": "238 тыс ₽"})), ("К оплате скоро", pick({"day": "318 тыс ₽", "yesterday": "346 тыс ₽", "week": "504 тыс ₽", "month": "1.12 млн ₽", "custom": "826 тыс ₽"}))])]
+            else:
+                panels = [rows_panel("Все", "Все крупные обязательства", [("МеталлТрейд", "312 тыс ₽"), ("СнабЛогистика", "246 тыс ₽"), ("Упаковка Плюс", "172 тыс ₽"), ("ПроектСервис", "148 тыс ₽")])]
+        elif active_tab == "anomalies":
+            valid = {"category"}
+            detail_code = detail_code if detail_code in valid else "category"
+            active_scope = active_scope if active_scope in anomaly_categories else anomaly_categories[0]
+            subtabs = [
+                build_subtab("Сегодня", detail_code, target_period="day", active=period_code == "day"),
+                build_subtab("Неделя", detail_code, target_period="week", active=period_code == "week"),
+                build_subtab("Месяц", detail_code, target_period="month", active=period_code == "month"),
+                build_subtab("Период", detail_code, target_period="custom", active=period_code == "custom"),
+                build_subtab("Категория", "category", active=detail_code == "category"),
+            ]
+            title = "Аномалии"
+            description = f"Аномалии {period_meta['window']}."
+            metrics = [
+                metric("Аномалии", {"day": "5", "yesterday": "6", "week": "8", "month": "13", "custom": "10"}, f"найдено {period_meta['window']}", "warning"),
+                metric("Критичные", {"day": "2", "yesterday": "2", "week": "3", "month": "5", "custom": "4"}, f"требуют внимания {period_meta['window']}", "danger"),
+                {"label": "Категория", "value": active_scope, "meta": f"текущий фильтр {period_meta['window']}", "tone": "default"},
+                {"label": "Период", "value": str(filters["period_label"]), "meta": f"срез {period_meta['window']}", "tone": "default"},
+            ]
+            panels = [
+                chips_panel(
+                    "Категория",
+                    "Подменю по категориям финансов",
+                    [{"label": item, "href": finance_href("anomalies", "category", item), "active": item == active_scope} for item in anomaly_categories],
+                ),
+                rows_panel(
+                    "Сигналы категории",
+                    active_scope,
+                    [("Критичный сигнал", "есть отклонение"), ("Последнее изменение", str(filters["selected_date_label"])), ("Статус", "нужно проверить"), ("Источник", "все источники финансов")],
+                ),
+            ]
+
+        return {
+            "filters": filters,
+            "workspace_id": "finance-workspace",
+            "section_label": "Финансы",
+            "active_tab": active_tab,
+            "active_detail": detail_code,
+            "active_scope": active_scope,
+            "title": title,
+            "description": description,
+            "tabs": tabs,
+            "tab_groups": [
+                {
+                    "eyebrow": "Действия",
+                    "title": "Что сделать",
+                    "primary": True,
+                    "items": [item for item in tabs if item["code"] in {"expense_add", "income_add", "purchase"}],
+                },
+                {
+                    "eyebrow": "Показатели",
+                    "title": "Что смотреть",
+                    "primary": False,
+                    "items": [item for item in tabs if item["code"] in {"balance", "capital", "expenses", "margin", "revenue", "cost"}],
+                },
+                {
+                    "eyebrow": "Контроль",
+                    "title": "Что держать под рукой",
+                    "primary": False,
+                    "items": [item for item in tabs if item["code"] in {"summary", "receivable", "payable", "anomalies", "charts"}],
+                },
+            ],
+            "block_title": "Действия и показатели",
+            "subtabs": subtabs,
+            "metrics": metrics,
+            "panels": panels,
+        }
+
+    def _site_inventory_surface_model(
+        selected_date_raw: str | None = None,
+        period_raw: str | None = None,
+        date_from_raw: str | None = None,
+        date_to_raw: str | None = None,
+        tab_raw: str | None = None,
+        detail_raw: str | None = None,
+        scope_raw: str | None = None,
+        request_params: dict[str, str] | None = None,
+        session: Session | None = None,
+        runtime: ResolvedRuntimeContext | None = None,
+    ) -> dict[str, object]:
+        request_params = request_params or {}
+        effective_period_raw = period_raw or "month"
+        filters = _site_dashboard_filters(selected_date_raw, effective_period_raw, date_from_raw, date_to_raw)
+        period_code = str(filters["period_code"])
+        period_meta = _site_period_meta(period_code, str(filters["date_from_label"]), str(filters["date_to_label"]))
+        period_query = _site_period_query(period_code, str(filters["date_from"]), str(filters["date_to"]))
+        inventory_section = _site_section("inventory")
+        raw_tabs = list(inventory_section.get("inventory_items", []))
+        allowed_codes = {str(item.get("code")) for item in raw_tabs if item.get("code")}
+        active_tab = str(tab_raw or "summary").strip().lower()
+        if active_tab not in allowed_codes or active_tab == "charts":
+            active_tab = "summary"
+
+        def pick(values: dict[str, str]) -> str:
+            return str(values.get(period_code, values.get("day", "")))
+
+        def metric(label: str, values: dict[str, str], meta: str, tone: str = "default") -> dict[str, str]:
+            return {"label": label, "value": pick(values), "meta": meta, "tone": tone}
+
+        def rows_panel(title: str, subtitle: str, rows: list[tuple[str, object]]) -> dict[str, object]:
+            items = []
+            for row_label, row_value in rows:
+                if isinstance(row_value, dict):
+                    value = pick({str(key): str(value) for key, value in row_value.items()})
+                else:
+                    value = str(row_value)
+                items.append({"label": row_label, "value": value})
+            return {"kind": "rows", "title": title, "subtitle": subtitle, "items": items}
+
+        def chips_panel(title: str, subtitle: str, chips: list[dict[str, object]]) -> dict[str, object]:
+            return {"kind": "chips", "title": title, "subtitle": subtitle, "items": chips}
+
+        def form_panel(title: str, subtitle: str, fields: list[dict[str, object]], button_label: str, period_value: str | None = None) -> dict[str, object]:
+            normalized_fields: list[dict[str, object]] = []
+            for field in fields:
+                field_copy = dict(field)
+                field_name = str(field_copy.get("name") or "")
+                if field_name and str(field_copy.get("type") or "") != "file" and field_name in request_params:
+                    field_copy["value"] = request_params[field_name]
+                normalized_fields.append(field_copy)
+            hidden = [
+                {"name": "tab", "value": active_tab},
+                {"name": "detail", "value": detail_code},
+                {"name": "period", "value": period_value or period_code},
+            ]
+            if active_scope:
+                hidden.append({"name": "scope", "value": active_scope})
+            if (period_value or period_code) == "custom":
+                hidden.append({"name": "date_from", "value": request_params.get("date_from", str(filters["date_from"]))})
+                hidden.append({"name": "date_to", "value": request_params.get("date_to", str(filters["date_to"]))})
+            return {
+                "kind": "form",
+                "title": title,
+                "subtitle": subtitle,
+                "items": normalized_fields,
+                "button_label": button_label,
+                "action": "/site/inventory#inventory-workspace",
+                "hidden": hidden,
+            }
+
+        def inventory_href(tab_code: str, detail_code_arg: str | None = None, scope_code: str | None = None, period_override: str | None = None) -> str:
+            params: dict[str, str] = {"tab": tab_code, "period": period_override or period_code, "selected_date": str(filters["anchor_date"])}
+            if detail_code_arg:
+                params["detail"] = detail_code_arg
+            if scope_code:
+                params["scope"] = scope_code
+            if params["period"] == "custom":
+                params["date_from"] = str(filters["date_from"])
+                params["date_to"] = str(filters["date_to"])
+            return f"/site/inventory?{urlencode(params)}#inventory-workspace"
+
+        def build_subtab(label: str, code: str | None = None, target_period: str | None = None, active: bool = False, scope_code: str | None = None) -> dict[str, object]:
+            href = inventory_href(active_tab, code or detail_code, scope_code, target_period)
+            return {"label": label, "href": href, "active": active}
+
+        warehouses = INVENTORY_WAREHOUSES
+        warehouse_choices = warehouses[1:]
+        counterparties = INVENTORY_COUNTERPARTIES
+        purchase_rule_items = INVENTORY_PURCHASE_RULE_ITEMS
+        date_from_value = date.fromisoformat(str(filters["date_from"]))
+        date_to_value = date.fromisoformat(str(filters["date_to"]))
+
+        def money_label(value: object) -> str:
+            return f"{_finance_format_decimal(_finance_parse_decimal_or_zero(value))} ₽"
+
+        def qty_label(value: object) -> str:
+            amount = _finance_parse_decimal_or_zero(value)
+            if amount == amount.to_integral():
+                return f"{int(amount)} шт."
+            return f"{_finance_format_decimal(amount)} шт."
+
+        account_session_active = session is not None and runtime is not None
+        live_inventory: dict[str, object] | None = None
+        if account_session_active:
+            live_inventory = _inventory_workspace_data(
+                runtime,
+                session,
+                section="overview",
+                period={"day": "today", "yesterday": "yesterday", "week": "week", "month": "month", "custom": "custom"}.get(period_code, "month"),
+                query=request_params.get("q") or None,
+                date_from=date_from_value if period_code == "custom" else None,
+                date_to=date_to_value if period_code == "custom" else None,
+            )
+
+        def _inventory_sync_label(value: datetime | None) -> str:
+            if value is None:
+                return "Нет данных"
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=timezone.utc)
+            return value.astimezone(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
+
+        account_state = {
+            "label": "Аккаунт",
+            "value": str(runtime.account.name or runtime.account.slug) if account_session_active else "Не выбран",
+            "meta": "active account session" if account_session_active else "Нет active account session",
+            "tone": "success" if account_session_active else "warning",
+        }
+        inventory_health = dict(live_inventory.get("inventory_data_health") or {}) if live_inventory is not None else {}
+        latest_sync_at = inventory_health.get("latest_moysklad_sync") if isinstance(inventory_health.get("latest_moysklad_sync"), datetime) else None
+        sync_state = {
+            "label": "Синхронизация",
+            "value": _inventory_sync_label(latest_sync_at),
+            "meta": "последний sync МойСклад" if account_session_active else "live-данные откроются после входа в аккаунт",
+            "tone": "default" if account_session_active else "warning",
+        }
+
+        def live_session_message_panel() -> dict[str, object]:
+            return rows_panel(
+                "Аккаунт",
+                "Live-склад доступен только внутри выбранного аккаунта.",
+                [
+                    ("Статус", "Нет active account session"),
+                    ("Что делать", "Войдите в аккаунт и откройте склад снова"),
+                    ("Период", str(filters["period_label"])),
+                ],
+            )
+
+        view_defaults = {
+            "summary": "period",
+            "receiving": "form",
+            "inventory_count": "form",
+            "purchase_request": "rules",
+            "transfer": "form",
+            "find": "search",
+            "dispatch": "form",
+            "return": "form",
+            "products": "top",
+            "stock": "critical",
+            "counterparties": "top",
+        }
+        detail_code = str(detail_raw or view_defaults.get(active_tab, "history")).strip().lower()
+        active_scope = str(scope_raw or "").strip()
+
+        tabs: list[dict[str, object]] = []
+        for item in raw_tabs:
+            code = str(item.get("code") or "")
+            href = f"/site/inventory?view=charts&{period_query}" if code == "charts" else inventory_href(code)
+            tabs.append(
+                {
+                    "code": code,
+                    "label": str(item.get("label") or ""),
+                    "icon": str(item.get("icon") or ""),
+                    "href": href,
+                    "active": code == active_tab and code != "charts",
+                }
+            )
+
+        filters["periods"] = [
+            {
+                **item,
+                "href": inventory_href(active_tab, detail_code, active_scope or None, str(item["code"])),
+            }
+            for item in list(filters["periods"])
+        ]
+
+        title = "Склад"
+        description = ""
+        context_line = (
+            f"Аккаунт: {runtime.account.name or runtime.account.slug}"
+            if account_session_active and runtime is not None
+            else "Live-данные склада доступны только внутри активного аккаунта."
+        )
+        states: list[dict[str, str]] = [account_state, sync_state]
+        metrics: list[dict[str, str]] = []
+        panels: list[dict[str, object]] = []
+        subtabs: list[dict[str, object]] = []
+
+        if active_tab == "summary":
+            valid = {"date", "period"}
+            detail_code = detail_code if detail_code in valid else "period"
+            subtabs = [
+                build_subtab("Дата", "date", active=detail_code == "date"),
+                build_subtab("Период", "period", active=detail_code == "period"),
+                build_subtab("День", detail_code, target_period="day", active=period_code == "day"),
+                build_subtab("Вчера", detail_code, target_period="yesterday", active=period_code == "yesterday"),
+                build_subtab("Месяц", detail_code, target_period="month", active=period_code == "month"),
+            ]
+            title = "Сводка"
+            description = f"Сводка по складу {period_meta['window']}."
+            metrics = [
+                {"label": "Дата", "value": str(filters["selected_date_label"]), "meta": f"срез {period_meta['window']}", "tone": "default"},
+                {"label": "Период", "value": str(filters["period_label"]), "meta": f"активно {period_meta['window']}", "tone": "default"},
+                metric("Отгрузки", {"day": "126 шт.", "yesterday": "118 шт.", "week": "742 шт.", "month": "2 980 шт.", "custom": "2 140 шт."}, f"движение {period_meta['window']}"),
+                metric("Критические остатки", {"day": "27 SKU", "yesterday": "31 SKU", "week": "22 SKU", "month": "18 SKU", "custom": "20 SKU"}, f"под риском {period_meta['window']}", "warning"),
+            ]
+            if detail_code == "date":
+                panels = [rows_panel("Дата", "Срез склада по дате", [("Дата", str(filters["selected_date_label"])), ("Отгрузки", pick({"day": "126 шт.", "yesterday": "118 шт.", "week": "742 шт.", "month": "2 980 шт.", "custom": "2 140 шт."})), ("Критические остатки", pick({"day": "27 SKU", "yesterday": "31 SKU", "week": "22 SKU", "month": "18 SKU", "custom": "20 SKU"})), ("Контрагенты", pick({"day": "14", "yesterday": "13", "week": "28", "month": "52", "custom": "39"}))])]
+            else:
+                panels = [
+                    form_panel(
+                        "Период",
+                        "Настроить период сводки",
+                        [
+                            {"label": "С", "name": "date_from", "type": "date", "value": str(filters["date_from"])},
+                            {"label": "По", "name": "date_to", "type": "date", "value": str(filters["date_to"])},
+                        ],
+                        "Сохранить",
+                        period_value="custom",
+                    ),
+                    rows_panel("Период", "Общая сводка по складу", [("Период", str(filters["period_label"])), ("С", str(filters["date_from_label"])), ("По", str(filters["date_to_label"])), ("Кол-во товара", pick({"day": "4 860 шт.", "yesterday": "4 420 шт.", "week": "27 600 шт.", "month": "112 400 шт.", "custom": "79 300 шт."}))]),
+                ]
+            if live_inventory is not None:
+                inventory_fact = dict(live_inventory.get("inventory_fact") or {})
+                inventory_metrics = dict(live_inventory.get("inventory_metrics") or {})
+                stock_rows = list(live_inventory.get("inventory_stock_rows") or [])
+                top_counterparties = list(live_inventory.get("inventory_top_counterparties") or [])
+                total_quantity = sum((Decimal(item.get("available") or 0) for item in stock_rows), Decimal("0"))
+                critical_count = sum((1 for item in stock_rows if bool(item.get("needs_reorder"))))
+                metrics = [
+                    {"label": "Дата", "value": str(filters["selected_date_label"]), "meta": f"срез {period_meta['window']}", "tone": "default"},
+                    {"label": "Период", "value": str(filters["period_label"]), "meta": f"активно {period_meta['window']}", "tone": "default"},
+                    {"label": "Отгрузки", "value": str(int(inventory_fact.get("shipments_count") or 0)), "meta": f"движение {period_meta['window']}", "tone": "default"},
+                    {"label": "Критические остатки", "value": str(critical_count), "meta": f"под риском {period_meta['window']}", "tone": "warning" if critical_count else "default"},
+                ]
+                if detail_code == "date":
+                    panels = [
+                        rows_panel(
+                            "Дата",
+                            "Срез склада по дате",
+                            [
+                                ("Дата", str(filters["selected_date_label"])),
+                                ("Отгрузки", int(inventory_fact.get("shipments_count") or 0)),
+                                ("Критические остатки", critical_count),
+                                ("Контрагенты", len(top_counterparties)),
+                            ],
+                        )
+                    ]
+                else:
+                    panels = [
+                        form_panel(
+                            "Период",
+                            "Настроить период сводки",
+                            [
+                                {"label": "С", "name": "date_from", "type": "date", "value": str(filters["date_from"])},
+                                {"label": "По", "name": "date_to", "type": "date", "value": str(filters["date_to"])},
+                            ],
+                            "Сохранить",
+                            period_value="custom",
+                        ),
+                        rows_panel(
+                            "Период",
+                            "Общая сводка по складу",
+                            [
+                                ("Период", str(filters["period_label"])),
+                                ("С", str(filters["date_from_label"])),
+                                ("По", str(filters["date_to_label"])),
+                                ("Кол-во товара", qty_label(total_quantity)),
+                                ("Выручка", money_label(inventory_fact.get("shipment_revenue"))),
+                                ("Движений", int(inventory_metrics.get("movement_rows") or 0)),
+                            ],
+                        ),
+                    ]
+        elif active_tab == "receiving":
+            title = "Приемка"
+            description = "Макет приемки: загрузка файла, выбор склада и контрагента."
+            metrics = [
+                {"label": "Склад", "value": warehouse_choices[0], "meta": "склад для приемки", "tone": "default"},
+                {"label": "Контрагент", "value": counterparties[0], "meta": "выбран для приемки", "tone": "default"},
+                metric("Приемка", {"day": "84 шт.", "yesterday": "72 шт.", "week": "436 шт.", "month": "1 940 шт.", "custom": "1 380 шт."}, f"в приемке {period_meta['window']}"),
+                {"label": "Файл", "value": "Не загружен", "meta": "ожидает загрузки", "tone": "default"},
+            ]
+            panels = [
+                form_panel(
+                    "Приемка",
+                    "Загрузка файла и параметры приемки",
+                    [
+                        {"label": "Файл", "name": "receipt_file", "type": "file"},
+                        {"label": "Склад", "name": "warehouse", "type": "select", "value": warehouse_choices[0], "options": warehouse_choices},
+                        {"label": "Контрагент", "name": "counterparty", "type": "select", "value": counterparties[0], "options": counterparties},
+                    ],
+                    "Сохранить",
+                )
+            ]
+        elif active_tab == "inventory_count":
+            title = "Инвентаризация"
+            description = "Макет инвентаризации: загрузка файлов и выбор склада."
+            metrics = [
+                {"label": "Склад", "value": warehouse_choices[0], "meta": "выбран для инвентаризации", "tone": "default"},
+                metric("Позиций", {"day": "124", "yesterday": "118", "week": "402", "month": "1 180", "custom": "860"}, f"в проверке {period_meta['window']}"),
+                {"label": "Файлы", "value": "0", "meta": "загружено в макете", "tone": "default"},
+                metric("Расхождения", {"day": "6", "yesterday": "8", "week": "14", "month": "22", "custom": "16"}, f"найдено {period_meta['window']}", "warning"),
+            ]
+            panels = [
+                form_panel(
+                    "Инвентаризация",
+                    "Загрузка файлов инвентаризации",
+                    [
+                        {"label": "Файл 1", "name": "inventory_file_primary", "type": "file"},
+                        {"label": "Файл 2", "name": "inventory_file_secondary", "type": "file"},
+                        {"label": "Склад", "name": "warehouse", "type": "select", "value": warehouse_choices[0], "options": warehouse_choices},
+                    ],
+                    "Сохранить",
+                )
+            ]
+        elif active_tab == "purchase_request":
+            valid = {"rules", "quantity", "download", "history"}
+            detail_code = detail_code if detail_code in valid else "rules"
+            active_scope = active_scope if active_scope in purchase_rule_items else purchase_rule_items[0]
+            subtabs = [
+                build_subtab("Правила", "rules", active=detail_code == "rules"),
+                build_subtab("Количество", "quantity", active=detail_code == "quantity"),
+                build_subtab("Скачать заявку", "download", active=detail_code == "download"),
+                build_subtab("История заявок", "history", active=detail_code == "history"),
+            ]
+            title = "Сформировать закуп"
+            description = "Макет формирования закупа по складу."
+            metrics = [
+                {"label": "Склад", "value": warehouse_choices[0], "meta": "основной склад закупа", "tone": "default"},
+                metric("Позиций", {"day": "12", "yesterday": "14", "week": "18", "month": "24", "custom": "20"}, f"в закупе {period_meta['window']}"),
+                metric("Количество", {"day": "186 шт.", "yesterday": "204 шт.", "week": "418 шт.", "month": "1 120 шт.", "custom": "760 шт."}, f"к заказу {period_meta['window']}"),
+                {"label": "Статус", "value": "Черновик", "meta": "заявка в макете", "tone": "default"},
+            ]
+            if detail_code == "rules":
+                panels = [
+                    chips_panel(
+                        "Правила",
+                        "Подменю правил закупа",
+                        [{"label": item, "href": inventory_href("purchase_request", "rules", item), "active": item == active_scope} for item in purchase_rule_items],
+                    ),
+                    form_panel(
+                        "Заполнить правило",
+                        active_scope,
+                        [
+                            {"label": "Правило", "name": "scope", "type": "select", "value": active_scope, "options": purchase_rule_items},
+                            {"label": "Значение", "name": "rule_value", "type": "text", "value": "заполнить значение"},
+                            {"label": "Комментарий", "name": "rule_note", "type": "text", "value": "описание правила"},
+                        ],
+                        "Сохранить",
+                    ),
+                    rows_panel(
+                        "Правила",
+                        "По каким правилам собирается закуп",
+                        [
+                            ("Минимальный остаток", "ниже порога"),
+                            ("Критические позиции", "в приоритете"),
+                            ("Склад", warehouse_choices[0]),
+                            ("Формат", "черновик заявки"),
+                        ],
+                    )
+                ]
+            elif detail_code == "quantity":
+                panels = [
+                    rows_panel(
+                        "Количество",
+                        "Что попадет в заявку",
+                        [
+                            ("Профиль 20x20", "48 шт."),
+                            ("Лист перфорированный", "32 шт."),
+                            ("Уголок 40x40", "26 шт."),
+                            ("Болт М12", "80 шт."),
+                        ],
+                    )
+                ]
+            elif detail_code == "history":
+                panels = [
+                    rows_panel(
+                        "История заявок",
+                        "Последние сформированные заявки",
+                        [
+                            ("21.04.2026", "Черновик · 12 позиций"),
+                            ("19.04.2026", "Отправлена · 9 позиций"),
+                            ("16.04.2026", "Согласована · 14 позиций"),
+                            ("12.04.2026", "Закрыта · 11 позиций"),
+                        ],
+                    )
+                ]
+            else:
+                panels = [
+                    form_panel(
+                        "Скачать заявку",
+                        "Подготовить файл заявки",
+                        [
+                            {"label": "Склад", "name": "warehouse", "type": "select", "value": warehouse_choices[0], "options": warehouse_choices},
+                            {"label": "Дата", "name": "selected_date", "type": "date", "value": str(filters["selected_date"])},
+                        ],
+                        "Скачать заявку",
+                    )
+                ]
+        elif active_tab == "transfer":
+            title = "Перемещение"
+            description = "Макет перемещения товара между складами."
+            metrics = [
+                {"label": "Со склада", "value": warehouse_choices[0], "meta": "откуда переместить", "tone": "default"},
+                {"label": "На склад", "value": warehouse_choices[1], "meta": "куда переместить", "tone": "default"},
+                metric("Перемещения", {"day": "18", "yesterday": "14", "week": "76", "month": "284", "custom": "198"}, f"зафиксировано {period_meta['window']}"),
+                {"label": "Товар", "value": "Профиль 60x40", "meta": "пример позиции", "tone": "default"},
+            ]
+            panels = [
+                form_panel(
+                    "Переместить товар",
+                    "Выбор складов и товара",
+                    [
+                        {"label": "Со склада", "name": "warehouse_from", "type": "select", "value": warehouse_choices[0], "options": warehouse_choices},
+                        {"label": "На склад", "name": "warehouse_to", "type": "select", "value": warehouse_choices[1], "options": warehouse_choices},
+                        {"label": "Товар", "name": "product_name", "type": "text", "value": "Профиль 60x40"},
+                        {"label": "Количество", "name": "quantity", "type": "text", "value": "0 шт."},
+                        {"label": "Дата", "name": "selected_date", "type": "date", "value": str(filters["selected_date"])},
+                    ],
+                    "Сохранить",
+                )
+            ]
+        elif active_tab == "find":
+            title = "Найти товар"
+            description = "Макет умного поиска по похожим словам."
+            metrics = [
+                {"label": "Поиск", "value": "Профиль", "meta": "пример запроса", "tone": "default"},
+                metric("Найдено", {"day": "12", "yesterday": "12", "week": "12", "month": "12", "custom": "12"}, "совпадений в макете"),
+                {"label": "Склад", "value": "Все склады", "meta": "поиск по всем складам", "tone": "default"},
+                {"label": "Режим", "value": "Похожие слова", "meta": "умный поиск", "tone": "default"},
+            ]
+            panels = [
+                form_panel(
+                    "Найти товар",
+                    "Поиск по похожим словам",
+                    [
+                        {"label": "Запрос", "name": "product_query", "type": "text", "value": "Профиль"},
+                        {"label": "Склад", "name": "warehouse", "type": "select", "value": "Все склады", "options": warehouses},
+                    ],
+                    "Сохранить",
+                ),
+                rows_panel("Результаты", "Похожие позиции", [("Профиль 60x40", "412 шт."), ("Профиль 40x20", "286 шт."), ("Профиль 20x20", "148 шт."), ("Профиль усиленный", "92 шт.")]),
+            ]
+        elif active_tab == "dispatch":
+            title = "Отгрузить"
+            description = "Макет отгрузки: выбор склада, контрагента и товара."
+            metrics = [
+                {"label": "Склад", "value": warehouse_choices[0], "meta": "склад отгрузки", "tone": "default"},
+                {"label": "Контрагент", "value": counterparties[0], "meta": "для отгрузки", "tone": "default"},
+                metric("Отгрузить", {"day": "126 шт.", "yesterday": "118 шт.", "week": "742 шт.", "month": "2 980 шт.", "custom": "2 140 шт."}, f"объем {period_meta['window']}"),
+                {"label": "Дата", "value": str(filters["selected_date_label"]), "meta": "дата отгрузки", "tone": "default"},
+            ]
+            panels = [
+                form_panel(
+                    "Отгрузить",
+                    "Параметры отгрузки",
+                    [
+                        {"label": "Склад", "name": "warehouse", "type": "select", "value": warehouse_choices[0], "options": warehouse_choices},
+                        {"label": "Контрагент", "name": "counterparty", "type": "select", "value": counterparties[0], "options": counterparties},
+                        {"label": "Товар", "name": "product_name", "type": "text", "value": "Профиль 60x40"},
+                        {"label": "Количество", "name": "quantity", "type": "text", "value": "0 шт."},
+                        {"label": "Дата", "name": "selected_date", "type": "date", "value": str(filters["selected_date"])},
+                    ],
+                    "Сохранить",
+                )
+            ]
+        elif active_tab == "return":
+            title = "Возврат"
+            description = "Макет возврата: выбор склада, контрагента, товара и комментарий."
+            metrics = [
+                {"label": "Склад", "value": warehouse_choices[0], "meta": "склад возврата", "tone": "default"},
+                {"label": "Контрагент", "value": counterparties[0], "meta": "для возврата", "tone": "default"},
+                metric("Возврат", {"day": "18 шт.", "yesterday": "14 шт.", "week": "96 шт.", "month": "386 шт.", "custom": "274 шт."}, f"объем {period_meta['window']}"),
+                {"label": "Дата", "value": str(filters["selected_date_label"]), "meta": "дата возврата", "tone": "default"},
+            ]
+            panels = [
+                form_panel(
+                    "Возврат",
+                    "Параметры возврата",
+                    [
+                        {"label": "Склад", "name": "warehouse", "type": "select", "value": warehouse_choices[0], "options": warehouse_choices},
+                        {"label": "Контрагент", "name": "counterparty", "type": "select", "value": counterparties[0], "options": counterparties},
+                        {"label": "Товар", "name": "product_name", "type": "text", "value": "Профиль 60x40"},
+                        {"label": "Количество", "name": "quantity", "type": "text", "value": "0 шт."},
+                        {"label": "Дата", "name": "selected_date", "type": "date", "value": str(filters["selected_date"])},
+                        {"label": "Комментарий", "name": "return_comment", "type": "text", "value": "Причина возврата"},
+                    ],
+                    "Сохранить",
+                )
+            ]
+        elif active_tab == "products":
+            valid = {"all", "top", "search", "history"}
+            detail_code = detail_code if detail_code in valid else "top"
+            subtabs = [
+                build_subtab("Все", "all", active=detail_code == "all"),
+                build_subtab("Топ товары", "top", active=detail_code == "top"),
+                build_subtab("Поиск", "search", active=detail_code == "search"),
+                build_subtab("История", "history", active=detail_code == "history"),
+            ]
+            title = "Товары"
+            description = f"Товарный срез склада {period_meta['window']}."
+            metrics = [
+                metric("Товаров", {"day": "1 248", "yesterday": "1 248", "week": "1 248", "month": "1 248", "custom": "1 248"}, f"в номенклатуре {period_meta['window']}"),
+                metric("Топ товары", {"day": "4", "yesterday": "4", "week": "4", "month": "4", "custom": "4"}, f"лидеры {period_meta['window']}"),
+                metric("Кол-во товара", {"day": "4 860 шт.", "yesterday": "4 420 шт.", "week": "27 600 шт.", "month": "112 400 шт.", "custom": "79 300 шт."}, f"в движении {period_meta['window']}"),
+                metric("Критические", {"day": "27 SKU", "yesterday": "31 SKU", "week": "22 SKU", "month": "18 SKU", "custom": "20 SKU"}, f"на контроле {period_meta['window']}", "warning"),
+            ]
+            if detail_code == "all":
+                panels = [rows_panel("Все товары", "Основные позиции", [("Профиль 60x40", "412 шт."), ("Лист оцинкованный", "356 шт."), ("Кронштейн усиленный", "214 шт."), ("Комплект крепежа", "188 шт.")])]
+            elif detail_code == "search":
+                panels = [form_panel("Поиск", "Поиск по товарам", [{"label": "Наименование", "name": "product_name", "type": "text", "value": "ввести товар"}], "Сохранить")]
+            elif detail_code == "history":
+                panels = [rows_panel("История", "Последние изменения по товарам", [("21.04.2026", "Профиль 60x40 · +42 шт."), ("20.04.2026", "Лист оцинкованный · +36 шт."), ("19.04.2026", "Кронштейн усиленный · -12 шт."), ("18.04.2026", "Комплект крепежа · +18 шт.")])]
+            else:
+                panels = [rows_panel("Топ товары", "Лидеры по движению", [("Профиль 60x40", "412 шт."), ("Лист оцинкованный", "356 шт."), ("Кронштейн усиленный", "214 шт."), ("Комплект крепежа", "188 шт.")])]
+            if live_inventory is not None:
+                top_sales_products = list(live_inventory.get("inventory_top_sales_products") or [])
+                top_products = list(live_inventory.get("inventory_top_products") or [])
+                top_rows = top_sales_products or top_products
+                metrics = [
+                    {"label": "Товаров", "value": str(len(list(live_inventory.get("inventory_products") or []))), "meta": "в номенклатуре", "tone": "default"},
+                    {"label": "Топ товары", "value": str(len(top_rows[:10])), "meta": f"лидеры {period_meta['window']}", "tone": "default"},
+                    {"label": "Кол-во товара", "value": qty_label(sum((Decimal(item.get('quantity') or 0) for item in top_products), Decimal('0'))), "meta": f"в движении {period_meta['window']}", "tone": "default"},
+                    {"label": "Критические", "value": str(sum((1 for item in list(live_inventory.get('inventory_stock_rows') or []) if bool(item.get('needs_reorder'))))), "meta": f"на контроле {period_meta['window']}", "tone": "warning"},
+                ]
+                product_rows = []
+                for item in top_rows[:12]:
+                    product = item.get("product")
+                    if product is None:
+                        continue
+                    value = money_label(item.get("revenue") if "revenue" in item else item.get("amount"))
+                    product_rows.append((str(product.name), value))
+                if detail_code == "search":
+                    panels = [form_panel("Поиск", "Поиск по товарам", [{"label": "Наименование", "name": "product_name", "type": "text", "value": request_params.get("product_name") or ""}], "Сохранить")]
+                else:
+                    panels = [rows_panel("Товары", "Живые данные по товарам", product_rows or [("Нет данных", "Товары не найдены")])]
+        elif active_tab == "stock":
+            valid = {"date", "warehouses", "critical", "all"}
+            detail_code = detail_code if detail_code in valid else "critical"
+            active_scope = active_scope if active_scope in warehouses else warehouses[0]
+            subtabs = [
+                build_subtab("Дата", "date", active=detail_code == "date"),
+                build_subtab("По складам", "warehouses", active=detail_code == "warehouses"),
+                build_subtab("Критические", "critical", active=detail_code == "critical"),
+                build_subtab("Все", "all", active=detail_code == "all"),
+            ]
+            title = "Остатки"
+            description = f"Остатки склада {period_meta['window']}."
+            metrics = [
+                {"label": "Дата", "value": str(filters["selected_date_label"]), "meta": f"срез {period_meta['window']}", "tone": "default"},
+                metric("Кол-во товара", {"day": "4 860 шт.", "yesterday": "4 420 шт.", "week": "27 600 шт.", "month": "112 400 шт.", "custom": "79 300 шт."}, f"остаток {period_meta['window']}"),
+                metric("Критические остатки", {"day": "27 SKU", "yesterday": "31 SKU", "week": "22 SKU", "month": "18 SKU", "custom": "20 SKU"}, f"в риске {period_meta['window']}", "warning"),
+                {"label": "Склад", "value": active_scope, "meta": f"текущий фильтр {period_meta['window']}", "tone": "default"},
+            ]
+            if detail_code == "date":
+                panels = [rows_panel("Дата", "Остатки по дате", [("Дата", str(filters["selected_date_label"])), ("Период", str(filters["period_label"]))])]
+            elif detail_code == "warehouses":
+                panels = [
+                    chips_panel("Склады", "Выбор склада", [{"label": item, "href": inventory_href("stock", "warehouses", item), "active": item == active_scope} for item in warehouses]),
+                    rows_panel("Остатки по складу", active_scope, [("Профиль 60x40", "412 шт."), ("Лист оцинкованный", "356 шт."), ("Кронштейн усиленный", "214 шт."), ("Комплект крепежа", "188 шт.")]),
+                ]
+            elif detail_code == "all":
+                panels = [rows_panel("Все остатки", "Основные позиции", [("Профиль 60x40", "412 шт."), ("Лист оцинкованный", "356 шт."), ("Кронштейн усиленный", "214 шт."), ("Комплект крепежа", "188 шт.")])]
+            else:
+                panels = [rows_panel("Критические остатки", "Позиции под риском", [("Профиль 20x20", "8 шт."), ("Лист перфорированный", "6 шт."), ("Уголок 40x40", "4 шт."), ("Болт М12", "12 шт.")])]
+            if live_inventory is not None:
+                stock_rows = list(live_inventory.get("inventory_stock_rows") or [])
+                warehouse_names = ["Все склады"] + [str(item.name) for item in list(live_inventory.get("inventory_warehouses") or [])]
+                active_scope = active_scope if active_scope in warehouse_names else warehouse_names[0]
+                filtered_stock_rows = [
+                    item for item in stock_rows
+                    if active_scope == "Все склады" or (item.get("warehouse") is not None and str(item["warehouse"].name) == active_scope)
+                ]
+                critical_rows = [item for item in filtered_stock_rows if bool(item.get("needs_reorder"))]
+                total_quantity = sum((Decimal(item.get("available") or 0) for item in filtered_stock_rows), Decimal("0"))
+                metrics = [
+                    {"label": "Дата", "value": str(filters["selected_date_label"]), "meta": f"срез {period_meta['window']}", "tone": "default"},
+                    {"label": "Кол-во товара", "value": qty_label(total_quantity), "meta": f"остаток {period_meta['window']}", "tone": "default"},
+                    {"label": "Критические остатки", "value": str(len(critical_rows)), "meta": f"в риске {period_meta['window']}", "tone": "warning" if critical_rows else "default"},
+                    {"label": "Склад", "value": active_scope, "meta": f"текущий фильтр {period_meta['window']}", "tone": "default"},
+                ]
+                stock_display_rows = []
+                for item in (critical_rows if detail_code == "critical" else filtered_stock_rows)[:12]:
+                    product = item.get("product")
+                    if product is None:
+                        continue
+                    stock_display_rows.append((str(product.name), qty_label(item.get("available"))))
+                if detail_code == "warehouses":
+                    panels = [
+                        chips_panel("Склады", "Выбор склада", [{"label": item, "href": inventory_href("stock", "warehouses", item), "active": item == active_scope} for item in warehouse_names]),
+                        rows_panel("Остатки по складу", active_scope, stock_display_rows or [("Нет данных", "Остатки не найдены")]),
+                    ]
+                elif detail_code == "all":
+                    panels = [rows_panel("Все остатки", "Основные позиции", stock_display_rows or [("Нет данных", "Остатки не найдены")])]
+                else:
+                    panels = [rows_panel("Критические остатки", "Позиции под риском", stock_display_rows or [("Нет данных", "Критических остатков нет")])]
+        else:
+            valid = {"all", "top", "history"}
+            detail_code = detail_code if detail_code in valid else "top"
+            subtabs = [
+                build_subtab("Все", "all", active=detail_code == "all"),
+                build_subtab("Топ контрагенты", "top", active=detail_code == "top"),
+                build_subtab("История", "history", active=detail_code == "history"),
+            ]
+            title = "Контрагенты"
+            description = f"Контрагенты по складу {period_meta['window']}."
+            metrics = [
+                metric("Контрагенты", {"day": "14", "yesterday": "13", "week": "28", "month": "52", "custom": "39"}, f"активно {period_meta['window']}"),
+                metric("Отгрузки", {"day": "126 шт.", "yesterday": "118 шт.", "week": "742 шт.", "month": "2 980 шт.", "custom": "2 140 шт."}, f"связано {period_meta['window']}"),
+                metric("Топ контрагенты", {"day": "4", "yesterday": "4", "week": "4", "month": "4", "custom": "4"}, f"лидеры {period_meta['window']}"),
+                {"label": "Период", "value": str(filters["period_label"]), "meta": f"срез {period_meta['window']}", "tone": "default"},
+            ]
+            if detail_code == "all":
+                panels = [rows_panel("Все контрагенты", "Основной список", [("СтройПоставка", "94 отгр."), ("МонтажСервис", "81 отгр."), ("ТехноСнаб", "67 отгр."), ("ГородПроект", "51 отгр.")])]
+            elif detail_code == "history":
+                panels = [rows_panel("История", "Последние изменения по контрагентам", [("21.04.2026", "СтройПоставка · 94 отгр."), ("20.04.2026", "МонтажСервис · 81 отгр."), ("19.04.2026", "ТехноСнаб · 67 отгр."), ("18.04.2026", "ГородПроект · 51 отгр.")])]
+            else:
+                panels = [rows_panel("Топ контрагенты", "Лидеры по отгрузкам", [("СтройПоставка", "94 отгр."), ("МонтажСервис", "81 отгр."), ("ТехноСнаб", "67 отгр."), ("ГородПроект", "51 отгр.")])]
+            if live_inventory is not None:
+                top_counterparties = list(live_inventory.get("inventory_top_counterparties") or [])
+                metrics = [
+                    {"label": "Контрагенты", "value": str(len(top_counterparties)), "meta": f"активно {period_meta['window']}", "tone": "default"},
+                    {"label": "Отгрузки", "value": str(int(dict(live_inventory.get('inventory_fact') or {}).get('shipments_count') or 0)), "meta": f"связано {period_meta['window']}", "tone": "default"},
+                    {"label": "Топ контрагенты", "value": str(min(len(top_counterparties), 10)), "meta": f"лидеры {period_meta['window']}", "tone": "default"},
+                    {"label": "Период", "value": str(filters["period_label"]), "meta": f"срез {period_meta['window']}", "tone": "default"},
+                ]
+                counterparty_rows = [
+                    (str(item.get("name") or "Контрагент"), money_label(item.get("amount")))
+                    for item in top_counterparties[:12]
+                ]
+                panels = [rows_panel("Контрагенты", "Живые данные по отгрузкам", counterparty_rows or [("Нет данных", "Контрагенты не найдены")])]
+
+        if not account_session_active and active_tab in {"summary", "products", "stock", "counterparties"}:
+            if active_tab == "summary":
+                metrics = [
+                    {"label": "Дата", "value": str(filters["selected_date_label"]), "meta": "срез экрана", "tone": "default"},
+                    {"label": "Период", "value": str(filters["period_label"]), "meta": "дефолт для склада", "tone": "default"},
+                    {"label": "Аккаунт", "value": "Не выбран", "meta": "live-данные не привязаны", "tone": "warning"},
+                    {"label": "Синхронизация", "value": "Недоступна", "meta": "нет active account session", "tone": "warning"},
+                ]
+                panels = [
+                    form_panel(
+                        "Период",
+                        "Настроить период сводки",
+                        [
+                            {"label": "С", "name": "date_from", "type": "date", "value": str(filters["date_from"])},
+                            {"label": "По", "name": "date_to", "type": "date", "value": str(filters["date_to"])},
+                        ],
+                        "Сохранить",
+                        period_value="custom",
+                    ),
+                    live_session_message_panel(),
+                ]
+            else:
+                entity_label = {
+                    "products": "Товары",
+                    "stock": "Остатки",
+                    "counterparties": "Контрагенты",
+                }.get(active_tab, "Склад")
+                metrics = [
+                    {"label": entity_label, "value": "Live", "meta": "данные доступны после входа", "tone": "default"},
+                    {"label": "Период", "value": str(filters["period_label"]), "meta": "текущий фильтр", "tone": "default"},
+                    {"label": "Аккаунт", "value": "Не выбран", "meta": "нет active account session", "tone": "warning"},
+                    {"label": "Синхронизация", "value": "Недоступна", "meta": "нет привязки к аккаунту", "tone": "warning"},
+                ]
+                panels = [live_session_message_panel()]
+
+        return {
+            "filters": filters,
+            "workspace_id": "inventory-workspace",
+            "section_label": "Склад",
+            "active_tab": active_tab,
+            "active_detail": detail_code,
+            "active_scope": active_scope,
+            "title": title,
+            "description": description,
+            "context_line": context_line,
+            "tabs": tabs,
+            "tab_groups": [
+                {
+                    "eyebrow": "Склад",
+                    "title": "Разделы склада",
+                    "primary": False,
+                    "items": tabs,
+                },
+            ],
+            "block_title": "Разделы склада",
+            "subtabs": subtabs,
+            "states": states,
+            "metrics": metrics,
+            "panels": panels,
+        }
+
+    def _site_marketing_surface_model(
+        selected_date_raw: str | None = None,
+        period_raw: str | None = None,
+        date_from_raw: str | None = None,
+        date_to_raw: str | None = None,
+        tab_raw: str | None = None,
+        detail_raw: str | None = None,
+        scope_raw: str | None = None,
+        request_params: dict[str, str] | None = None,
+    ) -> dict[str, object]:
+        request_params = request_params or {}
+        filters = _site_dashboard_filters(selected_date_raw, period_raw, date_from_raw, date_to_raw)
+        period_code = str(filters["period_code"])
+        period_meta = _site_period_meta(period_code, str(filters["date_from_label"]), str(filters["date_to_label"]))
+        period_query = _site_period_query(period_code, str(filters["date_from"]), str(filters["date_to"]))
+        section = _site_section("marketing")
+        raw_tabs = list(section.get("marketing_items", []))
+        allowed_codes = {str(item.get("code")) for item in raw_tabs if item.get("code")}
+        active_tab = str(tab_raw or "summary").strip().lower()
+        if active_tab not in allowed_codes or active_tab == "charts":
+            active_tab = "summary"
+
+        def pick(values: dict[str, str]) -> str:
+            return str(values.get(period_code, values.get("day", "")))
+
+        def metric(label: str, values: dict[str, str], meta: str, tone: str = "default") -> dict[str, str]:
+            return {"label": label, "value": pick(values), "meta": meta, "tone": tone}
+
+        def rows_panel(title: str, subtitle: str, rows: list[tuple[str, object]]) -> dict[str, object]:
+            items = [{"label": row_label, "value": pick(row_value) if isinstance(row_value, dict) else str(row_value)} for row_label, row_value in rows]
+            return {"kind": "rows", "title": title, "subtitle": subtitle, "items": items}
+
+        def chips_panel(title: str, subtitle: str, chips: list[dict[str, object]]) -> dict[str, object]:
+            return {"kind": "chips", "title": title, "subtitle": subtitle, "items": chips}
+
+        def form_panel(title: str, subtitle: str, fields: list[dict[str, object]], button_label: str, period_value: str | None = None) -> dict[str, object]:
+            normalized_fields: list[dict[str, object]] = []
+            for field in fields:
+                field_copy = dict(field)
+                field_name = str(field_copy.get("name") or "")
+                if field_name and str(field_copy.get("type") or "") != "file" and field_name in request_params:
+                    field_copy["value"] = request_params[field_name]
+                normalized_fields.append(field_copy)
+            hidden = [
+                {"name": "tab", "value": active_tab},
+                {"name": "detail", "value": detail_code},
+                {"name": "period", "value": period_value or period_code},
+            ]
+            if active_scope:
+                hidden.append({"name": "scope", "value": active_scope})
+            if (period_value or period_code) == "custom":
+                hidden.append({"name": "date_from", "value": request_params.get("date_from", str(filters["date_from"]))})
+                hidden.append({"name": "date_to", "value": request_params.get("date_to", str(filters["date_to"]))})
+            return {
+                "kind": "form",
+                "title": title,
+                "subtitle": subtitle,
+                "items": normalized_fields,
+                "button_label": button_label,
+                "action": "/site/marketing#marketing-workspace",
+                "hidden": hidden,
+            }
+
+        def marketing_href(tab_code: str, detail_code_arg: str | None = None, scope_code: str | None = None, period_override: str | None = None) -> str:
+            params: dict[str, str] = {"tab": tab_code, "period": period_override or period_code, "selected_date": str(filters["anchor_date"])}
+            if detail_code_arg:
+                params["detail"] = detail_code_arg
+            if scope_code:
+                params["scope"] = scope_code
+            if params["period"] == "custom":
+                params["date_from"] = str(filters["date_from"])
+                params["date_to"] = str(filters["date_to"])
+            return f"/site/marketing?{urlencode(params)}#marketing-workspace"
+
+        def build_subtab(label: str, code: str | None = None, target_period: str | None = None, active: bool = False, scope_code: str | None = None) -> dict[str, object]:
+            href = marketing_href(active_tab, code or detail_code, scope_code, target_period)
+            return {"label": label, "href": href, "active": active}
+
+        sources = MARKETING_SOURCES
+        city_options = MARKETING_CITY_OPTIONS
+        quantity_options = MARKETING_QUANTITY_OPTIONS
+        source_scope = str(scope_raw or request_params.get("scope") or "").strip()
+        if source_scope not in sources:
+            source_scope = sources[0]
+        detail_code = str(detail_raw or {"summary": "period", "fill_data": "form", "source": "all", "cities": "top"}.get(active_tab, "date")).strip().lower()
+        active_scope = source_scope
+
+        tabs = []
+        for item in raw_tabs:
+            code = str(item.get("code") or "")
+            href = f"/site/marketing?view=charts&{_site_source_query(period_query, active_scope)}" if code == "charts" else marketing_href(code, scope_code=active_scope)
+            tabs.append({"code": code, "label": str(item.get("label") or ""), "icon": str(item.get("icon") or ""), "href": href, "active": code == active_tab and code != "charts"})
+
+        filters["periods"] = [{**item, "href": marketing_href(active_tab, detail_code, active_scope or None, str(item["code"]))} for item in list(filters["periods"])]
+        title = "Маркетинг"
+        description = ""
+        metrics: list[dict[str, str]] = []
+        panels: list[dict[str, object]] = []
+        subtabs: list[dict[str, object]] = []
+
+        if active_tab == "summary":
+            valid = {"date", "period"}
+            detail_code = detail_code if detail_code in valid else "period"
+            subtabs = [
+                build_subtab("Дата", "date", active=detail_code == "date"),
+                build_subtab("Период", "period", active=detail_code == "period"),
+                build_subtab("Сегодня", detail_code, target_period="day", active=period_code == "day"),
+                build_subtab("Вчера", detail_code, target_period="yesterday", active=period_code == "yesterday"),
+                build_subtab("Неделя", detail_code, target_period="week", active=period_code == "week"),
+                build_subtab("Месяц", detail_code, target_period="month", active=period_code == "month"),
+            ]
+            title = "Сводка"
+            description = f"Сводка маркетинга по источнику {active_scope.lower()} {period_meta['window']}."
+            metrics = [
+                {"label": "Источник", "value": active_scope, "meta": "сквозной источник раздела", "tone": "default"},
+                {"label": "Период", "value": str(filters["period_label"]), "meta": f"активно {period_meta['window']}", "tone": "default"},
+                metric("Расходы", {"day": "268 тыс ₽", "yesterday": "251 тыс ₽", "week": "1.58 млн ₽", "month": "6.42 млн ₽", "custom": "4.66 млн ₽"}, f"по источнику {period_meta['window']}"),
+                metric("Количество продаж", {"day": "12", "yesterday": "10", "week": "54", "month": "228", "custom": "161"}, f"по источнику {period_meta['window']}"),
+            ]
+            if detail_code == "period":
+                panels = [
+                    chips_panel("Источник", "Выбранный источник", [{"label": item, "href": marketing_href("source", "all", item), "active": item == active_scope} for item in sources]),
+                    form_panel(
+                        "Период",
+                        "Выбрать диапазон",
+                        [
+                            {"label": "С", "name": "date_from", "type": "date", "value": str(filters["date_from"])},
+                            {"label": "По", "name": "date_to", "type": "date", "value": str(filters["date_to"])},
+                        ],
+                        "Сохранить",
+                        period_value="custom",
+                    ),
+                    rows_panel("Сводка", "Данные по выбранному источнику", [("Источник", active_scope), ("С", str(filters["date_from_label"])), ("По", str(filters["date_to_label"])), ("Расходы", {"day": "268 тыс ₽", "yesterday": "251 тыс ₽", "week": "1.58 млн ₽", "month": "6.42 млн ₽", "custom": "4.66 млн ₽"}), ("Количество продаж", {"day": "12", "yesterday": "10", "week": "54", "month": "228", "custom": "161"})]),
+                ]
+            else:
+                panels = [
+                    chips_panel("Источник", "Выбранный источник", [{"label": item, "href": marketing_href("source", "all", item), "active": item == active_scope} for item in sources]),
+                    rows_panel("Сводка", "Текущий срез", [("Дата", str(filters["selected_date_label"])), ("Источник", active_scope), ("Расходы", {"day": "268 тыс ₽", "yesterday": "251 тыс ₽", "week": "1.58 млн ₽", "month": "6.42 млн ₽", "custom": "4.66 млн ₽"}), ("Количество продаж", {"day": "12", "yesterday": "10", "week": "54", "month": "228", "custom": "161"}), ("Конверсия", {"day": "29.4%", "yesterday": "27.8%", "week": "30.6%", "month": "31.2%", "custom": "30.9%"})]),
+                ]
+        elif active_tab == "fill_data":
+            valid = {"form", "extra", "day_list"}
+            detail_code = detail_code if detail_code in valid else "form"
+            subtabs = [
+                build_subtab("Основная запись", "form", active=detail_code == "form"),
+                build_subtab("+ Добавить еще", "extra", active=detail_code == "extra"),
+                build_subtab("Список за день", "day_list", active=detail_code == "day_list"),
+            ]
+            title = "Заполнить данные"
+            description = "Заполнение количества продаж по городу и источнику рекламы с возможностью добавить несколько записей за день."
+            metrics = [
+                {"label": "Источник рекламы", "value": str(request_params.get("ad_source", active_scope)), "meta": "поле для заполнения", "tone": "default"},
+                {"label": "Город", "value": str(request_params.get("city_name", "Город")), "meta": "поле для заполнения", "tone": "default"},
+                {"label": "Количество продаж", "value": str(request_params.get("sales_count", "0")), "meta": f"внести {period_meta['window']}", "tone": "default"},
+                {"label": "Дата", "value": str(request_params.get("selected_date", str(filters["selected_date_label"]))), "meta": f"дата записи {period_meta['window']}", "tone": "default"},
+                {"label": "Записей за день", "value": str(request_params.get("daily_rows", "2")), "meta": "можно добавить несколько строк", "tone": "success"},
+            ]
+            if detail_code == "extra":
+                panels = [
+                    chips_panel("Источник", "Выбранный источник", [{"label": item, "href": marketing_href("source", "all", item), "active": item == active_scope} for item in sources]),
+                    form_panel(
+                        "Основная запись",
+                        "Первая строка за выбранную дату",
+                        [
+                            {"label": "Источник рекламы", "name": "ad_source", "type": "select", "value": str(request_params.get("ad_source", active_scope)), "options": sources},
+                            {"label": "Город", "name": "city_name", "type": "select", "value": str(request_params.get("city_name", city_options[0])), "options": city_options},
+                            {"label": "Количество продаж", "name": "sales_count", "type": "select", "value": str(request_params.get("sales_count", quantity_options[0])), "options": quantity_options},
+                            {"label": "Дата", "name": "selected_date", "type": "date", "value": str(filters["selected_date"])},
+                        ],
+                        "Сохранить",
+                    ),
+                    form_panel(
+                        "+ Добавить еще",
+                        "Дополнительная строка за ту же дату",
+                        [
+                            {"label": "Источник рекламы +", "name": "ad_source_extra", "type": "select", "value": str(request_params.get("ad_source_extra", active_scope)), "options": sources},
+                            {"label": "Город +", "name": "city_name_extra", "type": "select", "value": str(request_params.get("city_name_extra", city_options[1])), "options": city_options},
+                            {"label": "Количество продаж +", "name": "sales_count_extra", "type": "select", "value": str(request_params.get("sales_count_extra", quantity_options[1])), "options": quantity_options},
+                            {"label": "Комментарий", "name": "sales_note_extra", "type": "text", "value": str(request_params.get("sales_note_extra", "Дополнительная строка продаж"))},
+                        ],
+                        "Сохранить",
+                    ),
+                ]
+            elif detail_code == "day_list":
+                panels = [
+                    chips_panel("Источник", "Выбранный источник", [{"label": item, "href": marketing_href("source", "all", item), "active": item == active_scope} for item in sources]),
+                    rows_panel(
+                        "Записи за день",
+                        "Несколько строк по одной дате",
+                        [
+                            ("Дата", str(request_params.get("selected_date", str(filters["selected_date_label"])))),
+                            ("Москва · Все источники", "3 продажи"),
+                            ("Санкт-Петербург · Все источники", "2 продажи"),
+                            ("Казань · Все источники", "1 продажа"),
+                            ("Итого за день", "6 продаж"),
+                        ],
+                    ),
+                ]
+            else:
+                panels = [
+                    chips_panel("Источник", "Выбранный источник", [{"label": item, "href": marketing_href("source", "all", item), "active": item == active_scope} for item in sources]),
+                    form_panel(
+                        "Заполнить данные",
+                        "Основная запись продаж по городу и источнику рекламы",
+                        [
+                            {"label": "Источник рекламы", "name": "ad_source", "type": "select", "value": str(request_params.get("ad_source", active_scope)), "options": sources},
+                            {"label": "Город", "name": "city_name", "type": "select", "value": str(request_params.get("city_name", city_options[0])), "options": city_options},
+                            {"label": "Количество продаж", "name": "sales_count", "type": "select", "value": str(request_params.get("sales_count", quantity_options[0])), "options": quantity_options},
+                            {"label": "Дата", "name": "selected_date", "type": "date", "value": str(filters["selected_date"])},
+                        ],
+                        "Сохранить",
+                    ),
+                    rows_panel(
+                        "Что дальше",
+                        "Как заносить несколько продаж за день",
+                        [
+                            ("Шаг 1", "заполнить основную запись"),
+                            ("Шаг 2", "нажать + Добавить еще"),
+                            ("Шаг 3", "добавить вторую и следующие строки"),
+                            ("Шаг 4", "проверить Список за день"),
+                        ],
+                    ),
+                ]
+        elif active_tab == "source":
+            active_scope = active_scope if active_scope in sources else sources[0]
+            title = "Источники"
+            description = "Выбор источника для маркетинга."
+            metrics = [
+                {"label": "Источник", "value": active_scope, "meta": "активный источник", "tone": "default"},
+                metric("Расходы", {"day": "268 тыс ₽", "yesterday": "251 тыс ₽", "week": "1.58 млн ₽", "month": "6.42 млн ₽", "custom": "4.66 млн ₽"}, f"маркетинг {period_meta['window']}"),
+                metric("Лиды", {"day": "186", "yesterday": "171", "week": "1 140", "month": "4 680", "custom": "3 220"}, f"входящий поток {period_meta['window']}"),
+                metric("Конверсия", {"day": "29.4%", "yesterday": "27.8%", "week": "30.6%", "month": "31.2%", "custom": "30.9%"}, f"в клиента {period_meta['window']}"),
+            ]
+            panels = [
+                chips_panel("Источники", "Доступные источники", [{"label": item, "href": marketing_href("summary", "period", item), "active": item == active_scope} for item in sources]),
+                rows_panel("Сводка источника", active_scope, [("Расходы", {"day": "268 тыс ₽", "yesterday": "251 тыс ₽", "week": "1.58 млн ₽", "month": "6.42 млн ₽", "custom": "4.66 млн ₽"}), ("Стоимость клиента", {"day": "3 620 ₽", "yesterday": "3 740 ₽", "week": "3 410 ₽", "month": "3 280 ₽", "custom": "3 350 ₽"}), ("Стоимость лида", {"day": "1 420 ₽", "yesterday": "1 468 ₽", "week": "1 386 ₽", "month": "1 312 ₽", "custom": "1 348 ₽"}), ("Лиды", {"day": "186", "yesterday": "171", "week": "1 140", "month": "4 680", "custom": "3 220"})]),
+            ]
+        elif active_tab == "cities":
+            valid = {"top", "all"}
+            detail_code = detail_code if detail_code in valid else "top"
+            subtabs = [build_subtab("Топ города", "top", active=detail_code == "top"), build_subtab("Все", "all", active=detail_code == "all")]
+            title = "Города"
+            description = f"Города маркетинга {period_meta['window']}."
+            metrics = [
+                {"label": "Источник", "value": active_scope, "meta": "текущий источник", "tone": "default"},
+                metric("Городов", {"day": "8", "yesterday": "8", "week": "12", "month": "18", "custom": "14"}, f"в аналитике {period_meta['window']}"),
+                metric("Лиды", {"day": "186", "yesterday": "171", "week": "1 140", "month": "4 680", "custom": "3 220"}, f"по городам {period_meta['window']}"),
+                metric("Конверсия", {"day": "29.4%", "yesterday": "27.8%", "week": "30.6%", "month": "31.2%", "custom": "30.9%"}, f"в среднем {period_meta['window']}"),
+            ]
+            panels = [rows_panel("Топ города" if detail_code == "top" else "Все города", "Список городов", MARKETING_CITY_ROWS)]
+        else:
+            valid = {"date", "period"}
+            detail_code = detail_code if detail_code in valid else "date"
+            subtabs = [
+                build_subtab("Дата", "date", active=detail_code == "date"),
+                build_subtab("Период", "period", active=detail_code == "period"),
+                build_subtab("Сегодня", detail_code, target_period="day", active=period_code == "day"),
+                build_subtab("Вчера", detail_code, target_period="yesterday", active=period_code == "yesterday"),
+                build_subtab("Неделя", detail_code, target_period="week", active=period_code == "week"),
+                build_subtab("Месяц", detail_code, target_period="month", active=period_code == "month"),
+            ]
+            title_map = {"expenses": "Расходы", "cac": "Стоимость клиента", "cpl": "Стоимость лида", "leads": "Лиды", "conversion": "Конверсия"}
+            metric_map = {
+                "expenses": {"day": "268 тыс ₽", "yesterday": "251 тыс ₽", "week": "1.58 млн ₽", "month": "6.42 млн ₽", "custom": "4.66 млн ₽"},
+                "cac": {"day": "3 620 ₽", "yesterday": "3 740 ₽", "week": "3 410 ₽", "month": "3 280 ₽", "custom": "3 350 ₽"},
+                "cpl": {"day": "1 420 ₽", "yesterday": "1 468 ₽", "week": "1 386 ₽", "month": "1 312 ₽", "custom": "1 348 ₽"},
+                "leads": {"day": "186", "yesterday": "171", "week": "1 140", "month": "4 680", "custom": "3 220"},
+                "conversion": {"day": "29.4%", "yesterday": "27.8%", "week": "30.6%", "month": "31.2%", "custom": "30.9%"},
+            }
+            title = title_map.get(active_tab, "Маркетинг")
+            description = f"{title} {period_meta['window']}."
+            metrics = [
+                {"label": "Источник", "value": active_scope, "meta": "текущий источник", "tone": "default"},
+                {"label": "Дата", "value": str(filters["selected_date_label"]), "meta": f"срез {period_meta['window']}", "tone": "default"},
+                {"label": "Период", "value": str(filters["period_label"]), "meta": f"активно {period_meta['window']}", "tone": "default"},
+                metric(title, metric_map[active_tab], f"значение {period_meta['window']}"),
+            ]
+            if detail_code == "period":
+                panels = [
+                    form_panel(
+                        "Период",
+                        "Выбрать диапазон",
+                        [
+                            {"label": "С", "name": "date_from", "type": "date", "value": str(filters["date_from"])},
+                            {"label": "По", "name": "date_to", "type": "date", "value": str(filters["date_to"])},
+                        ],
+                        "Сохранить",
+                        period_value="custom",
+                    ),
+                    rows_panel("Выбранный период", "Текущий диапазон", [("Период", str(filters["period_label"])), ("С", str(filters["date_from_label"])), ("По", str(filters["date_to_label"])), ("Источник", active_scope)]),
+                ]
+            else:
+                panels = [rows_panel("Дата", f"{title} по дате", [("Дата", str(filters["selected_date_label"])), ("Значение", metric_map[active_tab]), ("Источник", active_scope), ("Статус", "макет")])]
+
+        return {
+            "filters": filters,
+            "workspace_id": "marketing-workspace",
+            "section_label": "Маркетинг",
+            "active_tab": active_tab,
+            "active_detail": detail_code,
+            "active_scope": active_scope,
+            "title": title,
+            "description": description,
+            "context_line": f"Источник: {active_scope}",
+            "tabs": tabs,
+            "tab_groups": [{"eyebrow": "Маркетинг", "title": "Разделы маркетинга", "primary": False, "items": tabs}],
+            "block_title": "Разделы маркетинга",
+            "subtabs": subtabs,
+            "metrics": metrics,
+            "panels": panels,
+        }
+
+    def _site_sales_surface_model(
+        selected_date_raw: str | None = None,
+        period_raw: str | None = None,
+        date_from_raw: str | None = None,
+        date_to_raw: str | None = None,
+        tab_raw: str | None = None,
+        detail_raw: str | None = None,
+        scope_raw: str | None = None,
+        request_params: dict[str, str] | None = None,
+    ) -> dict[str, object]:
+        request_params = request_params or {}
+        filters = _site_dashboard_filters(selected_date_raw, period_raw, date_from_raw, date_to_raw)
+        period_code = str(filters["period_code"])
+        period_meta = _site_period_meta(period_code, str(filters["date_from_label"]), str(filters["date_to_label"]))
+        period_query = _site_period_query(period_code, str(filters["date_from"]), str(filters["date_to"]))
+        section = _site_section("sales")
+        raw_tabs = list(section.get("sales_items", []))
+        allowed_codes = {str(item.get("code")) for item in raw_tabs if item.get("code")}
+        active_tab = str(tab_raw or "summary").strip().lower()
+        if active_tab not in allowed_codes or active_tab == "charts":
+            active_tab = "summary"
+
+        def pick(values: dict[str, str]) -> str:
+            return str(values.get(period_code, values.get("day", "")))
+
+        def metric(label: str, values: dict[str, str], meta: str, tone: str = "default") -> dict[str, str]:
+            return {"label": label, "value": pick(values), "meta": meta, "tone": tone}
+
+        def rows_panel(title: str, subtitle: str, rows: list[tuple[str, object]]) -> dict[str, object]:
+            items = [{"label": row_label, "value": pick(row_value) if isinstance(row_value, dict) else str(row_value)} for row_label, row_value in rows]
+            return {"kind": "rows", "title": title, "subtitle": subtitle, "items": items}
+
+        def chips_panel(title: str, subtitle: str, chips: list[dict[str, object]]) -> dict[str, object]:
+            return {"kind": "chips", "title": title, "subtitle": subtitle, "items": chips}
+
+        def form_panel(title: str, subtitle: str, fields: list[dict[str, object]], button_label: str, period_value: str | None = None) -> dict[str, object]:
+            normalized_fields: list[dict[str, object]] = []
+            for field in fields:
+                field_copy = dict(field)
+                field_name = str(field_copy.get("name") or "")
+                if field_name and str(field_copy.get("type") or "") != "file" and field_name in request_params:
+                    field_copy["value"] = request_params[field_name]
+                normalized_fields.append(field_copy)
+            hidden = [
+                {"name": "tab", "value": active_tab},
+                {"name": "detail", "value": detail_code},
+                {"name": "period", "value": period_value or period_code},
+            ]
+            if active_scope:
+                hidden.append({"name": "scope", "value": active_scope})
+            if (period_value or period_code) == "custom":
+                hidden.append({"name": "date_from", "value": request_params.get("date_from", str(filters["date_from"]))})
+                hidden.append({"name": "date_to", "value": request_params.get("date_to", str(filters["date_to"]))})
+            return {
+                "kind": "form",
+                "title": title,
+                "subtitle": subtitle,
+                "items": normalized_fields,
+                "button_label": button_label,
+                "action": "/site/sales#sales-workspace",
+                "hidden": hidden,
+            }
+
+        def sales_href(tab_code: str, detail_code_arg: str | None = None, scope_code: str | None = None, period_override: str | None = None) -> str:
+            params: dict[str, str] = {"tab": tab_code, "period": period_override or period_code, "selected_date": str(filters["anchor_date"])}
+            if detail_code_arg:
+                params["detail"] = detail_code_arg
+            if scope_code:
+                params["scope"] = scope_code
+            if params["period"] == "custom":
+                params["date_from"] = str(filters["date_from"])
+                params["date_to"] = str(filters["date_to"])
+            return f"/site/sales?{urlencode(params)}#sales-workspace"
+
+        def build_subtab(label: str, code: str | None = None, target_period: str | None = None, active: bool = False, scope_code: str | None = None) -> dict[str, object]:
+            href = sales_href(active_tab, code or detail_code, scope_code, target_period)
+            return {"label": label, "href": href, "active": active}
+
+        sources = SALES_SOURCES
+        source_scope = str(scope_raw or request_params.get("scope") or "").strip()
+        if source_scope not in sources:
+            source_scope = sources[0]
+        detail_code = str(detail_raw or {"summary": "period", "source": "all", "cities": "top", "days": "period"}.get(active_tab, "date")).strip().lower()
+        active_scope = source_scope
+
+        tabs = []
+        for item in raw_tabs:
+            code = str(item.get("code") or "")
+            href = f"/site/sales?view=charts&{_site_source_query(period_query, active_scope)}" if code == "charts" else sales_href(code, scope_code=active_scope)
+            tabs.append({"code": code, "label": str(item.get("label") or ""), "icon": str(item.get("icon") or ""), "href": href, "active": code == active_tab and code != "charts"})
+
+        filters["periods"] = [{**item, "href": sales_href(active_tab, detail_code, active_scope or None, str(item["code"]))} for item in list(filters["periods"])]
+        title = "Продажи"
+        description = ""
+        metrics: list[dict[str, str]] = []
+        panels: list[dict[str, object]] = []
+        subtabs: list[dict[str, object]] = []
+
+        if active_tab == "summary":
+            valid = {"date", "period"}
+            detail_code = detail_code if detail_code in valid else "period"
+            subtabs = [
+                build_subtab("Дата", "date", active=detail_code == "date"),
+                build_subtab("Период", "period", active=detail_code == "period"),
+                build_subtab("Сегодня", detail_code, target_period="day", active=period_code == "day"),
+                build_subtab("Вчера", detail_code, target_period="yesterday", active=period_code == "yesterday"),
+                build_subtab("Неделя", detail_code, target_period="week", active=period_code == "week"),
+                build_subtab("Месяц", detail_code, target_period="month", active=period_code == "month"),
+            ]
+            title = "Сводка"
+            description = f"Сводка продаж по источнику {active_scope.lower()} {period_meta['window']}."
+            metrics = [
+                {"label": "Источник", "value": active_scope, "meta": "сквозной источник раздела", "tone": "default"},
+                {"label": "Период", "value": str(filters["period_label"]), "meta": f"активно {period_meta['window']}", "tone": "default"},
+                metric("Продажи", {"day": "74", "yesterday": "69", "week": "418", "month": "1 740", "custom": "1 220"}, f"по источнику {period_meta['window']}"),
+                metric("Средний чек", {"day": "48 600 ₽", "yesterday": "46 900 ₽", "week": "50 200 ₽", "month": "51 800 ₽", "custom": "50 900 ₽"}, f"по источнику {period_meta['window']}"),
+            ]
+            if detail_code == "period":
+                panels = [
+                    chips_panel("Источник", "Выбранный источник", [{"label": item, "href": sales_href("source", "all", item), "active": item == active_scope} for item in sources]),
+                    form_panel(
+                        "Период",
+                        "Выбрать диапазон",
+                        [
+                            {"label": "С", "name": "date_from", "type": "date", "value": str(filters["date_from"])},
+                            {"label": "По", "name": "date_to", "type": "date", "value": str(filters["date_to"])},
+                        ],
+                        "Сохранить",
+                        period_value="custom",
+                    ),
+                    rows_panel("Сводка", "Данные по выбранному источнику", [("Источник", active_scope), ("С", str(filters["date_from_label"])), ("По", str(filters["date_to_label"])), ("Продажи", {"day": "74", "yesterday": "69", "week": "418", "month": "1 740", "custom": "1 220"}), ("Средний чек", {"day": "48 600 ₽", "yesterday": "46 900 ₽", "week": "50 200 ₽", "month": "51 800 ₽", "custom": "50 900 ₽"})]),
+                ]
+            else:
+                panels = [
+                    chips_panel("Источник", "Выбранный источник", [{"label": item, "href": sales_href("source", "all", item), "active": item == active_scope} for item in sources]),
+                    rows_panel("Сводка", "Текущий срез", [("Дата", str(filters["selected_date_label"])), ("Источник", active_scope), ("Продажи", {"day": "74", "yesterday": "69", "week": "418", "month": "1 740", "custom": "1 220"}), ("Средний чек", {"day": "48 600 ₽", "yesterday": "46 900 ₽", "week": "50 200 ₽", "month": "51 800 ₽", "custom": "50 900 ₽"}), ("Города", {"day": "8", "yesterday": "8", "week": "12", "month": "18", "custom": "14"})]),
+                ]
+        elif active_tab == "source":
+            active_scope = active_scope if active_scope in sources else sources[0]
+            title = "Источники"
+            description = "Выбор источника для продаж."
+            metrics = [
+                {"label": "Источник", "value": active_scope, "meta": "активный источник", "tone": "default"},
+                metric("Средний чек", {"day": "48 600 ₽", "yesterday": "46 900 ₽", "week": "50 200 ₽", "month": "51 800 ₽", "custom": "50 900 ₽"}, f"по источнику {period_meta['window']}"),
+                metric("Продажи", {"day": "74", "yesterday": "69", "week": "418", "month": "1 740", "custom": "1 220"}, f"кол-во {period_meta['window']}"),
+                metric("Города", {"day": "8", "yesterday": "8", "week": "12", "month": "18", "custom": "14"}, f"в аналитике {period_meta['window']}"),
+            ]
+            panels = [
+                chips_panel("Источники", "Доступные источники", [{"label": item, "href": sales_href("summary", "period", item), "active": item == active_scope} for item in sources]),
+                rows_panel("Сводка источника", active_scope, [("Средний чек", {"day": "48 600 ₽", "yesterday": "46 900 ₽", "week": "50 200 ₽", "month": "51 800 ₽", "custom": "50 900 ₽"}), ("Продажи", {"day": "74", "yesterday": "69", "week": "418", "month": "1 740", "custom": "1 220"}), ("Города", {"day": "8", "yesterday": "8", "week": "12", "month": "18", "custom": "14"}), ("Статус", "макет")]),
+            ]
+        elif active_tab == "cities":
+            valid = {"top", "all"}
+            detail_code = detail_code if detail_code in valid else "top"
+            subtabs = [build_subtab("Топ города", "top", active=detail_code == "top"), build_subtab("Все", "all", active=detail_code == "all")]
+            title = "Города"
+            description = f"Города продаж {period_meta['window']}."
+            metrics = [
+                {"label": "Источник", "value": active_scope, "meta": "текущий источник", "tone": "default"},
+                metric("Городов", {"day": "8", "yesterday": "8", "week": "12", "month": "18", "custom": "14"}, f"в аналитике {period_meta['window']}"),
+                metric("Продажи", {"day": "74", "yesterday": "69", "week": "418", "month": "1 740", "custom": "1 220"}, f"по городам {period_meta['window']}"),
+                metric("Средний чек", {"day": "48 600 ₽", "yesterday": "46 900 ₽", "week": "50 200 ₽", "month": "51 800 ₽", "custom": "50 900 ₽"}, f"в среднем {period_meta['window']}"),
+            ]
+            panels = [rows_panel("Топ города" if detail_code == "top" else "Все города", "Список городов", SALES_CITY_ROWS)]
+        else:
+            valid = {"date", "period"}
+            detail_code = detail_code if detail_code in valid else ("period" if active_tab == "days" else "date")
+            subtabs = [
+                build_subtab("Дата", "date", active=detail_code == "date"),
+                build_subtab("Период", "period", active=detail_code == "period"),
+                build_subtab("Сегодня", detail_code, target_period="day", active=period_code == "day"),
+                build_subtab("Вчера", detail_code, target_period="yesterday", active=period_code == "yesterday"),
+                build_subtab("Неделя", detail_code, target_period="week", active=period_code == "week"),
+                build_subtab("Месяц", detail_code, target_period="month", active=period_code == "month"),
+            ]
+            title_map = {"avg_check": "Средний чек", "days": "Дни"}
+            metric_map = {
+                "avg_check": {"day": "48 600 ₽", "yesterday": "46 900 ₽", "week": "50 200 ₽", "month": "51 800 ₽", "custom": "50 900 ₽"},
+                "days": {"day": "74 продажи", "yesterday": "69 продаж", "week": "418 продаж", "month": "1 740 продаж", "custom": "1 220 продаж"},
+            }
+            title = title_map.get(active_tab, "Продажи")
+            description = f"{title} {period_meta['window']}."
+            metrics = [
+                {"label": "Источник", "value": active_scope, "meta": "текущий источник", "tone": "default"},
+                {"label": "Дата", "value": str(filters["selected_date_label"]), "meta": f"срез {period_meta['window']}", "tone": "default"},
+                {"label": "Период", "value": str(filters["period_label"]), "meta": f"активно {period_meta['window']}", "tone": "default"},
+                metric(title, metric_map[active_tab], f"значение {period_meta['window']}"),
+            ]
+            if detail_code == "period":
+                panels = [
+                    form_panel(
+                        "Период",
+                        "Выбрать диапазон",
+                        [
+                            {"label": "С", "name": "date_from", "type": "date", "value": str(filters["date_from"])},
+                            {"label": "По", "name": "date_to", "type": "date", "value": str(filters["date_to"])},
+                        ],
+                        "Сохранить",
+                        period_value="custom",
+                    ),
+                    rows_panel("Выбранный период", "Текущий диапазон", [("Период", str(filters["period_label"])), ("С", str(filters["date_from_label"])), ("По", str(filters["date_to_label"])), ("Источник", active_scope)]),
+                ]
+            else:
+                panels = [rows_panel("Дата", f"{title} по дате", [("Дата", str(filters["selected_date_label"])), ("Значение", metric_map[active_tab]), ("Источник", active_scope), ("Статус", "макет")])]
+
+        return {
+            "filters": filters,
+            "workspace_id": "sales-workspace",
+            "section_label": "Продажи",
+            "active_tab": active_tab,
+            "active_detail": detail_code,
+            "active_scope": active_scope,
+            "title": title,
+            "description": description,
+            "context_line": f"Источник: {active_scope}",
+            "tabs": tabs,
+            "tab_groups": [{"eyebrow": "Продажи", "title": "Разделы продаж", "primary": False, "items": tabs}],
+            "block_title": "Разделы продаж",
+            "subtabs": subtabs,
+            "metrics": metrics,
+            "panels": panels,
+        }
+
+    def _site_employees_surface_model(
+        selected_date_raw: str | None = None,
+        period_raw: str | None = None,
+        date_from_raw: str | None = None,
+        date_to_raw: str | None = None,
+        tab_raw: str | None = None,
+        detail_raw: str | None = None,
+        scope_raw: str | None = None,
+        request_params: dict[str, str] | None = None,
+    ) -> dict[str, object]:
+        request_params = request_params or {}
+        filters = _site_dashboard_filters(selected_date_raw, period_raw, date_from_raw, date_to_raw)
+        period_code = str(filters["period_code"])
+        period_meta = _site_period_meta(period_code, str(filters["date_from_label"]), str(filters["date_to_label"]))
+        period_query = _site_period_query(period_code, str(filters["date_from"]), str(filters["date_to"]))
+        section = _site_section("employees")
+        raw_tabs = list(section.get("employee_items", []))
+        allowed_codes = {str(item.get("code")) for item in raw_tabs if item.get("code")}
+        active_tab = str(tab_raw or "summary").strip().lower()
+        if active_tab not in allowed_codes or active_tab == "charts":
+            active_tab = "summary"
+
+        def pick(values: dict[str, str]) -> str:
+            return str(values.get(period_code, values.get("day", "")))
+
+        def metric(label: str, values: dict[str, str], meta: str, tone: str = "default") -> dict[str, str]:
+            return {"label": label, "value": pick(values), "meta": meta, "tone": tone}
+
+        def rows_panel(title: str, subtitle: str, rows: list[tuple[str, object]]) -> dict[str, object]:
+            items = [{"label": row_label, "value": pick(row_value) if isinstance(row_value, dict) else str(row_value)} for row_label, row_value in rows]
+            return {"kind": "rows", "title": title, "subtitle": subtitle, "items": items}
+
+        def chips_panel(title: str, subtitle: str, chips: list[dict[str, object]]) -> dict[str, object]:
+            return {"kind": "chips", "title": title, "subtitle": subtitle, "items": chips}
+
+        def form_panel(title: str, subtitle: str, fields: list[dict[str, object]], button_label: str, period_value: str | None = None) -> dict[str, object]:
+            normalized_fields: list[dict[str, object]] = []
+            for field in fields:
+                field_copy = dict(field)
+                field_name = str(field_copy.get("name") or "")
+                if field_name and str(field_copy.get("type") or "") != "file" and field_name in request_params:
+                    field_copy["value"] = request_params[field_name]
+                normalized_fields.append(field_copy)
+            hidden = [
+                {"name": "tab", "value": active_tab},
+                {"name": "detail", "value": detail_code},
+                {"name": "period", "value": period_value or period_code},
+            ]
+            if active_scope:
+                hidden.append({"name": "scope", "value": active_scope})
+            if (period_value or period_code) == "custom":
+                hidden.append({"name": "date_from", "value": request_params.get("date_from", str(filters["date_from"]))})
+                hidden.append({"name": "date_to", "value": request_params.get("date_to", str(filters["date_to"]))})
+            return {
+                "kind": "form",
+                "title": title,
+                "subtitle": subtitle,
+                "items": normalized_fields,
+                "button_label": button_label,
+                "action": "/site/employees#employees-workspace",
+                "hidden": hidden,
+            }
+
+        def employees_href(tab_code: str, detail_code_arg: str | None = None, scope_code: str | None = None, period_override: str | None = None) -> str:
+            params: dict[str, str] = {"tab": tab_code, "period": period_override or period_code, "selected_date": str(filters["anchor_date"])}
+            if detail_code_arg:
+                params["detail"] = detail_code_arg
+            if scope_code:
+                params["scope"] = scope_code
+            if params["period"] == "custom":
+                params["date_from"] = str(filters["date_from"])
+                params["date_to"] = str(filters["date_to"])
+            return f"/site/employees?{urlencode(params)}#employees-workspace"
+
+        def build_subtab(label: str, code: str | None = None, target_period: str | None = None, active: bool = False, scope_code: str | None = None) -> dict[str, object]:
+            href = employees_href(active_tab, code or detail_code, scope_code, target_period)
+            return {"label": label, "href": href, "active": active}
+
+        employees = EMPLOYEE_DIRECTORY
+        scopes = ["Команда", "Отделы"]
+        detail_code = str(detail_raw or {"employee_add": "form", "task_assign": "employee", "summary": "period", "overdue": "all", "workload": "team", "all_employees": "list"}.get(active_tab, "date")).strip().lower()
+        active_scope = str(scope_raw or "").strip()
+
+        tabs = []
+        for item in raw_tabs:
+            code = str(item.get("code") or "")
+            href = f"/site/employees?view=charts&{period_query}" if code == "charts" else employees_href(code)
+            tabs.append({"code": code, "label": str(item.get("label") or ""), "icon": str(item.get("icon") or ""), "href": href, "active": code == active_tab and code != "charts"})
+
+        filters["periods"] = [{**item, "href": employees_href(active_tab, detail_code, active_scope or None, str(item["code"]))} for item in list(filters["periods"])]
+        title = "Сотрудники"
+        description = ""
+        metrics: list[dict[str, str]] = []
+        panels: list[dict[str, object]] = []
+        subtabs: list[dict[str, object]] = []
+
+        if active_tab == "all_employees":
+            title = "Все сотрудники"
+            description = f"Общий список сотрудников {period_meta['window']}."
+            metrics = [
+                metric("Сотрудники", {"day": "24", "yesterday": "24", "week": "24", "month": "24", "custom": "24"}, f"в команде {period_meta['window']}"),
+                metric("Отделы", {"day": "6", "yesterday": "6", "week": "6", "month": "6", "custom": "6"}, f"активно {period_meta['window']}"),
+                metric("KPI", {"day": "86%", "yesterday": "84%", "week": "88%", "month": "91%", "custom": "89%"}, f"по команде {period_meta['window']}"),
+                metric("Просроченные задачи", {"day": "14", "yesterday": "17", "week": "39", "month": "62", "custom": "48"}, f"на контроле {period_meta['window']}", "danger"),
+            ]
+            panels = [
+                rows_panel(
+                    "Все сотрудники",
+                    "Общий список сотрудников",
+                    [
+                        ("Айдар", "Продажи"),
+                        ("Тимур", "Склад"),
+                        ("Егор", "Финансы"),
+                        ("Алина", "Документы"),
+                    ],
+                )
+            ]
+        elif active_tab == "employee_add":
+            title = "Добавить сотрудника"
+            description = "Макет добавления нового сотрудника."
+            metrics = [
+                {"label": "Режим", "value": "Новый сотрудник", "meta": "карточка создания", "tone": "default"},
+                {"label": "Дата", "value": str(filters["selected_date_label"]), "meta": f"дата создания {period_meta['window']}", "tone": "default"},
+                {"label": "Период", "value": str(filters["period_label"]), "meta": f"активный период {period_meta['window']}", "tone": "default"},
+                metric("Сотрудники", {"day": "24", "yesterday": "24", "week": "24", "month": "24", "custom": "24"}, f"в команде {period_meta['window']}"),
+            ]
+            panels = [
+                form_panel(
+                    "Добавить сотрудника",
+                    "Основные данные сотрудника",
+                    [
+                        {"label": "Имя", "name": "employee_name", "type": "text", "value": "Новый сотрудник"},
+                        {"label": "Отдел", "name": "department", "type": "text", "value": "Отдел"},
+                        {"label": "Роль", "name": "role", "type": "text", "value": "Роль"},
+                        {"label": "Дата выхода", "name": "selected_date", "type": "date", "value": str(filters["selected_date"])},
+                    ],
+                    "Сохранить",
+                )
+            ]
+        elif active_tab == "task_assign":
+            valid = {"employee", "assigned_at", "due_at"}
+            detail_code = detail_code if detail_code in valid else "employee"
+            active_scope = active_scope if active_scope in employees else employees[0]
+            subtabs = [
+                build_subtab("Сотрудник", "employee", active=detail_code == "employee"),
+                build_subtab("Дата постановки", "assigned_at", active=detail_code == "assigned_at"),
+                build_subtab("Срок задачи", "due_at", active=detail_code == "due_at"),
+            ]
+            title = "Поставить задачу"
+            description = "Макет постановки задачи сотруднику."
+            metrics = [
+                {"label": "Сотрудник", "value": active_scope, "meta": "кому ставится задача", "tone": "default"},
+                {"label": "Дата постановки", "value": str(filters["selected_date_label"]), "meta": f"дата установки {period_meta['window']}", "tone": "default"},
+                {"label": "Срок", "value": str(filters["date_to_label"] if period_code == "custom" else filters["selected_date_label"]), "meta": "дата выполнения", "tone": "default"},
+                {"label": "Период", "value": str(filters["period_label"]), "meta": f"активный период {period_meta['window']}", "tone": "default"},
+            ]
+            if detail_code == "employee":
+                panels = [
+                    chips_panel("Сотрудник", "Выбор сотрудника", [{"label": item, "href": employees_href("task_assign", "employee", item), "active": item == active_scope} for item in employees]),
+                    form_panel(
+                        "Поставить задачу",
+                        active_scope,
+                        [
+                            {"label": "Сотрудник", "name": "scope", "type": "select", "value": active_scope, "options": employees},
+                            {"label": "Задача", "name": "task_text", "type": "text", "value": "Новая задача"},
+                            {"label": "Дата постановки", "name": "selected_date", "type": "date", "value": str(filters["selected_date"])},
+                            {"label": "Срок задачи", "name": "due_date", "type": "date", "value": str(filters["selected_date"])},
+                        ],
+                        "Сохранить",
+                    ),
+                ]
+            elif detail_code == "assigned_at":
+                panels = [
+                    form_panel(
+                        "Дата постановки",
+                        "Когда задача поставлена",
+                        [
+                            {"label": "Сотрудник", "name": "scope", "type": "select", "value": active_scope, "options": employees},
+                            {"label": "Дата постановки", "name": "selected_date", "type": "date", "value": str(filters["selected_date"])},
+                            {"label": "Задача", "name": "task_text", "type": "text", "value": "Новая задача"},
+                        ],
+                        "Сохранить",
+                    )
+                ]
+            else:
+                panels = [
+                    form_panel(
+                        "Срок задачи",
+                        "До какой даты выполнить",
+                        [
+                            {"label": "Сотрудник", "name": "scope", "type": "select", "value": active_scope, "options": employees},
+                            {"label": "Задача", "name": "task_text", "type": "text", "value": "Новая задача"},
+                            {"label": "Дата постановки", "name": "selected_date", "type": "date", "value": str(filters["selected_date"])},
+                            {"label": "Срок задачи", "name": "due_date", "type": "date", "value": str(filters["selected_date"])},
+                        ],
+                        "Сохранить",
+                    )
+                ]
+        elif active_tab == "overdue":
+            valid = {"all"}
+            detail_code = detail_code if detail_code in valid else "all"
+            subtabs = [
+                build_subtab("Сегодня", detail_code, target_period="day", active=period_code == "day"),
+                build_subtab("Неделя", detail_code, target_period="week", active=period_code == "week"),
+                build_subtab("Месяц", detail_code, target_period="month", active=period_code == "month"),
+                build_subtab("Все", "all", active=True),
+            ]
+            title = "Просроченные задачи"
+            description = f"Просрочки команды {period_meta['window']}."
+            metrics = [
+                metric("Просроченные задачи", {"day": "14", "yesterday": "17", "week": "39", "month": "62", "custom": "48"}, f"вне срока {period_meta['window']}", "danger"),
+                metric("KPI", {"day": "86%", "yesterday": "84%", "week": "88%", "month": "91%", "custom": "89%"}, f"по команде {period_meta['window']}"),
+                metric("Исполнение в срок", {"day": "78%", "yesterday": "74%", "week": "81%", "month": "84%", "custom": "82%"}, f"по команде {period_meta['window']}"),
+                metric("Средняя реакция", {"day": "1.6 ч", "yesterday": "1.8 ч", "week": "1.4 ч", "month": "1.2 ч", "custom": "1.3 ч"}, f"по задачам {period_meta['window']}"),
+            ]
+            panels = [rows_panel("Просроченные задачи", "Ключевые просрочки", [("Приемка", "6 задач"), ("Документы", "4 задачи"), ("Монтаж", "3 задачи"), ("Логистика", "1 задача")])]
+        elif active_tab == "workload":
+            active_scope = active_scope if active_scope in scopes else scopes[0]
+            subtabs = [build_subtab("Команда", "team", active=active_scope == "Команда", scope_code="Команда"), build_subtab("Отделы", "team", active=active_scope == "Отделы", scope_code="Отделы")]
+            title = "Загрузка команды"
+            description = f"Загрузка {period_meta['window']}."
+            metrics = [
+                {"label": "Срез", "value": active_scope, "meta": "текущий режим", "tone": "default"},
+                metric("Загрузка", {"day": "82%", "yesterday": "79%", "week": "85%", "month": "88%", "custom": "86%"}, f"в среднем {period_meta['window']}"),
+                metric("Просроченные задачи", {"day": "14", "yesterday": "17", "week": "39", "month": "62", "custom": "48"}, f"на фоне загрузки {period_meta['window']}"),
+                metric("Средняя реакция", {"day": "1.6 ч", "yesterday": "1.8 ч", "week": "1.4 ч", "month": "1.2 ч", "custom": "1.3 ч"}, f"по команде {period_meta['window']}"),
+            ]
+            panels = [
+                chips_panel("Срез", "Команда или отделы", [{"label": item, "href": employees_href("workload", "team", item), "active": item == active_scope} for item in scopes]),
+                rows_panel("Загрузка", active_scope, [("Команда продаж", "84%"), ("Команда склада", "88%"), ("Документы", "76%"), ("Финансы", "68%")]),
+            ]
+        elif active_tab in {"kpi", "on_time", "reaction"}:
+            valid = {"date", "period"}
+            detail_code = detail_code if detail_code in valid else "date"
+            subtabs = [
+                build_subtab("Дата", "date", active=detail_code == "date"),
+                build_subtab("Период", "period", active=detail_code == "period"),
+                build_subtab("Сегодня", detail_code, target_period="day", active=period_code == "day"),
+                build_subtab("Вчера", detail_code, target_period="yesterday", active=period_code == "yesterday"),
+                build_subtab("Неделя", detail_code, target_period="week", active=period_code == "week"),
+                build_subtab("Месяц", detail_code, target_period="month", active=period_code == "month"),
+            ]
+            title_map = {
+                "kpi": "KPI",
+                "on_time": "Исполнение в срок",
+                "reaction": "Средняя реакция",
+            }
+            metric_map = {
+                "kpi": {"day": "86%", "yesterday": "84%", "week": "88%", "month": "91%", "custom": "89%"},
+                "on_time": {"day": "78%", "yesterday": "74%", "week": "81%", "month": "84%", "custom": "82%"},
+                "reaction": {"day": "1.6 ч", "yesterday": "1.8 ч", "week": "1.4 ч", "month": "1.2 ч", "custom": "1.3 ч"},
+            }
+            title = title_map.get(active_tab, "Сотрудники")
+            description = f"{title} {period_meta['window']}."
+            metrics = [
+                {"label": "Дата", "value": str(filters["selected_date_label"]), "meta": f"срез {period_meta['window']}", "tone": "default"},
+                {"label": "Период", "value": str(filters["period_label"]), "meta": f"активно {period_meta['window']}", "tone": "default"},
+                metric(title, metric_map[active_tab], f"значение {period_meta['window']}"),
+                metric("Просроченные задачи", {"day": "14", "yesterday": "17", "week": "39", "month": "62", "custom": "48"}, f"контекст {period_meta['window']}"),
+            ]
+            if detail_code == "period":
+                panels = [
+                    form_panel(
+                        "Период",
+                        "Выбрать диапазон",
+                        [
+                            {"label": "С", "name": "date_from", "type": "date", "value": str(filters["date_from"])},
+                            {"label": "По", "name": "date_to", "type": "date", "value": str(filters["date_to"])},
+                        ],
+                        "Сохранить",
+                        period_value="custom",
+                    ),
+                    rows_panel("Выбранный период", "Текущий диапазон", [("Период", str(filters["period_label"])), ("С", str(filters["date_from_label"])), ("По", str(filters["date_to_label"])), ("Статус", "макет")]),
+                ]
+            else:
+                panels = [rows_panel("Дата", f"{title} по дате", [("Дата", str(filters["selected_date_label"])), ("Значение", metric_map[active_tab]), ("Команда", "основной срез"), ("Статус", "макет")])]
+        else:
+            valid = {"date", "period", "all_employees"}
+            detail_code = detail_code if detail_code in valid else "period"
+            subtabs = [
+                build_subtab("Дата", "date", active=detail_code == "date"),
+                build_subtab("Период", "period", active=detail_code == "period"),
+                build_subtab("Сегодня", detail_code, target_period="day", active=period_code == "day"),
+                build_subtab("Вчера", detail_code, target_period="yesterday", active=period_code == "yesterday"),
+                build_subtab("Месяц", detail_code, target_period="month", active=period_code == "month"),
+                build_subtab("Все сотрудники", "all_employees", active=detail_code == "all_employees"),
+            ]
+            title = "Сводка"
+            description = f"Сводка по сотрудникам {period_meta['window']}."
+            metrics = [
+                {"label": "Дата", "value": str(filters["selected_date_label"]), "meta": f"срез {period_meta['window']}", "tone": "default"},
+                {"label": "Период", "value": str(filters["period_label"]), "meta": f"активно {period_meta['window']}", "tone": "default"},
+                metric("Сотрудники", {"day": "24", "yesterday": "24", "week": "24", "month": "24", "custom": "24"}, f"в команде {period_meta['window']}"),
+                metric("Поставленные задачи", {"day": "12", "yesterday": "9", "week": "38", "month": "114", "custom": "76"}, f"за период {period_meta['window']}"),
+            ]
+            if detail_code == "period":
+                panels = [
+                    form_panel(
+                        "Период",
+                        "Выбрать диапазон",
+                        [
+                            {"label": "С", "name": "date_from", "type": "date", "value": str(filters["date_from"])},
+                            {"label": "По", "name": "date_to", "type": "date", "value": str(filters["date_to"])},
+                        ],
+                        "Сохранить",
+                        period_value="custom",
+                    ),
+                    rows_panel("Выбранный период", "Текущий диапазон", [("Период", str(filters["period_label"])), ("С", str(filters["date_from_label"])), ("По", str(filters["date_to_label"])), ("Просроченные задачи", {"day": "14", "yesterday": "17", "week": "39", "month": "62", "custom": "48"}), ("Исполнение в срок", {"day": "78%", "yesterday": "74%", "week": "81%", "month": "84%", "custom": "82%"})]),
+                ]
+            elif detail_code == "all_employees":
+                panels = [
+                    rows_panel(
+                        "Все сотрудники",
+                        "Общий список сотрудников",
+                        [
+                            ("Айдар", "Продажи"),
+                            ("Тимур", "Склад"),
+                            ("Егор", "Финансы"),
+                            ("Алина", "Документы"),
+                        ],
+                    )
+                ]
+            else:
+                panels = [rows_panel("Дата", "Сводка по дате", [("Дата", str(filters["selected_date_label"])), ("Сотрудники", {"day": "24", "yesterday": "24", "week": "24", "month": "24", "custom": "24"}), ("Поставленные задачи", {"day": "12", "yesterday": "9", "week": "38", "month": "114", "custom": "76"}), ("Просроченные задачи", {"day": "14", "yesterday": "17", "week": "39", "month": "62", "custom": "48"})])]
+
+        return {
+            "filters": filters,
+            "workspace_id": "employees-workspace",
+            "section_label": "Сотрудники",
+            "active_tab": active_tab,
+            "active_detail": detail_code,
+            "active_scope": active_scope,
+            "title": title,
+            "description": description,
+            "tabs": tabs,
+            "tab_groups": [{"eyebrow": "Сотрудники", "title": "Разделы сотрудников", "primary": False, "items": tabs}],
+            "block_title": "Разделы сотрудников",
+            "subtabs": subtabs,
+            "metrics": metrics,
+            "panels": panels,
+        }
+
+    def _site_documents_surface_model(
+        selected_date_raw: str | None = None,
+        period_raw: str | None = None,
+        date_from_raw: str | None = None,
+        date_to_raw: str | None = None,
+        tab_raw: str | None = None,
+        detail_raw: str | None = None,
+        scope_raw: str | None = None,
+        request_params: dict[str, str] | None = None,
+    ) -> dict[str, object]:
+        request_params = request_params or {}
+        filters = _site_dashboard_filters(selected_date_raw, period_raw, date_from_raw, date_to_raw)
+        period_code = str(filters["period_code"])
+        period_meta = _site_period_meta(period_code, str(filters["date_from_label"]), str(filters["date_to_label"]))
+        section = _site_section("documents")
+        raw_tabs = list(section.get("document_items", []))
+        allowed_codes = {str(item.get("code")) for item in raw_tabs if item.get("code")}
+        active_tab = str(tab_raw or "quote").strip().lower()
+        if active_tab not in allowed_codes:
+            active_tab = "quote"
+
+        def pick(values: dict[str, str]) -> str:
+            return str(values.get(period_code, values.get("day", "")))
+
+        def metric(label: str, values: dict[str, str], meta: str, tone: str = "default") -> dict[str, str]:
+            return {"label": label, "value": pick(values), "meta": meta, "tone": tone}
+
+        def rows_panel(title: str, subtitle: str, rows: list[tuple[str, object]]) -> dict[str, object]:
+            items = []
+            for row_label, row_value in rows:
+                value = pick(row_value) if isinstance(row_value, dict) else str(row_value)
+                items.append({"label": row_label, "value": value})
+            return {"kind": "rows", "title": title, "subtitle": subtitle, "items": items}
+
+        def chips_panel(title: str, subtitle: str, chips: list[dict[str, object]]) -> dict[str, object]:
+            return {"kind": "chips", "title": title, "subtitle": subtitle, "items": chips}
+
+        def form_panel(title: str, subtitle: str, fields: list[dict[str, object]], button_label: str, period_value: str | None = None) -> dict[str, object]:
+            normalized_fields: list[dict[str, object]] = []
+            for field in fields:
+                field_copy = dict(field)
+                field_name = str(field_copy.get("name") or "")
+                if field_name and str(field_copy.get("type") or "") != "file" and field_name in request_params:
+                    field_copy["value"] = request_params[field_name]
+                normalized_fields.append(field_copy)
+            hidden = [
+                {"name": "tab", "value": active_tab},
+                {"name": "detail", "value": detail_code},
+                {"name": "period", "value": period_value or period_code},
+            ]
+            if active_scope:
+                hidden.append({"name": "scope", "value": active_scope})
+            if (period_value or period_code) == "custom":
+                hidden.append({"name": "date_from", "value": request_params.get("date_from", str(filters["date_from"]))})
+                hidden.append({"name": "date_to", "value": request_params.get("date_to", str(filters["date_to"]))})
+            return {
+                "kind": "form",
+                "title": title,
+                "subtitle": subtitle,
+                "items": normalized_fields,
+                "button_label": button_label,
+                "action": "/site/documents#documents-workspace",
+                "hidden": hidden,
+            }
+
+        def document_form_panel(title: str, subtitle: str, fields: list[dict[str, object]], button_label: str = "Сохранить", period_value: str | None = None) -> dict[str, object]:
+            panel = form_panel(title, subtitle, fields, button_label, period_value)
+            panel["secondary_button_label"] = "Сохранить файл"
+            panel["secondary_button_name"] = "document_action"
+            panel["secondary_button_value"] = "save_file"
+            return panel
+
+        def documents_href(tab_code: str, detail_code_arg: str | None = None, scope_code: str | None = None, period_override: str | None = None) -> str:
+            params: dict[str, str] = {"tab": tab_code, "period": period_override or period_code, "selected_date": str(filters["anchor_date"])}
+            if detail_code_arg:
+                params["detail"] = detail_code_arg
+            if scope_code:
+                params["scope"] = scope_code
+            if params["period"] == "custom":
+                params["date_from"] = str(filters["date_from"])
+                params["date_to"] = str(filters["date_to"])
+            return f"/site/documents?{urlencode(params)}#documents-workspace"
+
+        def build_subtab(label: str, code: str | None = None, target_period: str | None = None, active: bool = False, scope_code: str | None = None) -> dict[str, object]:
+            href = documents_href(active_tab, code or detail_code, scope_code, target_period)
+            return {"label": label, "href": href, "active": active}
+
+        counterparties = DOCUMENT_COUNTERPARTIES
+        statuses = DOCUMENT_STATUSES
+        requisites_scopes = DOCUMENT_REQUISITES_SCOPES
+        goods = DOCUMENT_GOODS
+        detail_code = str(detail_raw or {"requisites": "company", "counterparties": "list", "history": "period"}.get(active_tab, "create")).strip().lower()
+        active_scope = str(scope_raw or "").strip()
+
+        tabs = []
+        for item in raw_tabs:
+            code = str(item.get("code") or "")
+            tabs.append({"code": code, "label": str(item.get("label") or ""), "icon": str(item.get("icon") or ""), "href": documents_href(code), "active": code == active_tab})
+
+        filters["periods"] = [{**item, "href": documents_href(active_tab, detail_code, active_scope or None, str(item["code"]))} for item in list(filters["periods"])]
+
+        title = "Документы"
+        description = ""
+        metrics: list[dict[str, str]] = []
+        panels: list[dict[str, object]] = []
+        subtabs: list[dict[str, object]] = []
+
+        if active_tab in {"quote", "invoice", "contract", "act", "completed_act", "warranty", "claim"}:
+            valid = {"create", "list", "history"}
+            detail_code = detail_code if detail_code in valid else "create"
+            subtabs = [
+                build_subtab("Создать", "create", active=detail_code == "create"),
+                build_subtab("Список", "list", active=detail_code == "list"),
+                build_subtab("История", "history", active=detail_code == "history"),
+            ]
+            title_map = {
+                "quote": "КП",
+                "invoice": "Счета",
+                "contract": "Договоры",
+                "act": "Акты",
+                "completed_act": "Акт выполненных работ",
+                "warranty": "Гарантия",
+                "claim": "Претензии",
+            }
+            title = title_map.get(active_tab, "Документы")
+            description = f"{title} {period_meta['window']}."
+            metrics = [
+                metric(title, {"day": "12", "yesterday": "9", "week": "38", "month": "114", "custom": "76"}, f"документов {period_meta['window']}"),
+                {"label": "Дата", "value": str(filters["selected_date_label"]), "meta": f"активная дата {period_meta['window']}", "tone": "default"},
+                {"label": "Статус", "value": "Черновик", "meta": f"текущий сценарий {period_meta['window']}", "tone": "default"},
+                metric("Подписано", {"day": "4", "yesterday": "3", "week": "16", "month": "48", "custom": "31"}, f"завершено {period_meta['window']}"),
+            ]
+            if detail_code == "create":
+                if active_tab == "invoice":
+                    panels = [
+                        document_form_panel(
+                            "Реквизиты счета",
+                            "От кого и кому выставляется счет",
+                            [
+                                {"label": "Дата", "name": "selected_date", "type": "date", "value": str(filters["selected_date"]), "required": True, "hint": "Дата выставления счета."},
+                                {"label": "От какого контрагента", "name": "issuer_counterparty", "type": "select", "value": counterparties[0], "options": counterparties, "required": True, "hint": "Контрагент, от имени которого выставляется счет."},
+                                {"label": "Кому выставляем", "name": "counterparty", "type": "select", "value": counterparties[1], "options": counterparties, "required": True, "hint": "Контрагент-получатель счета."},
+                                {"label": "Статус", "name": "status", "type": "select", "value": statuses[0], "options": statuses, "hint": "Текущее состояние счета в макете."},
+                            ],
+                            "Сохранить",
+                        ),
+                        rows_panel(
+                            "Позиции счета",
+                            "Добавленные товары, количество и сумма",
+                            [
+                                ("Профиль 60x40", "12 шт. · 7 000 ₽/шт. · 84 000 ₽"),
+                                ("Лист оцинкованный", "8 шт. · 7 000 ₽/шт. · 56 000 ₽"),
+                                ("Комплект крепежа", "20 шт. · 900 ₽/шт. · 18 000 ₽"),
+                            ],
+                        ),
+                        document_form_panel(
+                            "Изменить позицию",
+                            "Количество, цена и итог по выбранному товару",
+                            [
+                                {"label": "Товар", "name": "invoice_line_item", "type": "select", "value": goods[0], "options": goods, "required": True, "hint": "Выбери позицию, которую нужно изменить."},
+                                {"label": "Количество", "name": "invoice_line_quantity", "type": "text", "value": "12 шт.", "required": True, "hint": "Количество по выбранному товару."},
+                                {"label": "Цена за единицу", "name": "invoice_line_price", "type": "text", "value": "7 000 ₽", "required": True, "hint": "Цена одной единицы выбранного товара."},
+                                {"label": "Итого по строке", "name": "invoice_line_amount", "type": "text", "value": "84 000 ₽", "required": True, "hint": "Итог по строке с учетом количества."},
+                            ],
+                            "Сохранить",
+                        ),
+                        document_form_panel(
+                            "Добавить товар",
+                            "Добавление разных товаров в счет",
+                            [
+                                {"label": "Товар", "name": "invoice_new_item", "type": "select", "value": goods[1], "options": goods, "required": True, "hint": "Можно последовательно добавлять разные товары."},
+                                {"label": "Количество", "name": "invoice_new_quantity", "type": "text", "value": "1 шт.", "required": True, "hint": "Количество для новой позиции."},
+                                {"label": "Цена за единицу", "name": "invoice_new_price", "type": "text", "value": "0 ₽", "required": True, "hint": "Цена одной единицы нового товара."},
+                                {"label": "Итого по строке", "name": "invoice_new_amount", "type": "text", "value": "0 ₽", "required": True, "hint": "Итог новой позиции."},
+                            ],
+                            "Сохранить",
+                        ),
+                        rows_panel(
+                            "Итог счета",
+                            "Общий итог по текущим позициям",
+                            [
+                                ("Количество позиций", "3 товара"),
+                                ("Общее количество", "40 шт."),
+                                ("Средняя цена за единицу", "3 950 ₽"),
+                                ("Итоговая сумма", "158 000 ₽"),
+                                ("Получатель", counterparties[1]),
+                            ],
+                        ),
+                    ]
+                else:
+                    panels = [
+                        document_form_panel(
+                            f"Создать {title[:-1] if title.endswith('ы') else title}",
+                            "Заполнение документа",
+                            [
+                                {"label": "Дата", "name": "selected_date", "type": "date", "value": str(filters["selected_date"])},
+                                {"label": "От какого контрагента", "name": "issuer_counterparty", "type": "select", "value": counterparties[0], "options": counterparties},
+                                {"label": "Контрагент", "name": "counterparty", "type": "select", "value": counterparties[0], "options": counterparties},
+                                {"label": "Сумма", "name": "amount", "type": "text", "value": "0 ₽"},
+                                {"label": "Статус", "name": "status", "type": "select", "value": statuses[0], "options": statuses},
+                            ],
+                            "Сохранить",
+                        )
+                    ]
+            elif detail_code == "history":
+                panels = [
+                    rows_panel(
+                        "История",
+                        "Последние действия",
+                        [
+                            ("21.04.2026", f"{title} · Черновик"),
+                            ("20.04.2026", f"{title} · Согласовано"),
+                            ("19.04.2026", f"{title} · Отправлено"),
+                            ("18.04.2026", f"{title} · Подписано"),
+                        ],
+                    )
+                ]
+            else:
+                panels = [
+                    rows_panel(
+                        "Список",
+                        f"Актуальные {title.lower()}",
+                        [
+                            ("СтройИмпульс", "Черновик"),
+                            ("МонтажПро", "Согласовано"),
+                            ("ГородСнаб", "Отправлено"),
+                            ("СеверПроект", "Подписано"),
+                        ],
+                    )
+                ]
+        elif active_tab == "requisites":
+            valid = {"company", "bank", "signatory"}
+            detail_code = detail_code if detail_code in valid else "company"
+            active_scope = active_scope if active_scope in requisites_scopes else requisites_scopes[0]
+            subtabs = [
+                build_subtab("Компания", "company", active=detail_code == "company"),
+                build_subtab("Банк", "bank", active=detail_code == "bank"),
+                build_subtab("Подписант", "signatory", active=detail_code == "signatory"),
+            ]
+            title = "Реквизиты"
+            description = "Карточка реквизитов компании."
+            metrics = [
+                {"label": "Раздел", "value": active_scope, "meta": "текущий блок", "tone": "default"},
+                {"label": "Дата", "value": str(filters["selected_date_label"]), "meta": f"дата изменений {period_meta['window']}", "tone": "default"},
+                {"label": "Статус", "value": "Заполнено", "meta": "макет", "tone": "default"},
+                metric("Версий", {"day": "3", "yesterday": "3", "week": "3", "month": "3", "custom": "3"}, "карточек в макете"),
+            ]
+            panels = [
+                chips_panel("Реквизиты", "Выбор блока", [{"label": item, "href": documents_href("requisites", item, item), "active": item == active_scope} for item in requisites_scopes]),
+                form_panel(
+                    active_scope,
+                    "Заполнение реквизитов",
+                    [
+                        {"label": "Поле 1", "name": "field_primary", "type": "text", "value": "Заполнить"},
+                        {"label": "Поле 2", "name": "field_secondary", "type": "text", "value": "Заполнить"},
+                        {"label": "Дата", "name": "selected_date", "type": "date", "value": str(filters["selected_date"])},
+                    ],
+                    "Сохранить",
+                ),
+            ]
+        elif active_tab == "counterparties":
+            valid = {"add", "import", "list"}
+            detail_code = detail_code if detail_code in valid else "list"
+            subtabs = [
+                build_subtab("Добавить", "add", active=detail_code == "add"),
+                build_subtab("Загрузить импорт", "import", active=detail_code == "import"),
+                build_subtab("Список контрагентов", "list", active=detail_code == "list"),
+            ]
+            title = "Контрагенты"
+            description = f"Карты контрагентов для документов {period_meta['window']}."
+            metrics = [
+                metric("Контрагенты", {"day": "24", "yesterday": "24", "week": "24", "month": "24", "custom": "24"}, f"в базе {period_meta['window']}"),
+                {"label": "Режим", "value": {"add": "Добавление", "import": "Импорт", "list": "Список"}[detail_code], "meta": "текущий блок", "tone": "default"},
+                {"label": "Дата", "value": str(filters["selected_date_label"]), "meta": f"активная дата {period_meta['window']}", "tone": "default"},
+                {"label": "Статус", "value": "Макет", "meta": "дизайн", "tone": "default"},
+            ]
+            if detail_code == "add":
+                panels = [
+                    form_panel(
+                        "Добавить контрагента",
+                        "Карточка контрагента",
+                        [
+                            {"label": "Название", "name": "counterparty_name", "type": "text", "value": "Новый контрагент"},
+                            {"label": "Роль", "name": "counterparty_role", "type": "text", "value": "Поставщик / Исполнитель / Юрлицо"},
+                            {"label": "Реквизиты", "name": "counterparty_requisites", "type": "text", "value": "Заполнить"},
+                            {"label": "Дата", "name": "selected_date", "type": "date", "value": str(filters["selected_date"])},
+                        ],
+                        "Сохранить",
+                    )
+                ]
+            elif detail_code == "import":
+                panels = [
+                    form_panel(
+                        "Загрузить импорт",
+                        "Импорт контрагентов",
+                        [
+                            {"label": "Файл", "name": "counterparty_import_file", "type": "file"},
+                            {"label": "Дата", "name": "selected_date", "type": "date", "value": str(filters["selected_date"])},
+                        ],
+                        "Сохранить",
+                    )
+                ]
+            else:
+                panels = [rows_panel("Список контрагентов", "Текущие контрагенты", [("СтройИмпульс", "Юрлицо"), ("МонтажПро", "Поставщик"), ("ГородСнаб", "Исполнитель"), ("СеверПроект", "Юрлицо")])]
+        else:
+            valid = {"date", "period", "status"}
+            detail_code = detail_code if detail_code in valid else "period"
+            active_scope = active_scope if active_scope in statuses else statuses[0]
+            subtabs = [
+                build_subtab("Дата", "date", active=detail_code == "date"),
+                build_subtab("Период", "period", active=detail_code == "period"),
+                build_subtab("Статус", "status", active=detail_code == "status"),
+                build_subtab("Сегодня", detail_code, target_period="day", active=period_code == "day"),
+                build_subtab("Вчера", detail_code, target_period="yesterday", active=period_code == "yesterday"),
+                build_subtab("Месяц", detail_code, target_period="month", active=period_code == "month"),
+            ]
+            title = "История"
+            description = f"История документов {period_meta['window']}."
+            metrics = [
+                {"label": "Период", "value": str(filters["period_label"]), "meta": f"активно {period_meta['window']}", "tone": "default"},
+                {"label": "Дата", "value": str(filters["selected_date_label"]), "meta": f"срез {period_meta['window']}", "tone": "default"},
+                metric("Документы", {"day": "12", "yesterday": "9", "week": "38", "month": "114", "custom": "76"}, f"в истории {period_meta['window']}"),
+                {"label": "Статус", "value": active_scope, "meta": "текущий фильтр", "tone": "default"},
+            ]
+            if detail_code == "period":
+                panels = [
+                    form_panel(
+                        "Период",
+                        "Выбрать диапазон",
+                        [
+                            {"label": "С", "name": "date_from", "type": "date", "value": str(filters["date_from"])},
+                            {"label": "По", "name": "date_to", "type": "date", "value": str(filters["date_to"])},
+                        ],
+                        "Сохранить",
+                        period_value="custom",
+                    ),
+                    rows_panel("Выбранный период", "Текущий диапазон", [("Период", str(filters["period_label"])), ("С", str(filters["date_from_label"])), ("По", str(filters["date_to_label"])), ("Документы", {"day": "12", "yesterday": "9", "week": "38", "month": "114", "custom": "76"})]),
+                ]
+            elif detail_code == "status":
+                panels = [
+                    chips_panel("Статус", "Фильтр по статусу", [{"label": item, "href": documents_href("history", "status", item), "active": item == active_scope} for item in statuses]),
+                    rows_panel("История", active_scope, [("21.04.2026", active_scope), ("20.04.2026", active_scope), ("19.04.2026", active_scope), ("18.04.2026", active_scope)]),
+                ]
+            else:
+                panels = [rows_panel("Дата", "История по дате", [("Дата", str(filters["selected_date_label"])), ("Документы", {"day": "12", "yesterday": "9", "week": "38", "month": "114", "custom": "76"}), ("Статус", active_scope), ("Контрагент", counterparties[0])])]
+
+        return {
+            "filters": filters,
+            "workspace_id": "documents-workspace",
+            "section_label": "Документы",
+            "active_tab": active_tab,
+            "active_detail": detail_code,
+            "active_scope": active_scope,
+            "title": title,
+            "description": description,
+            "tabs": tabs,
+            "tab_groups": [{"eyebrow": "Документы", "title": "Разделы документов", "primary": False, "items": tabs}],
+            "block_title": "Разделы документов",
+            "subtabs": subtabs,
+            "metrics": metrics,
+            "panels": panels,
+        }
+
+    def _site_kpi_surface_model(
+        selected_date_raw: str | None = None,
+        period_raw: str | None = None,
+        date_from_raw: str | None = None,
+        date_to_raw: str | None = None,
+        tab_raw: str | None = None,
+        detail_raw: str | None = None,
+        scope_raw: str | None = None,
+        request_params: dict[str, str] | None = None,
+    ) -> dict[str, object]:
+        request_params = request_params or {}
+        filters = _site_dashboard_filters(selected_date_raw, period_raw, date_from_raw, date_to_raw)
+        period_code = str(filters["period_code"])
+        period_meta = _site_period_meta(period_code, str(filters["date_from_label"]), str(filters["date_to_label"]))
+        section = _site_section("kpi")
+        raw_tabs = list(section.get("kpi_items", []))
+        allowed_codes = {str(item.get("code")) for item in raw_tabs if item.get("code")}
+        active_tab = str(tab_raw or "summary").strip().lower()
+        if active_tab not in allowed_codes:
+            active_tab = "summary"
+
+        def pick(values: dict[str, str]) -> str:
+            return str(values.get(period_code, values.get("day", "")))
+
+        def metric(label: str, values: dict[str, str], meta: str, tone: str = "default") -> dict[str, str]:
+            return {"label": label, "value": pick(values), "meta": meta, "tone": tone}
+
+        def rows_panel(title: str, subtitle: str, rows: list[tuple[str, object]]) -> dict[str, object]:
+            items = []
+            for row_label, row_value in rows:
+                value = pick(row_value) if isinstance(row_value, dict) else str(row_value)
+                items.append({"label": row_label, "value": value})
+            return {"kind": "rows", "title": title, "subtitle": subtitle, "items": items}
+
+        def form_panel(title: str, subtitle: str, fields: list[dict[str, object]], button_label: str, period_value: str | None = None) -> dict[str, object]:
+            normalized_fields: list[dict[str, object]] = []
+            for field in fields:
+                field_copy = dict(field)
+                field_name = str(field_copy.get("name") or "")
+                if field_name and str(field_copy.get("type") or "") != "file" and field_name in request_params:
+                    field_copy["value"] = request_params[field_name]
+                normalized_fields.append(field_copy)
+            hidden = [
+                {"name": "tab", "value": active_tab},
+                {"name": "detail", "value": detail_code},
+                {"name": "period", "value": period_value or period_code},
+            ]
+            if active_scope:
+                hidden.append({"name": "scope", "value": active_scope})
+            if (period_value or period_code) == "custom":
+                hidden.append({"name": "date_from", "value": request_params.get("date_from", str(filters["date_from"]))})
+                hidden.append({"name": "date_to", "value": request_params.get("date_to", str(filters["date_to"]))})
+            return {
+                "kind": "form",
+                "title": title,
+                "subtitle": subtitle,
+                "items": normalized_fields,
+                "button_label": button_label,
+                "action": "/site/kpi#kpi-workspace",
+                "hidden": hidden,
+            }
+
+        def kpi_href(tab_code: str, detail_code_arg: str | None = None, scope_code: str | None = None, period_override: str | None = None) -> str:
+            params: dict[str, str] = {"tab": tab_code, "period": period_override or period_code, "selected_date": str(filters["anchor_date"])}
+            if detail_code_arg:
+                params["detail"] = detail_code_arg
+            if scope_code:
+                params["scope"] = scope_code
+            if params["period"] == "custom":
+                params["date_from"] = str(filters["date_from"])
+                params["date_to"] = str(filters["date_to"])
+            return f"/site/kpi?{urlencode(params)}#kpi-workspace"
+
+        def build_subtab(label: str, code: str | None = None, target_period: str | None = None, active: bool = False, scope_code: str | None = None) -> dict[str, object]:
+            href = kpi_href(active_tab, code or detail_code, scope_code, target_period)
+            return {"label": label, "href": href, "active": active}
+
+        detail_code = str(
+            detail_raw
+            or {
+                "summary": "period",
+                "plan_fact": "period",
+                "company_goals": "active",
+                "plans": "company",
+                "company": "plan_fact",
+                "departments": "top",
+                "employees": "top",
+            }.get(active_tab, "date")
+        ).strip().lower()
+        active_scope = str(scope_raw or "").strip()
+        tabs = [{"code": str(item.get("code") or ""), "label": str(item.get("label") or ""), "icon": str(item.get("icon") or ""), "href": kpi_href(str(item.get("code") or "")), "active": str(item.get("code") or "") == active_tab} for item in raw_tabs]
+        filters["periods"] = [{**item, "href": kpi_href(active_tab, detail_code, active_scope or None, str(item["code"]))} for item in list(filters["periods"])]
+
+        title = "KPI"
+        description = ""
+        metrics: list[dict[str, str]] = []
+        panels: list[dict[str, object]] = []
+        subtabs: list[dict[str, object]] = []
+        states: list[dict[str, str]] = []
+
+        if active_tab == "summary":
+            valid = {"date", "period"}
+            detail_code = detail_code if detail_code in valid else "period"
+            subtabs = [
+                build_subtab("Дата", "date", active=detail_code == "date"),
+                build_subtab("Период", "period", active=detail_code == "period"),
+                build_subtab("Сегодня", detail_code, target_period="day", active=period_code == "day"),
+                build_subtab("Вчера", detail_code, target_period="yesterday", active=period_code == "yesterday"),
+                build_subtab("Неделя", detail_code, target_period="week", active=period_code == "week"),
+                build_subtab("Месяц", detail_code, target_period="month", active=period_code == "month"),
+            ]
+            title = "Сводка"
+            description = f"KPI-сводка {period_meta['window']}."
+            metrics = [
+                {"label": "Период", "value": str(filters["period_label"]), "meta": f"активно {period_meta['window']}", "tone": "default"},
+                metric("Выполнение плана", {"day": "84%", "yesterday": "81%", "week": "88%", "month": "92%", "custom": "89%"}, f"по компании {period_meta['window']}"),
+                metric("Топ показатель", {"day": "Выручка", "yesterday": "Выручка", "week": "Маржа", "month": "Выручка", "custom": "Маржа"}, f"лучший сигнал {period_meta['window']}"),
+                metric("Антитоп показатель", {"day": "Просрочки", "yesterday": "Просрочки", "week": "CPL", "month": "Просрочки", "custom": "CPL"}, f"главный риск {period_meta['window']}", "danger"),
+            ]
+            states = [
+                {"label": "Что требует решения", "value": "Просрочки", "meta": "главный риск периода", "tone": "danger"},
+                {"label": "Лучший рост", "value": "Выручка", "meta": "сильный сигнал периода", "tone": "success"},
+                {"label": "Под давлением", "value": "CPL", "meta": "нужно перепроверить", "tone": "warning"},
+                {"label": "Следующий шаг", "value": "Открыть антитопы", "meta": "быстрый переход к проблемам", "tone": "default"},
+            ]
+            if detail_code == "period":
+                panels = [
+                    form_panel(
+                        "Период",
+                        "Выбрать диапазон",
+                        [
+                            {"label": "С", "name": "date_from", "type": "date", "value": str(filters["date_from"])},
+                            {"label": "По", "name": "date_to", "type": "date", "value": str(filters["date_to"])},
+                        ],
+                        "Сохранить",
+                        period_value="custom",
+                    ),
+                    rows_panel("Сводка", "Ключевые данные для решения", [("С", str(filters["date_from_label"])), ("По", str(filters["date_to_label"])), ("Выполнение плана", {"day": "84%", "yesterday": "81%", "week": "88%", "month": "92%", "custom": "89%"}), ("Топ", {"day": "Выручка", "yesterday": "Выручка", "week": "Маржа", "month": "Выручка", "custom": "Маржа"}), ("Антитоп", {"day": "Просрочки", "yesterday": "Просрочки", "week": "CPL", "month": "Просрочки", "custom": "CPL"})]),
+                    rows_panel("Что требует решения", "Критичные сигналы периода", [("Просрочки", "+14 задач"), ("CPL", "+18% к норме"), ("Документы", "задержка 2 дня"), ("Егор", "63% выполнения")]),
+                ]
+            else:
+                panels = [
+                    rows_panel("Дата", "Срез по дате", [("Дата", str(filters["selected_date_label"])), ("Выполнение плана", {"day": "84%", "yesterday": "81%", "week": "88%", "month": "92%", "custom": "89%"}), ("Топ", {"day": "Выручка", "yesterday": "Выручка", "week": "Маржа", "month": "Выручка", "custom": "Маржа"}), ("Антитоп", {"day": "Просрочки", "yesterday": "Просрочки", "week": "CPL", "month": "Просрочки", "custom": "CPL"})]),
+                    rows_panel("Что требует решения", "Критичные сигналы по дате", [("Просрочки", "+14 задач"), ("CPL", "+18% к норме"), ("Документы", "задержка 2 дня"), ("Егор", "63% выполнения")]),
+                ]
+        elif active_tab == "plan_fact":
+            valid = {"date", "period"}
+            detail_code = detail_code if detail_code in valid else "period"
+            subtabs = [
+                build_subtab("Дата", "date", active=detail_code == "date"),
+                build_subtab("Период", "period", active=detail_code == "period"),
+                build_subtab("Сегодня", detail_code, target_period="day", active=period_code == "day"),
+                build_subtab("Вчера", detail_code, target_period="yesterday", active=period_code == "yesterday"),
+                build_subtab("Неделя", detail_code, target_period="week", active=period_code == "week"),
+                build_subtab("Месяц", detail_code, target_period="month", active=period_code == "month"),
+            ]
+            title = "План/факт"
+            description = f"План и факт по главным KPI {period_meta['window']}."
+            metrics = [
+                metric("Выручка", {"day": "84%", "yesterday": "81%", "week": "88%", "month": "92%", "custom": "89%"}, f"исполнение плана {period_meta['window']}"),
+                metric("Маржа", {"day": "92%", "yesterday": "90%", "week": "94%", "month": "97%", "custom": "95%"}, f"исполнение плана {period_meta['window']}"),
+                metric("Cashflow", {"day": "88%", "yesterday": "84%", "week": "91%", "month": "94%", "custom": "92%"}, f"исполнение плана {period_meta['window']}"),
+                metric("Просрочки", {"day": "140% нормы", "yesterday": "152% нормы", "week": "126% нормы", "month": "118% нормы", "custom": "123% нормы"}, f"контроль {period_meta['window']}", "danger"),
+            ]
+            if detail_code == "period":
+                panels = [
+                    form_panel(
+                        "Период",
+                        "Выбрать диапазон",
+                        [
+                            {"label": "С", "name": "date_from", "type": "date", "value": str(filters["date_from"])},
+                            {"label": "По", "name": "date_to", "type": "date", "value": str(filters["date_to"])},
+                        ],
+                        "Сохранить",
+                        period_value="custom",
+                    ),
+                    rows_panel("План/факт", "Главные показатели периода", [("Выручка", "План 30 млн ₽ / Факт 27.6 млн ₽"), ("Маржа", "План 21% / Факт 20.4%"), ("Cashflow", "План 4.5 млн ₽ / Факт 4.1 млн ₽"), ("Просрочки", "План до 10 / Факт 14")]),
+                ]
+            else:
+                panels = [
+                    rows_panel("Дата", "Срез plan/fact по дате", [("Дата", str(filters["selected_date_label"])), ("Выручка", "План 1.48 млн ₽ / Факт 1.24 млн ₽"), ("Маржа", "План 20% / Факт 18.4%"), ("Cashflow", "План 240 тыс ₽ / Факт 214 тыс ₽"), ("Просрочки", "План до 10 / Факт 14")]),
+                ]
+        elif active_tab == "company_goals":
+            valid = {"active", "risk", "done"}
+            detail_code = detail_code if detail_code in valid else "active"
+            goal_scope_tabs = list(zip(KPI_GOAL_STATES, ["active", "risk", "done"]))
+            subtabs = [
+                build_subtab(label, code, active=detail_code == code) for label, code in goal_scope_tabs
+            ]
+            title = "Цели компании"
+            description = f"Цели компании и их статус {period_meta['window']}."
+            metrics = [
+                metric("Активные цели", {"day": "6", "yesterday": "6", "week": "6", "month": "6", "custom": "6"}, f"в работе {period_meta['window']}"),
+                metric("Под риском", {"day": "2", "yesterday": "2", "week": "3", "month": "2", "custom": "2"}, f"нужен контроль {period_meta['window']}", "warning"),
+                metric("Выполнено", {"day": "1", "yesterday": "1", "week": "2", "month": "4", "custom": "3"}, f"закрыто {period_meta['window']}", "success"),
+                metric("Главная цель", {"day": "Выручка", "yesterday": "Выручка", "week": "Маржа", "month": "Выручка", "custom": "Выручка"}, f"фокус {period_meta['window']}"),
+            ]
+            if detail_code == "risk":
+                panels = [rows_panel("Под риском", "Цели, которые требуют внимания", [("Выручка", "ниже плана на 8%"), ("Просрочки", "выше нормы на 4 задачи"), ("Маржа", "ниже плана на 0.6 п.п."), ("Cashflow", "ниже плана на 9%")])]
+            elif detail_code == "done":
+                panels = [rows_panel("Выполнено", "Закрытые цели", [("Средний чек", "цель достигнута"), ("Конверсия", "выше плана"), ("Срок реакции", "норма выполнена"), ("Документы", "очередь разгружена")])]
+            else:
+                panels = [rows_panel("Активные цели", "Основные цели компании", [("Выручка", "План 30 млн ₽"), ("Маржа", "План 21%"), ("Cashflow", "План +4.5 млн ₽"), ("Просрочки", "Не выше 10"), ("Скорость реакции", "До 1.5 ч")])]
+        elif active_tab == "plans":
+            valid = {"company", "departments", "employees"}
+            detail_code = detail_code if detail_code in valid else "company"
+            plan_scope_tabs = list(zip(KPI_PLAN_SCOPES, ["company", "departments", "employees"]))
+            subtabs = [
+                build_subtab(label, code, active=detail_code == code) for label, code in plan_scope_tabs
+            ]
+            title = "Планы"
+            description = f"Планы по компании, отделам и сотрудникам {period_meta['window']}."
+            metrics = [
+                metric("Планов в работе", {"day": "12", "yesterday": "12", "week": "18", "month": "24", "custom": "19"}, f"в контуре {period_meta['window']}"),
+                metric("Компания", {"day": "4", "yesterday": "4", "week": "4", "month": "4", "custom": "4"}, f"верхний уровень {period_meta['window']}"),
+                metric("Отделы", {"day": "6", "yesterday": "6", "week": "8", "month": "10", "custom": "8"}, f"по отделам {period_meta['window']}"),
+                metric("Сотрудники", {"day": "24", "yesterday": "24", "week": "24", "month": "24", "custom": "24"}, f"личные планы {period_meta['window']}"),
+            ]
+            if detail_code == "departments":
+                panels = [rows_panel("Планы отделов", "Планы на уровне отделов", [("Продажи", "Выручка 12 млн ₽"), ("Маркетинг", "CPL до 1 350 ₽"), ("Склад", "Просрочки приемки не выше 3"), ("Документы", "Закрывать акты до 24 ч")])]
+            elif detail_code == "employees":
+                panels = [rows_panel("Планы сотрудников", "Личные планы команды", [("Айдар", "Выручка 4.8 млн ₽"), ("Тимур", "KPI 88%"), ("Егор", "Просрочки до 3"), ("Алина", "Закрытие документов до 24 ч")])]
+            else:
+                panels = [rows_panel("Планы компании", "Верхнеуровневые планы", [("Выручка", "30 млн ₽"), ("Маржа", "21%"), ("Cashflow", "+4.5 млн ₽"), ("Просрочки", "до 10"), ("Скорость реакции", "до 1.5 ч")])]
+        elif active_tab == "top":
+            title = "Топы"
+            description = f"Лучшие показатели для принятия решений {period_meta['window']}."
+            metrics = [
+                metric("Топ 1", {"day": "Выручка", "yesterday": "Выручка", "week": "Маржа", "month": "Выручка", "custom": "Маржа"}, f"лидер {period_meta['window']}"),
+                metric("Топ 2", {"day": "Средний чек", "yesterday": "Средний чек", "week": "Конверсия", "month": "Средний чек", "custom": "Конверсия"}, f"сильный сигнал {period_meta['window']}"),
+                metric("Топ отдел", {"day": "Продажи", "yesterday": "Продажи", "week": "Продажи", "month": "Продажи", "custom": "Продажи"}, f"по результату {period_meta['window']}"),
+                metric("Топ сотрудник", {"day": "Айдар", "yesterday": "Айдар", "week": "Тимур", "month": "Айдар", "custom": "Тимур"}, f"по KPI {period_meta['window']}"),
+            ]
+            panels = [rows_panel("Топы", "Что тянет результат вверх", [("Выручка", "+12% к плану"), ("Средний чек", "+9% к плану"), ("Продажи", "+8% к плану"), ("Айдар", "94% выполнения")])]
+        elif active_tab == "anti_top":
+            title = "Антитопы"
+            description = f"Слабые места для принятия решений {period_meta['window']}."
+            metrics = [
+                metric("Антитоп 1", {"day": "Просрочки", "yesterday": "Просрочки", "week": "CPL", "month": "Просрочки", "custom": "CPL"}, f"главный риск {period_meta['window']}", "danger"),
+                metric("Антитоп 2", {"day": "Склад", "yesterday": "Склад", "week": "Документы", "month": "Склад", "custom": "Документы"}, f"узкое место {period_meta['window']}", "warning"),
+                metric("Антитоп отдел", {"day": "Документы", "yesterday": "Документы", "week": "Маркетинг", "month": "Документы", "custom": "Маркетинг"}, f"просадка {period_meta['window']}", "danger"),
+                metric("Антитоп сотрудник", {"day": "Егор", "yesterday": "Егор", "week": "Алина", "month": "Егор", "custom": "Алина"}, f"нужен контроль {period_meta['window']}", "danger"),
+            ]
+            panels = [rows_panel("Антитопы", "Что требует решения", [("Просрочки", "+14 задач"), ("CPL", "+18% к норме"), ("Документы", "задержка 2 дня"), ("Егор", "63% выполнения")])]
+        elif active_tab == "company":
+            valid = {"plan_fact", "goals", "signals"}
+            detail_code = detail_code if detail_code in valid else "plan_fact"
+            subtabs = [
+                build_subtab("Plan/fact", "plan_fact", active=detail_code == "plan_fact"),
+                build_subtab("Цели", "goals", active=detail_code == "goals"),
+                build_subtab("Сигналы", "signals", active=detail_code == "signals"),
+            ]
+            title = "Компания"
+            description = f"Компания и отклонения {period_meta['window']}."
+            metrics = [
+                metric("Plan/fact", {"day": "84%", "yesterday": "81%", "week": "88%", "month": "92%", "custom": "89%"}, f"по компании {period_meta['window']}"),
+                metric("Выручка", {"day": "1.24 млн ₽", "yesterday": "1.08 млн ₽", "week": "6.84 млн ₽", "month": "27.6 млн ₽", "custom": "19.4 млн ₽"}, f"факт {period_meta['window']}"),
+                metric("Маржа", {"day": "18.4%", "yesterday": "17.1%", "week": "19.6%", "month": "21.3%", "custom": "20.4%"}, f"факт {period_meta['window']}"),
+                metric("Просрочки", {"day": "14", "yesterday": "17", "week": "39", "month": "62", "custom": "48"}, f"контроль {period_meta['window']}", "danger"),
+            ]
+            if detail_code == "goals":
+                panels = [rows_panel("Цели", "Цели компании", [("Выручка", "План 30 млн ₽"), ("Маржа", "План 21%"), ("Cashflow", "План +4.5 млн ₽"), ("Просрочки", "Не выше 10")])]
+            elif detail_code == "signals":
+                panels = [rows_panel("Сигналы", "Что важно проверить", [("Выручка", "ниже плана на 8%"), ("Маржа", "ниже плана на 1.4 п.п."), ("Просрочки", "выше нормы"), ("CPL", "растет вторую неделю")])]
+            else:
+                panels = [rows_panel("Plan/fact", "Компания", [("Выручка", "84%"), ("Маржа", "92%"), ("Cashflow", "88%"), ("Просрочки", "140% нормы")])]
+        elif active_tab == "departments":
+            valid = {"top", "anti_top", "plan_fact"}
+            detail_code = detail_code if detail_code in valid else "top"
+            subtabs = [
+                build_subtab("Топы", "top", active=detail_code == "top"),
+                build_subtab("Антитопы", "anti_top", active=detail_code == "anti_top"),
+                build_subtab("Plan/fact", "plan_fact", active=detail_code == "plan_fact"),
+            ]
+            title = "Отделы"
+            description = f"Срез по отделам {period_meta['window']}."
+            metrics = [
+                metric("Лучший отдел", {"day": "Продажи", "yesterday": "Продажи", "week": "Продажи", "month": "Продажи", "custom": "Продажи"}, f"по KPI {period_meta['window']}"),
+                metric("Слабый отдел", {"day": "Документы", "yesterday": "Документы", "week": "Маркетинг", "month": "Документы", "custom": "Маркетинг"}, f"по KPI {period_meta['window']}", "danger"),
+                metric("Среднее выполнение", {"day": "82%", "yesterday": "80%", "week": "86%", "month": "90%", "custom": "87%"}, f"по отделам {period_meta['window']}"),
+                metric("Риск", {"day": "Приемка", "yesterday": "Приемка", "week": "Документы", "month": "Приемка", "custom": "Документы"}, f"узкое место {period_meta['window']}", "warning"),
+            ]
+            if detail_code == "anti_top":
+                panels = [rows_panel("Антитопы отделов", "Что проседает", [("Документы", "71%"), ("Маркетинг", "74%"), ("Склад", "78%"), ("Финансы", "81%")])]
+            elif detail_code == "plan_fact":
+                panels = [rows_panel("Plan/fact отделов", "По отделам", [("Продажи", "94%"), ("Склад", "83%"), ("Финансы", "81%"), ("Документы", "71%")])]
+            else:
+                panels = [rows_panel("Топы отделов", "Что тянет результат", [("Продажи", "94%"), ("Склад", "83%"), ("Финансы", "81%"), ("Маркетинг", "79%")])]
+        else:
+            valid = {"top", "anti_top", "plan_fact"}
+            detail_code = detail_code if detail_code in valid else "top"
+            subtabs = [
+                build_subtab("Топы", "top", active=detail_code == "top"),
+                build_subtab("Антитопы", "anti_top", active=detail_code == "anti_top"),
+                build_subtab("Plan/fact", "plan_fact", active=detail_code == "plan_fact"),
+            ]
+            title = "Сотрудники"
+            description = f"KPI по сотрудникам {period_meta['window']}."
+            metrics = [
+                metric("Топ сотрудник", {"day": "Айдар", "yesterday": "Айдар", "week": "Тимур", "month": "Айдар", "custom": "Тимур"}, f"по KPI {period_meta['window']}"),
+                metric("Антитоп сотрудник", {"day": "Егор", "yesterday": "Егор", "week": "Алина", "month": "Егор", "custom": "Алина"}, f"по KPI {period_meta['window']}", "danger"),
+                metric("Среднее выполнение", {"day": "79%", "yesterday": "77%", "week": "84%", "month": "88%", "custom": "85%"}, f"по людям {period_meta['window']}"),
+                metric("Риск", {"day": "Просрочки", "yesterday": "Просрочки", "week": "Реакция", "month": "Просрочки", "custom": "Реакция"}, f"причина просадки {period_meta['window']}", "warning"),
+            ]
+            if detail_code == "anti_top":
+                panels = [rows_panel("Антитоп сотрудников", "Кого проверить", [("Егор", "63%"), ("Алина", "68%"), ("Тимур", "74%"), ("Ирина", "76%")])]
+            elif detail_code == "plan_fact":
+                panels = [rows_panel("Plan/fact сотрудников", "По сотрудникам", [("Айдар", "94%"), ("Тимур", "88%"), ("Алина", "68%"), ("Егор", "63%")])]
+            else:
+                panels = [rows_panel("Топ сотрудников", "Кто тянет результат", [("Айдар", "94%"), ("Тимур", "88%"), ("Ирина", "84%"), ("Никита", "81%")])]
+
+        return {
+            "filters": filters,
+            "workspace_id": "kpi-workspace",
+            "section_label": "KPI",
+            "active_tab": active_tab,
+            "active_detail": detail_code,
+            "active_scope": active_scope,
+            "title": title,
+            "description": description,
+            "context_line": "Топы, антитопы и сигналы для принятия решений.",
+            "tabs": tabs,
+            "tab_groups": [{"eyebrow": "KPI", "title": "Разделы KPI", "primary": False, "items": tabs}],
+            "block_title": "Разделы KPI",
+            "subtabs": subtabs,
+            "states": states,
+            "metrics": metrics,
+            "panels": panels,
+        }
+
+    def _site_integrations_surface_model(
+        selected_date_raw: str | None = None,
+        period_raw: str | None = None,
+        date_from_raw: str | None = None,
+        date_to_raw: str | None = None,
+        tab_raw: str | None = None,
+        detail_raw: str | None = None,
+        scope_raw: str | None = None,
+        request_params: dict[str, str] | None = None,
+        session: Session | None = None,
+        runtime: ResolvedRuntimeContext | None = None,
+        csrf_token: str | None = None,
+        avito_oauth_state: str | None = None,
+    ) -> dict[str, object]:
+        request_params = request_params or {}
+        avito_scope_normalized = ",".join(
+            item for item in re.split(r"[\s,]+", str(settings.avito_oauth_scope or "").strip()) if item
+        )
+        telegram_refresh_id_raw = str(request_params.get("telegram_refresh_id") or "").strip()
+        telegram_refresh_id = int(telegram_refresh_id_raw) if telegram_refresh_id_raw.isdigit() else None
+        filters = _site_dashboard_filters(selected_date_raw, period_raw, date_from_raw, date_to_raw)
+        period_code = str(filters["period_code"])
+        section = _site_section("integrations")
+        raw_tabs = list(section.get("integration_items", []))
+        allowed_codes = {str(item.get("code")) for item in raw_tabs if item.get("code")}
+        active_tab = str(tab_raw or "telegram").strip().lower()
+        if active_tab not in allowed_codes:
+            active_tab = "telegram"
+        persist_enabled = True
+
+        def rows_panel(title: str, subtitle: str, rows: list[tuple[str, object]], note: str | None = None) -> dict[str, object]:
+            panel = {"kind": "rows", "title": title, "subtitle": subtitle, "items": [{"label": row_label, "value": str(row_value)} for row_label, row_value in rows]}
+            if note:
+                panel["note"] = note
+            return panel
+
+        def qr_cards_panel(title: str, subtitle: str, cards: list[dict[str, str]], note: str | None = None) -> dict[str, object]:
+            panel = {"kind": "qr_cards", "title": title, "subtitle": subtitle, "items": cards}
+            if note:
+                panel["note"] = note
+            return panel
+
+        def form_panel(
+            title: str,
+            subtitle: str,
+            fields: list[dict[str, object]],
+            button_label: str,
+            note: str | None = None,
+            *,
+            action: str | None = None,
+            method: str | None = None,
+            button_name: str | None = None,
+            button_value: str | None = None,
+            secondary_button_label: str | None = None,
+            secondary_button_name: str | None = None,
+            secondary_button_value: str | None = None,
+            hidden_fields: list[dict[str, object]] | None = None,
+        ) -> dict[str, object]:
+            normalized_fields: list[dict[str, object]] = []
+            for field in fields:
+                field_copy = dict(field)
+                field_name = str(field_copy.get("name") or "")
+                if field_name and str(field_copy.get("type") or "") != "file" and field_name in request_params:
+                    field_copy["value"] = request_params[field_name]
+                normalized_fields.append(field_copy)
+            panel = {
+                "kind": "form",
+                "title": title,
+                "subtitle": subtitle,
+                "items": normalized_fields,
+                "button_label": button_label,
+                "action": action or ("/site/integrations/save" if persist_enabled else "/site/integrations#integrations-workspace"),
+                "method": method or ("post" if persist_enabled else "get"),
+                "hidden": [
+                    {"name": "tab", "value": active_tab},
+                    {"name": "detail", "value": detail_code},
+                    {"name": "period", "value": period_code},
+                    {"name": "selected_date", "value": str(filters["anchor_date"])},
+                ],
+            }
+            if period_code == "custom":
+                panel["hidden"].append({"name": "date_from", "value": str(filters["date_from"])})
+                panel["hidden"].append({"name": "date_to", "value": str(filters["date_to"])})
+            if csrf_token:
+                panel["hidden"].append({"name": "csrf_token", "value": csrf_token})
+            if hidden_fields:
+                for field in hidden_fields:
+                    field_name = str(field.get("name") or "").strip()
+                    if not field_name:
+                        continue
+                    panel["hidden"].append({"name": field_name, "value": str(field.get("value") or "")})
+            if button_name:
+                panel["button_name"] = button_name
+            if button_value:
+                panel["button_value"] = button_value
+            if secondary_button_label:
+                panel["secondary_button_label"] = secondary_button_label
+            if secondary_button_name:
+                panel["secondary_button_name"] = secondary_button_name
+            if secondary_button_value:
+                panel["secondary_button_value"] = secondary_button_value
+            if note:
+                panel["note"] = note
+            return panel
+
+        def integrations_href(tab_code: str, detail_code_arg: str | None = None) -> str:
+            params: dict[str, str] = {"tab": tab_code, "period": period_code, "selected_date": str(filters["anchor_date"])}
+            if detail_code_arg:
+                params["detail"] = detail_code_arg
+            if period_code == "custom":
+                params["date_from"] = str(filters["date_from"])
+                params["date_to"] = str(filters["date_to"])
+            return f"/site/integrations?{urlencode(params)}#integrations-workspace"
+
+        def build_subtab(label: str, code: str, active: bool) -> dict[str, object]:
+            return {"label": label, "href": integrations_href(active_tab, code), "active": active}
+
+        def current_integration_id(service_code: str) -> int | None:
+            setup = current_setup_by_service.get(service_code) or {}
+            integration = setup.get("integration") if isinstance(setup, dict) else None
+            integration_id = getattr(integration, "id", None)
+            return int(integration_id) if isinstance(integration_id, int) else None
+
+        detail_code = str(detail_raw or {"telegram": "app", "max": "qr", "avito": "login", "moysklad": "api", "bank": "api"}.get(active_tab, "api")).strip().lower()
+        active_scope = str(scope_raw or "").strip()
+        tabs = [{"code": str(item.get("code") or ""), "label": str(item.get("label") or ""), "icon": str(item.get("icon") or ""), "href": integrations_href(str(item.get("code") or "")), "active": str(item.get("code") or "") == active_tab} for item in raw_tabs]
+        filters["periods"] = [{**item, "href": integrations_href(active_tab, detail_code)} for item in list(filters["periods"])]
+
+        title = "Интеграции"
+        description = ""
+        metrics: list[dict[str, str]] = []
+        panels: list[dict[str, object]] = []
+        subtabs: list[dict[str, object]] = []
+        states: list[dict[str, str]] = []
+        context_line = ""
+
+        service_profiles = {
+            "telegram": {"label": "Telegram", "status": "Подключено частично", "status_tone": "warning", "sync": "Сегодня 12:40", "primary": "Telegram 1", "filled": "0 из 1 аккаунтов подключены", "next": "Добавить аккаунт и отсканировать QR"},
+            "max": {"label": "MAX", "status": "Черновик", "status_tone": "warning", "sync": "Сегодня 11:25", "primary": "MAX 1", "filled": "QR и API key заведены", "next": "Добавить API secret"},
+            "avito": {"label": "Авито", "status": "Не подключено", "status_tone": "warning", "sync": "Нет данных", "primary": "Avito 1", "filled": "Данные подключения не заполнены", "next": "Нажать 'Подключить Авито'"},
+            "moysklad": {"label": "МойСклад", "status": "Требует данные", "status_tone": "warning", "sync": "Сегодня 10:18", "primary": "МойСклад 1", "filled": "данные подключения заполнены частично", "next": "Добавить данные доступа"},
+            "bank": {"label": "Банк", "status": "Ошибка авторизации", "status_tone": "danger", "sync": "Сегодня 09:42", "primary": "Банк 1", "filled": "API key и secret добавлены", "next": "Перепроверить банковские ключи"},
+        }
+
+        service_label_to_code = {
+            "Telegram": "telegram",
+            "MAX": "max",
+            "Avito": "avito",
+            "Авито": "avito",
+            "МойСклад": "moysklad",
+            "Банк": "bank",
+        }
+        provider_bindings = {
+            "telegram": {"provider_kind": "messaging", "provider_name": "telegram"},
+            "avito": {"provider_kind": "ads", "provider_name": "avito"},
+            "moysklad": {"provider_kind": "erp", "provider_name": "moysklad"},
+            "bank": {"provider_kind": "banking", "provider_name": "generic_bank"},
+        }
+        real_account_rows: dict[str, list[tuple[str, object]]] = {}
+        real_account_options: dict[str, list[str]] = {}
+        real_account_qr_cards: dict[str, list[dict[str, str]]] = {}
+        current_setup_by_service: dict[str, dict[str, object]] = {}
+        current_settings_by_service: dict[str, dict[str, object]] = {}
+
+        def integration_field_value(service_code: str, field_name: str, fallback: str) -> str:
+            setup = current_setup_by_service.get(service_code) or {}
+            masked = setup.get("masked_credentials") if isinstance(setup, dict) else {}
+            masked = masked if isinstance(masked, dict) else {}
+            settings_payload = current_settings_by_service.get(service_code) or {}
+            settings_payload = settings_payload if isinstance(settings_payload, dict) else {}
+            field_map = {
+                "avito_api_key": str(masked.get("access_token") or ""),
+                "avito_api_secret": str(masked.get("client_secret") or masked.get("access_token") or ""),
+                "avito_account_external_id": str(masked.get("account_external_id") or settings_payload.get("avito_account_external_id") or ""),
+                "moysklad_api_key": str(masked.get("login") or ""),
+                "moysklad_api_secret": str(masked.get("password") or ""),
+                "bank_api_key": str(masked.get("access_token") or ""),
+                "bank_api_secret": str(masked.get("client_secret") or masked.get("access_token") or ""),
+            }
+            value = field_map.get(field_name)
+            if value:
+                return value
+            return fallback
+
+        def _integration_dt_label(value: datetime | None) -> str:
+            if value is None:
+                return "Нет данных"
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=timezone.utc)
+            return value.astimezone(timezone.utc).strftime("%d.%m.%Y %H:%M")
+
+        def _integration_row_status(integration: Integration, *, has_credentials: bool, latest_sync_label: str | None = None) -> str:
+            parts: list[str] = []
+            if integration.status == "active":
+                parts.append("Подключен")
+            elif integration.status == "disabled":
+                parts.append("Отключен")
+            elif integration.status == "archived":
+                parts.append("В архиве")
+            else:
+                parts.append(str(integration.status or "Неизвестно").capitalize())
+            if not has_credentials:
+                parts.append("нет данных подключения")
+            if latest_sync_label:
+                parts.append(f"синхронизация {latest_sync_label}")
+            elif integration.provider_kind == "messaging" and integration.last_webhook_at is not None:
+                parts.append(f"webhook {_integration_dt_label(integration.last_webhook_at)}")
+            else:
+                parts.append("без синхронизации")
+            return " · ".join(parts)
+
+        if session is not None and runtime is not None and (
+            "*" in runtime.permissions or "integrations.manage" in runtime.permissions
+        ):
+            integration_service = RuntimeIntegrationService(session)
+            admin_query = AdminQueryService(session)
+            integrations = integration_service.list_integrations(runtime.context)
+            sync_rows = {
+                int(item["integration"].id): item
+                for item in admin_query.integration_sync_status(runtime.account.id)
+                if item.get("integration") is not None
+            }
+            for service_code, binding in provider_bindings.items():
+                matching = [
+                    item
+                    for item in integrations
+                    if item.provider_kind == binding["provider_kind"] and item.provider_name == binding["provider_name"]
+                    and item.status != "archived"
+                ]
+                if not matching:
+                    service_profiles[service_code].update(
+                        {
+                            "status": "Не подключено",
+                            "status_tone": "warning",
+                            "sync": "Нет данных",
+                            "primary": "Не выбран",
+                            "filled": "подключений еще нет",
+                            "next": "Добавить первую интеграцию",
+                        }
+                    )
+                    real_account_rows[service_code] = [(service_profiles[service_code]["label"], "Подключений пока нет")]
+                    real_account_options[service_code] = ["Нет подключений"]
+                    continue
+
+                setup_by_id: dict[int, dict[str, object]] = {}
+                for integration in matching:
+                    try:
+                        setup_by_id[integration.id] = integration_service.integration_setup_payload(
+                            runtime.context,
+                            integration_id=integration.id,
+                        )
+                    except TenantContextError:
+                        setup_by_id[integration.id] = {}
+
+                active_first = sorted(
+                    matching,
+                    key=lambda item: (
+                        0 if isinstance(item.settings_json, dict) and item.settings_json.get("is_primary") else 1,
+                        0 if item.status == "active" else 1,
+                        0 if item.status == "disabled" else 1,
+                        item.id,
+                    ),
+                )
+                primary_integration = active_first[0]
+                primary_label = str(primary_integration.display_name or service_profiles[service_code]["label"])
+                current_setup_by_service[service_code] = setup_by_id.get(primary_integration.id) or {}
+                current_settings_by_service[service_code] = (
+                    dict(primary_integration.settings_json) if isinstance(primary_integration.settings_json, dict) else {}
+                )
+                real_account_options[service_code] = [
+                    str(item.display_name or f"{service_profiles[service_code]['label']} {index + 1}")
+                    for index, item in enumerate(active_first)
+                ]
+
+                ready_count = 0
+                active_count = 0
+                latest_success_at: datetime | None = None
+                latest_failure_at: datetime | None = None
+                latest_failure_message: str | None = None
+                rows: list[tuple[str, object]] = []
+                for index, integration in enumerate(active_first):
+                    if integration.status == "active":
+                        active_count += 1
+                    setup = setup_by_id.get(integration.id) or {}
+                    provider_spec = _provider_spec(integration.provider_kind, integration.provider_name)
+                    credential_health = _integration_credential_health(provider_spec, setup)
+                    masked_credentials = setup.get("masked_credentials")
+                    has_credentials = isinstance(masked_credentials, dict) and len(masked_credentials) > 0
+                    if credential_health["status"] == "healthy":
+                        ready_count += 1
+                    sync_row = sync_rows.get(int(integration.id)) or {}
+                    latest_success = sync_row.get("latest_success")
+                    latest_failure = sync_row.get("latest_failure")
+                    success_dt = latest_success.finished_at if latest_success is not None else integration.last_sync_at
+                    failure_dt = latest_failure.finished_at if latest_failure is not None else None
+                    if success_dt is not None and (latest_success_at is None or success_dt > latest_success_at):
+                        latest_success_at = success_dt
+                    if failure_dt is not None and (latest_failure_at is None or failure_dt > latest_failure_at):
+                        latest_failure_at = failure_dt
+                        latest_failure_message = _human_sync_error(latest_failure) or str(latest_failure.error_message or "").strip() or "Ошибка синхронизации"
+                    row_label = str(integration.display_name or f"{service_profiles[service_code]['label']} {index + 1}")
+                    row_suffix = ""
+                    if has_credentials and credential_health["missing_required"]:
+                        row_suffix = f" · не хватает: {', '.join(str(item) for item in credential_health['missing_required'])}"
+                    rows.append(
+                        (
+                            row_label,
+                            _integration_row_status(
+                                integration,
+                                has_credentials=has_credentials,
+                                latest_sync_label=_integration_dt_label(success_dt) if success_dt is not None else None,
+                            ) + row_suffix,
+                        )
+                    )
+                real_account_rows[service_code] = rows
+                if service_code == "telegram":
+                    qr_cards: list[dict[str, str]] = []
+                    for integration in active_first:
+                        if integration.status == "archived":
+                            continue
+                        manager_snapshot = telegram_qr_login_manager.snapshot(integration.id)
+                        should_issue_qr = False
+                        if runtime is not None and session is not None:
+                            if telegram_refresh_id == integration.id:
+                                should_issue_qr = True
+                            else:
+                                setup_payload = setup_by_id.get(integration.id)
+                                masked_credentials = setup_payload.get("masked_credentials") if isinstance(setup_payload, dict) else {}
+                                masked_credentials = masked_credentials if isinstance(masked_credentials, dict) else {}
+                                has_session_string = bool(masked_credentials.get("session_string"))
+                                if not has_session_string and manager_snapshot.state == "idle":
+                                    should_issue_qr = True
+                        if should_issue_qr:
+                            try:
+                                qr_state = asyncio.run(_refresh_telegram_qr_login(runtime, session, integration.id))
+                            except Exception:
+                                qr_state = _telegram_connection_payload(
+                                    integration,
+                                    manager_snapshot=manager_snapshot,
+                                    setup=setup_by_id.get(integration.id),
+                                )
+                        else:
+                            qr_state = _telegram_connection_payload(
+                                integration,
+                                manager_snapshot=manager_snapshot,
+                                setup=setup_by_id.get(integration.id),
+                            )
+                        account_label = str(integration.display_name or "Telegram аккаунт")
+                        qr_cards.append(
+                            {
+                                "label": account_label,
+                                "value": str(qr_state.get("message") or "Подключение Telegram"),
+                                "image_url": str(qr_state.get("qr_image_data_uri") or ""),
+                                "status": "подключен" if qr_state.get("connected") else "ожидает вход" if qr_state.get("pending") else "не подключен",
+                                "status_url": f"/site/integrations/telegram/{integration.id}/qr",
+                                "refresh_url": f"/site/integrations/telegram/{integration.id}/qr?refresh=1",
+                                "password_url": f"/site/integrations/telegram/{integration.id}/qr/password",
+                                "page_refresh_href": f"{integrations_href('telegram', 'accounts')}&telegram_refresh_id={integration.id}",
+                                "integration_id": str(integration.id),
+                            }
+                        )
+                    real_account_qr_cards[service_code] = qr_cards
+
+                if latest_failure_at is not None and (latest_success_at is None or latest_failure_at >= latest_success_at):
+                    status_value = "Ошибка синхронизации"
+                    status_tone = "danger"
+                    next_step = latest_failure_message or "Проверить последнюю ошибку"
+                elif active_count == 0:
+                    status_value = "Отключено"
+                    status_tone = "warning"
+                    next_step = "Включить рабочий аккаунт"
+                elif ready_count == 0:
+                    status_value = "Требует данные"
+                    status_tone = "warning"
+                    next_step = "Заполнить данные подключения"
+                elif ready_count < len(active_first):
+                    status_value = "Подключено частично"
+                    status_tone = "warning"
+                    next_step = "Дозаполнить оставшиеся аккаунты"
+                elif latest_success_at is None and binding["provider_kind"] in {"ads", "erp", "banking"}:
+                    status_value = "Подключено"
+                    status_tone = "success"
+                    next_step = "Запустить первую синхронизацию"
+                elif binding["provider_kind"] == "messaging" and not any(item.last_webhook_at is not None for item in active_first):
+                    status_value = "Подключено"
+                    status_tone = "success"
+                    next_step = "Проверить webhook и входящий канал"
+                else:
+                    status_value = "Подключено"
+                    status_tone = "success"
+                    next_step = "Подключение собрано"
+
+                sync_label = _integration_dt_label(latest_success_at)
+                if latest_success_at is None and binding["provider_kind"] == "messaging":
+                    webhook_dt = max((item.last_webhook_at for item in active_first if item.last_webhook_at is not None), default=None)
+                    sync_label = _integration_dt_label(webhook_dt)
+
+                service_profiles[service_code].update(
+                    {
+                        "status": status_value,
+                        "status_tone": status_tone,
+                        "sync": sync_label,
+                        "primary": primary_label,
+                        "filled": f"{ready_count} из {len(active_first)} аккаунтов с данными",
+                        "next": next_step,
+                    }
+                )
+
+        def account_rows(service_name: str, last_sync: str) -> list[tuple[str, object]]:
+            service_code = service_label_to_code.get(service_name)
+            if service_code and service_code in real_account_rows:
+                return real_account_rows[service_code]
+            return [
+                (f"{service_name} 1", f"Основной · подключен · синхронизация {last_sync.lower()}"),
+                (f"{service_name} 2", "Черновик · данные заполнены не полностью"),
+                (f"{service_name} 3", "Неактивен · сохранен для истории"),
+            ]
+
+        def account_options(service_name: str) -> list[str]:
+            service_code = service_label_to_code.get(service_name)
+            if service_code and service_code in real_account_options:
+                return real_account_options[service_code]
+            return [f"{service_name} 1", f"{service_name} 2", f"{service_name} 3"]
+
+        def service_state_cards(service_code: str) -> list[dict[str, str]]:
+            profile = service_profiles[service_code]
+            return [
+                {"label": "Статус подключения", "value": str(profile["status"]), "meta": "текущее состояние интеграции", "tone": str(profile["status_tone"])},
+                {"label": "Последняя синхронизация", "value": str(profile["sync"]), "meta": "последний успешный sync или webhook", "tone": "default"},
+                {"label": "Аккаунтов", "value": str(len(real_account_options.get(service_code) or [])), "meta": str(profile["filled"]), "tone": "success"},
+                {"label": "Следующий шаг", "value": str(profile["next"]), "meta": "следующее действие", "tone": "warning"},
+            ]
+
+        def service_status_rows(service_code: str) -> list[tuple[str, object]]:
+            profile = service_profiles[service_code]
+            return [
+                ("Аккаунтов", len(real_account_options.get(service_code) or [])),
+                ("Последняя синхронизация", profile["sync"]),
+                ("Статус подключения", profile["status"]),
+                ("Следующий шаг", profile["next"]),
+            ]
+
+        if active_tab == "telegram":
+            valid = {"app", "accounts"}
+            detail_code = detail_code if detail_code in valid else "app"
+            profile = service_profiles["telegram"]
+            states = service_state_cards("telegram")
+            telegram_app_configured = bool(settings.telegram_api_id and settings.telegram_api_hash)
+            context_line = "Мультиаккаунтное подключение Telegram."
+            subtabs = [
+                build_subtab("Приложение", "app", detail_code == "app"),
+                build_subtab("Аккаунты", "accounts", detail_code == "accounts"),
+            ]
+            title = "Telegram"
+            description = "Подключение Telegram."
+            metrics = [
+                {"label": "Статус подключения", "value": str(profile["status"]), "meta": "подключение Telegram", "tone": str(profile["status_tone"])},
+                {"label": "Dev app", "value": "Подключено" if telegram_app_configured else "Не заполнено", "meta": "API ID и API hash платформы", "tone": "success" if telegram_app_configured else "warning"},
+                {"label": "QR вход", "value": "Доступен", "meta": "подключение аккаунтов по QR", "tone": "default"},
+                {"label": "Аккаунтов", "value": str(len(account_options("Telegram"))), "meta": "подключено в текущем аккаунте", "tone": "default"},
+            ]
+            if detail_code == "accounts":
+                panels = [
+                    rows_panel("Состояние", "Текущая конфигурация", service_status_rows("telegram"), "Сначала добавь named-аккаунт, потом подключи его через QR."),
+                    rows_panel("Аккаунты", "Подключенные Telegram-аккаунты", account_rows("Telegram", str(profile["sync"]))),
+                ]
+                if runtime is not None:
+                    panels.extend(
+                        [
+                            qr_cards_panel(
+                                "QR вход",
+                                "Вход в Telegram по каждому аккаунту",
+                                real_account_qr_cards.get("telegram") or [],
+                                "Сканируй QR нужного аккаунта, чтобы подключить именно это Telegram-подключение.",
+                            ),
+                            form_panel(
+                                "Добавить новый аккаунт",
+                                "Новый Telegram-аккаунт",
+                                [
+                                    {"label": "Название аккаунта", "name": "telegram_account_name", "type": "text", "value": "Telegram аккаунт", "required": True, "hint": "Короткое имя, чтобы различать подключения."},
+                                ],
+                                "Сохранить",
+                                "После сохранения аккаунт появится в списке, и для него можно будет отсканировать QR.",
+                            ),
+                            form_panel(
+                                "Изменить название аккаунта",
+                                "Переименование Telegram-аккаунта",
+                                [
+                                    {"label": "Аккаунт", "name": "telegram_account_rename", "type": "select", "value": account_options("Telegram")[0], "options": account_options("Telegram"), "required": True, "hint": "Выбери уже подключенный аккаунт."},
+                                    {"label": "Новое название", "name": "telegram_account_new_name", "type": "text", "value": "Telegram аккаунт", "required": True, "hint": "Новое имя для списка подключений."},
+                                ],
+                                "Сохранить",
+                                "Переименование не меняет токен и не отключает существующее подключение.",
+                            ),
+                            form_panel(
+                                "Удалить старый аккаунт",
+                                "Выбор аккаунта для удаления",
+                                [
+                                    {"label": "Аккаунт", "name": "telegram_account_delete", "type": "select", "value": account_options("Telegram")[0], "options": account_options("Telegram"), "required": True, "hint": "Удаление в макете убирает аккаунт из активного списка."},
+                                    {"label": "Причина", "name": "telegram_delete_reason", "type": "text", "value": "Отключить старый аккаунт", "hint": "Короткая причина для истории изменений."},
+                                ],
+                                "Сохранить",
+                                "Удаление убирает аккаунт из активного списка подключений.",
+                            ),
+                        ]
+                    )
+                else:
+                    panels.append(
+                        rows_panel(
+                            "QR вход",
+                            "Что нужно для показа QR",
+                            [("Статус", "Нужен вход в аккаунт"), ("Действие", "Открой этот экран после авторизации"), ("Где открыть", "/admin/<account>/integrations или /site/integrations после входа")],
+                            "Без активной сессии система не знает, для какого аккаунта выпускать QR-код Telegram.",
+                        )
+                    )
+            else:
+                panels = [
+                    {
+                        "kind": "telegram_app",
+                        "title": "Приложение",
+                        "subtitle": "Параметры Telegram dev application",
+                        "items": [
+                            {"label": "API ID", "value": "Подключено" if settings.telegram_api_id else "Не задано"},
+                            {"label": "API hash", "value": "Подключено" if settings.telegram_api_hash else "Не задано"},
+                            {"label": "QR авторизация", "value": "Включена"},
+                            {"label": "Сценарий", "value": "Platform-level dev app + QR Telegram accounts"},
+                        ],
+                        "note": "Dev app хранится на уровне платформы. Подключение Telegram-аккаунтов делается во вкладке 'Аккаунты' через отдельный QR для каждого подключения.",
+                    }
+                ]
+        elif active_tab == "max":
+            valid = {"qr", "api", "secret", "accounts"}
+            detail_code = detail_code if detail_code in valid else "qr"
+            profile = service_profiles["max"]
+            states = service_state_cards("max")
+            context_line = f"Основной аккаунт: {profile['primary']}"
+            subtabs = [
+                build_subtab("QR код", "qr", detail_code == "qr"),
+                build_subtab("API key", "api", detail_code == "api"),
+                build_subtab("API secret", "secret", detail_code == "secret"),
+                build_subtab("Аккаунты", "accounts", detail_code == "accounts"),
+            ]
+            title = "MAX"
+            description = "Подключение MAX."
+            metrics = [
+                {"label": "Статус подключения", "value": str(profile["status"]), "meta": "подключение MAX", "tone": str(profile["status_tone"])},
+                {"label": "Последняя синхронизация", "value": str(profile["sync"]), "meta": "последний успешный sync", "tone": "default"},
+                {"label": "QR", "value": "Готов", "meta": "для подключения", "tone": "default"},
+                {"label": "Основной аккаунт", "value": str(profile["primary"]), "meta": "по умолчанию", "tone": "success"},
+            ]
+            if detail_code == "accounts":
+                panels = [
+                    rows_panel("Состояние", "Текущая конфигурация", service_status_rows("max"), "Сначала заполни ключи, затем выбери основной аккаунт и только после этого добавляй новые подключения."),
+                    rows_panel("Аккаунты", "Подключенные MAX-аккаунты", account_rows("MAX", str(profile["sync"]))),
+                    form_panel(
+                        "Добавить новый аккаунт",
+                        "Данные MAX-аккаунта",
+                        [
+                            {"label": "Название аккаунта", "name": "max_account_name", "type": "text", "value": "MAX аккаунт", "required": True, "hint": "Название помогает различать несколько подключений."},
+                            {"label": "API key", "name": "max_api_key", "type": "text", "value": "Вставить API key", "required": True, "hint": "Ключ доступа MAX."},
+                            {"label": "API secret", "name": "max_api_secret", "type": "text", "value": "Вставить API secret", "required": True, "hint": "Секретный ключ для полного подключения."},
+                        ],
+                        "Сохранить",
+                        "После сохранения новый аккаунт появится в общем списке.",
+                    ),
+                    form_panel(
+                        "Удалить старый аккаунт",
+                        "Выбор аккаунта для удаления",
+                        [
+                            {"label": "Аккаунт", "name": "max_account_delete", "type": "select", "value": account_options("MAX")[0], "options": account_options("MAX"), "required": True, "hint": "Удаляемый аккаунт исчезнет из активного списка."},
+                            {"label": "Причина", "name": "max_delete_reason", "type": "text", "value": "Отключить старый аккаунт", "hint": "Причина нужна для понятной истории действий."},
+                        ],
+                        "Сохранить",
+                        "Если аккаунт был основным, после удаления выбери новый основной.",
+                    ),
+                ]
+            elif detail_code == "api":
+                panels = [form_panel("API key", "Ключ MAX", [{"label": "API key", "name": "max_api_key", "type": "text", "value": "Вставить API key", "required": True, "hint": "После сохранения блок перейдет в состояние 'данные заполнены'."}], "Сохранить", "Следующий шаг: добавить API secret и назначить основной аккаунт.")]
+            elif detail_code == "secret":
+                panels = [form_panel("API secret", "Секрет MAX", [{"label": "API secret", "name": "max_api_secret", "type": "text", "value": "Вставить API secret", "required": True, "hint": "Закрывающий ключ для полноценного подключения."}], "Сохранить", "После сохранения можно вернуться в 'Аккаунты' и выбрать основной аккаунт.")]
+            else:
+                panels = [rows_panel("QR код", "Подключение через QR", [("QR", "Показать QR код"), ("Статус", "Ожидает сканирования"), ("Сценарий", "подключение нового аккаунта")], "После сканирования заполни API key и API secret, чтобы экран считался собранным.")]
+        elif active_tab == "avito":
+            valid = {"login", "account", "accounts"}
+            detail_code = detail_code if detail_code in valid else "login"
+            profile = service_profiles["avito"]
+            states = service_state_cards("avito")
+            context_line = f"Основной аккаунт: {profile['primary']}"
+            subtabs = [
+                build_subtab("Подключение", "login", detail_code == "login"),
+                build_subtab("ID аккаунта", "account", detail_code == "account"),
+                build_subtab("Аккаунты", "accounts", detail_code == "accounts"),
+            ]
+            title = "Авито"
+            description = "Подключение Авито."
+            avito_connected = bool(integration_field_value("avito", "avito_api_key", "").strip())
+            metrics = [
+                {
+                    "label": "Статус подключения",
+                    "value": "Подключено" if avito_connected else "Не подключено",
+                    "meta": "OAuth-подключение Авито",
+                    "tone": "success" if avito_connected else "warning",
+                },
+                {"label": "Последняя синхронизация", "value": str(profile["sync"]), "meta": "последний успешный sync", "tone": "default"},
+                {"label": "Аккаунтов", "value": str(len(account_options("Avito"))), "meta": "подключено в текущем аккаунте", "tone": "default"},
+                {"label": "Основной аккаунт", "value": str(profile["primary"]), "meta": "по умолчанию", "tone": "success"},
+            ]
+            if detail_code == "accounts":
+                panels = [
+                    rows_panel("Состояние", "Текущая конфигурация", service_status_rows("avito"), "Здесь видно, какой аккаунт основной, когда была последняя синхронизация и что нужно доделать."),
+                    form_panel(
+                        "Действия",
+                        "Проверка и синхронизация",
+                        [],
+                        "Проверить подключение",
+                        "Проверка и синхронизация идут по основному Avito-аккаунту текущего профиля.",
+                        button_name="integration_action",
+                        button_value="test",
+                        secondary_button_label="Запустить синхронизацию",
+                        secondary_button_name="integration_action",
+                        secondary_button_value="sync",
+                        hidden_fields=(
+                            [{"name": "integration_id", "value": str(current_integration_id("avito"))}]
+                            if current_integration_id("avito") is not None
+                            else None
+                        ),
+                    ),
+                    rows_panel("Аккаунты", "Подключенные Avito-аккаунты", account_rows("Avito", str(profile["sync"]))),
+                    form_panel(
+                        "Добавить новый аккаунт",
+                        "Новый Avito-аккаунт",
+                        [
+                            {"label": "Название аккаунта", "name": "avito_account_name", "type": "text", "value": "Avito аккаунт", "required": True, "hint": "Дай понятное имя: например, регион, бренд или направление."},
+                        ],
+                        "Подключить новый аккаунт",
+                        "После нажатия откроется Avito OAuth-вход именно для нового аккаунта с этим названием.",
+                        action="/site/integrations/avito/start",
+                        method="get",
+                    ),
+                    form_panel(
+                        "Изменить название аккаунта",
+                        "Переименование Avito-аккаунта",
+                        [
+                            {"label": "Аккаунт", "name": "avito_account_rename", "type": "select", "value": account_options("Avito")[0], "options": account_options("Avito"), "required": True, "hint": "Выбери уже подключенный аккаунт Авито."},
+                            {"label": "Новое название", "name": "avito_account_new_name", "type": "text", "value": "Avito аккаунт", "required": True, "hint": "Например, по бренду, городу или направлению."},
+                        ],
+                        "Сохранить",
+                        "Переименование не сбрасывает OAuth-подключение и не трогает токены.",
+                    ),
+                    form_panel(
+                        "Удалить старый аккаунт",
+                        "Выбор аккаунта для удаления",
+                        [
+                            {"label": "Аккаунт", "name": "avito_account_delete", "type": "select", "value": account_options("Avito")[0], "options": account_options("Avito"), "required": True, "hint": "Удаляемый аккаунт будет убран из активного списка."},
+                            {"label": "Причина", "name": "avito_delete_reason", "type": "text", "value": "Отключить старый аккаунт", "hint": "Нужно для понятной истории отключений."},
+                        ],
+                        "Сохранить",
+                        "Если удалишь основной аккаунт, затем назначь новый основной.",
+                    ),
+                ]
+            elif detail_code == "account":
+                panels = [form_panel("ID аккаунта", "Аккаунт для API", [{"label": "ID аккаунта", "name": "avito_account_external_id", "type": "text", "value": integration_field_value("avito", "avito_account_external_id", "Введите user_id аккаунта"), "required": True, "hint": "Это user_id аккаунта Авито, который нужен live API и синхронизации."}], "Сохранить", "Поле относится к текущему основному Avito-аккаунту.")]
+            else:
+                panels = [
+                    {
+                        "kind": "avito_oauth",
+                        "title": "Подключение Авито",
+                        "subtitle": "OAuth вход",
+                        "client_id": settings.avito_client_id or "",
+                        "scope": avito_scope_normalized,
+                        "state": avito_oauth_state or "",
+                        "button_title": "Подключить Авито",
+                        "oauth_start_href": "/site/integrations/avito/start",
+                        "note": "Нажми кнопку, войди в Авито и подтверди доступ. Для нескольких аккаунтов используй вкладку 'Аккаунты'.",
+                    },
+                    rows_panel(
+                        "Параметры подключения",
+                        "Статус интеграции",
+                        [
+                            ("Redirect URL", "https://app.financeavio.ru/site/integrations/avito/callback"),
+                            ("Статус", "Подключено" if avito_connected else "Ожидает подключения"),
+                            ("Сценарий", "Только OAuth вход через Авито"),
+                        ],
+                    ),
+                ]
+        elif active_tab == "moysklad":
+            valid = {"api", "secret", "accounts"}
+            detail_code = detail_code if detail_code in valid else "api"
+            profile = service_profiles["moysklad"]
+            states = service_state_cards("moysklad")
+            context_line = f"Основной аккаунт: {profile['primary']}"
+            subtabs = [
+                build_subtab("API key", "api", detail_code == "api"),
+                build_subtab("API secret", "secret", detail_code == "secret"),
+                build_subtab("Аккаунты", "accounts", detail_code == "accounts"),
+            ]
+            title = "МойСклад"
+            description = "Подключение МойСклад."
+            metrics = [
+                {"label": "Статус подключения", "value": str(profile["status"]), "meta": "подключение МойСклад", "tone": str(profile["status_tone"])},
+                {"label": "Последняя синхронизация", "value": str(profile["sync"]), "meta": "последний успешный sync", "tone": "default"},
+                {"label": "Склады", "value": "Подтягиваются автоматически", "meta": "после синхронизации из МойСклад", "tone": "default"},
+                {"label": "Основной аккаунт", "value": str(profile["primary"]), "meta": "по умолчанию", "tone": "success"},
+            ]
+            if detail_code == "accounts":
+                panels = [
+                    rows_panel("Состояние", "Текущая конфигурация", service_status_rows("moysklad"), "Склады подтягиваются автоматически из МойСклад после синхронизации."),
+                    form_panel(
+                        "Действия",
+                        "Проверка и синхронизация",
+                        [],
+                        "Проверить подключение",
+                        "Сначала проверь подключение, потом запускай синхронизацию по текущему аккаунту.",
+                        button_name="integration_action",
+                        button_value="test",
+                        secondary_button_label="Запустить синхронизацию",
+                        secondary_button_name="integration_action",
+                        secondary_button_value="sync",
+                        hidden_fields=(
+                            [{"name": "integration_id", "value": str(current_integration_id("moysklad"))}]
+                            if current_integration_id("moysklad") is not None
+                            else None
+                        ),
+                    ),
+                    rows_panel("Аккаунты", "Подключенные аккаунты МойСклад", account_rows("МойСклад", str(profile["sync"]))),
+                    form_panel(
+                        "Добавить новый аккаунт",
+                        "Новый аккаунт МойСклад",
+                        [
+                            {"label": "Название аккаунта", "name": "moysklad_account_name", "type": "text", "value": "МойСклад аккаунт", "required": True, "hint": "Имя подключения для списка аккаунтов."},
+                            {"label": "API key", "name": "moysklad_api_key", "type": "text", "value": integration_field_value("moysklad", "moysklad_api_key", "Вставить API key"), "required": True, "hint": "Ключ авторизации МойСклад."},
+                            {"label": "API secret", "name": "moysklad_api_secret", "type": "text", "value": integration_field_value("moysklad", "moysklad_api_secret", "Вставить API secret"), "required": True, "hint": "Секретный ключ для интеграции."},
+                        ],
+                        "Сохранить",
+                        "После сохранения подключение появится в общем списке.",
+                    ),
+                    form_panel(
+                        "Изменить название аккаунта",
+                        "Переименование аккаунта МойСклад",
+                        [
+                            {"label": "Аккаунт", "name": "moysklad_account_rename", "type": "select", "value": account_options("МойСклад")[0], "options": account_options("МойСклад"), "required": True, "hint": "Выбери подключенный аккаунт МойСклад."},
+                            {"label": "Новое название", "name": "moysklad_account_new_name", "type": "text", "value": "МойСклад аккаунт", "required": True, "hint": "Новое имя подключения для списка."},
+                        ],
+                        "Сохранить",
+                        "Переименование не меняет логин, пароль и синхронизацию.",
+                    ),
+                    form_panel(
+                        "Удалить старый аккаунт",
+                        "Выбор аккаунта для удаления",
+                        [
+                            {"label": "Аккаунт", "name": "moysklad_account_delete", "type": "select", "value": account_options("МойСклад")[0], "options": account_options("МойСклад"), "required": True, "hint": "Удаляемый аккаунт пропадет из активных подключений."},
+                            {"label": "Причина", "name": "moysklad_delete_reason", "type": "text", "value": "Отключить старый аккаунт", "hint": "Нужно для истории отключений."},
+                        ],
+                        "Сохранить",
+                        "Если удаляешь основной аккаунт, заново выбери новый основной.",
+                    ),
+                ]
+            elif detail_code == "secret":
+                panels = [form_panel("API secret", "Секрет МойСклад", [{"label": "API secret", "name": "moysklad_api_secret", "type": "text", "value": integration_field_value("moysklad", "moysklad_api_secret", "Вставить API secret"), "required": True, "hint": "Секрет авторизации для полного подключения."}], "Сохранить", "Следующий шаг: выбрать основной аккаунт и запустить синхронизацию.")]
+            else:
+                panels = [form_panel("API key", "Ключ МойСклад", [{"label": "API key", "name": "moysklad_api_key", "type": "text", "value": integration_field_value("moysklad", "moysklad_api_key", "Вставить API key"), "required": True, "hint": "Первый обязательный шаг подключения."}], "Сохранить", "Следующий шаг: добавить API secret и перейти к аккаунтам.")]
+        else:
+            valid = {"api", "secret", "accounts", "bank_accounts"}
+            detail_code = detail_code if detail_code in valid else "api"
+            profile = service_profiles["bank"]
+            states = service_state_cards("bank")
+            context_line = f"Основной аккаунт: {profile['primary']}"
+            subtabs = [
+                build_subtab("API key", "api", detail_code == "api"),
+                build_subtab("API secret", "secret", detail_code == "secret"),
+                build_subtab("Аккаунты", "accounts", detail_code == "accounts"),
+                build_subtab("Счета", "bank_accounts", detail_code == "bank_accounts"),
+            ]
+            title = "Банк"
+            description = "Подключение банка."
+            metrics = [
+                {"label": "Статус подключения", "value": str(profile["status"]), "meta": "подключение банка", "tone": str(profile["status_tone"])},
+                {"label": "Последняя синхронизация", "value": str(profile["sync"]), "meta": "последний успешный sync", "tone": "default"},
+                {"label": "Счета", "value": "Не добавлены", "meta": "банковские счета", "tone": "default"},
+                {"label": "Основной аккаунт", "value": str(profile["primary"]), "meta": "по умолчанию", "tone": "success"},
+            ]
+            if detail_code == "accounts":
+                panels = [
+                    rows_panel("Состояние", "Текущая конфигурация", service_status_rows("bank"), "Если банк в ошибке, сначала перепроверь ключи и только потом меняй аккаунты."),
+                    rows_panel("Аккаунты", "Подключенные банковские аккаунты", account_rows("Банк", str(profile["sync"]))),
+                    form_panel(
+                        "Добавить новый аккаунт",
+                        "Новый банковский аккаунт",
+                        [
+                            {"label": "Название аккаунта", "name": "bank_account_name", "type": "text", "value": "Банк аккаунт", "required": True, "hint": "Имя подключения для списка."},
+                            {"label": "API key", "name": "bank_api_key", "type": "text", "value": "Вставить API key", "required": True, "hint": "Банковский ключ подключения."},
+                            {"label": "API secret", "name": "bank_api_secret", "type": "text", "value": "Вставить API secret", "required": True, "hint": "Секрет банка для авторизации."},
+                        ],
+                        "Сохранить",
+                        "После сохранения аккаунт появится в списке подключений.",
+                    ),
+                    form_panel(
+                        "Изменить название аккаунта",
+                        "Переименование банковского аккаунта",
+                        [
+                            {"label": "Аккаунт", "name": "bank_account_rename", "type": "select", "value": account_options("Банк")[0], "options": account_options("Банк"), "required": True, "hint": "Выбери уже подключенный банковский аккаунт."},
+                            {"label": "Новое название", "name": "bank_account_new_name", "type": "text", "value": "Банк аккаунт", "required": True, "hint": "Новое имя для списка банковских подключений."},
+                        ],
+                        "Сохранить",
+                        "Переименование не трогает ключи доступа и историю синхронизации.",
+                    ),
+                    form_panel(
+                        "Удалить старый аккаунт",
+                        "Выбор аккаунта для удаления",
+                        [
+                            {"label": "Аккаунт", "name": "bank_account_delete", "type": "select", "value": account_options("Банк")[0], "options": account_options("Банк"), "required": True, "hint": "Удаляемый аккаунт будет убран из активного списка."},
+                            {"label": "Причина", "name": "bank_delete_reason", "type": "text", "value": "Отключить старый аккаунт", "hint": "Причина нужна для истории изменений."},
+                        ],
+                        "Сохранить",
+                        "Если удаляешь основной аккаунт, затем выбери новый основной.",
+                    ),
+                ]
+            elif detail_code == "secret":
+                panels = [form_panel("API secret", "Секрет банка", [{"label": "API secret", "name": "bank_api_secret", "type": "text", "value": "Вставить API secret", "required": True, "hint": "Секретный ключ банковской интеграции."}], "Сохранить", "После сохранения вернись к аккаунтам и проверь статус подключения.")]
+            elif detail_code == "bank_accounts":
+                panels = [form_panel("Счета", "Банковские счета", [{"label": "Счет", "name": "bank_account", "type": "text", "value": "Добавить счет", "required": True, "hint": "Счет, который должен отображаться в банковом разделе."}], "Сохранить", "После сохранения счет появится в списке банковских счетов макета.")]
+            else:
+                panels = [form_panel("API key", "Ключ банка", [{"label": "API key", "name": "bank_api_key", "type": "text", "value": integration_field_value("bank", "bank_api_key", "Вставить API key"), "required": True, "hint": "Первый шаг для банковской интеграции."}], "Сохранить", "Следующий шаг: добавить API secret и проверить состояние подключения.")]
+
+        return {
+            "filters": filters,
+            "hide_periods": True,
+            "workspace_id": "integrations-workspace",
+            "section_label": "Интеграции",
+            "active_tab": active_tab,
+            "active_detail": detail_code,
+            "active_scope": active_scope,
+            "title": title,
+            "description": description,
+            "context_line": context_line,
+            "tabs": tabs,
+            "tab_groups": [{"eyebrow": "Интеграции", "title": "Разделы интеграций", "primary": False, "items": tabs}],
+            "block_title": "Разделы интеграций",
+            "subtabs": subtabs,
+            "states": states,
+            "metrics": metrics,
+            "panels": panels,
+        }
+
+    def _site_settings_surface_model(
+        selected_date_raw: str | None = None,
+        period_raw: str | None = None,
+        date_from_raw: str | None = None,
+        date_to_raw: str | None = None,
+        tab_raw: str | None = None,
+        detail_raw: str | None = None,
+        scope_raw: str | None = None,
+        request_params: dict[str, str] | None = None,
+    ) -> dict[str, object]:
+        request_params = request_params or {}
+        filters = _site_dashboard_filters(selected_date_raw, period_raw, date_from_raw, date_to_raw)
+        period_code = str(filters["period_code"])
+        period_meta = _site_period_meta(period_code, str(filters["date_from_label"]), str(filters["date_to_label"]))
+        section = _site_section("settings")
+        raw_tabs = list(section.get("settings_items", []))
+        allowed_codes = {str(item.get("code")) for item in raw_tabs if item.get("code")}
+        active_tab = str(tab_raw or "company").strip().lower()
+        if active_tab not in allowed_codes:
+            active_tab = "company"
+
+        def rows_panel(title: str, subtitle: str, rows: list[tuple[str, object]]) -> dict[str, object]:
+            return {"kind": "rows", "title": title, "subtitle": subtitle, "items": [{"label": str(label), "value": str(value)} for label, value in rows]}
+
+        def form_panel(title: str, subtitle: str, fields: list[dict[str, object]], button_label: str) -> dict[str, object]:
+            normalized_fields: list[dict[str, object]] = []
+            for field in fields:
+                field_copy = dict(field)
+                field_name = str(field_copy.get("name") or "")
+                if field_name and str(field_copy.get("type") or "") != "file" and field_name in request_params:
+                    field_copy["value"] = request_params[field_name]
+                normalized_fields.append(field_copy)
+            return {
+                "kind": "form",
+                "title": title,
+                "subtitle": subtitle,
+                "items": normalized_fields,
+                "button_label": button_label,
+                "action": "/site/settings#settings-workspace",
+                "hidden": [
+                    {"name": "tab", "value": active_tab},
+                    {"name": "detail", "value": detail_code},
+                    {"name": "period", "value": period_code},
+                ],
+            }
+
+        def settings_href(tab_code: str, detail_code_arg: str | None = None) -> str:
+            params: dict[str, str] = {"tab": tab_code, "period": period_code, "selected_date": str(filters["anchor_date"])}
+            if detail_code_arg:
+                params["detail"] = detail_code_arg
+            if period_code == "custom":
+                params["date_from"] = str(filters["date_from"])
+                params["date_to"] = str(filters["date_to"])
+            return f"/site/settings?{urlencode(params)}#settings-workspace"
+
+        def build_subtab(label: str, code: str, active: bool) -> dict[str, object]:
+            return {"label": label, "href": settings_href(active_tab, code), "active": active}
+
+        detail_code = str(detail_raw or {"company": "profile", "roles": "roles", "notifications": "employees", "directories": "categories", "brand": "visual", "system": "workspace"}.get(active_tab, "profile")).strip().lower()
+        tabs = [{"code": str(item.get("code") or ""), "label": str(item.get("label") or ""), "icon": str(item.get("icon") or ""), "href": settings_href(str(item.get("code") or "")), "active": str(item.get("code") or "") == active_tab} for item in raw_tabs]
+        filters["periods"] = [{**item, "href": settings_href(active_tab, detail_code)} for item in list(filters["periods"])]
+
+        title = "Настройки"
+        description = ""
+        states = [
+            {"label": "Профиль", "value": "Заполняется", "meta": "карточка компании и реквизиты", "tone": "warning"},
+            {"label": "Доступы", "value": "24 роли", "meta": "активные роли и права", "tone": "default"},
+            {"label": "Бренд", "value": "Черновик", "meta": "логотип, цвета, шаблоны", "tone": "default"},
+            {"label": "Система", "value": "Базово", "meta": "рабочие параметры макета", "tone": "success"},
+        ]
+        metrics: list[dict[str, str]] = []
+        panels: list[dict[str, object]] = []
+        subtabs: list[dict[str, object]] = []
+
+        if active_tab == "company":
+            valid = {"profile", "requisites", "timezone"}
+            detail_code = detail_code if detail_code in valid else "profile"
+            subtabs = [build_subtab("Профиль", "profile", detail_code == "profile"), build_subtab("Реквизиты", "requisites", detail_code == "requisites"), build_subtab("Часовой пояс", "timezone", detail_code == "timezone")]
+            title = "Компания"
+            description = f"Основные настройки компании {period_meta['window']}."
+            metrics = [
+                {"label": "Компания", "value": "Financeavio", "meta": "рабочее название", "tone": "default"},
+                {"label": "Юрлицо", "value": "Заполнено", "meta": "карточка компании", "tone": "success"},
+                {"label": "Часовой пояс", "value": "Europe/Moscow", "meta": "основной пояс системы", "tone": "default"},
+                {"label": "Статус", "value": "Макет", "meta": "только дизайн", "tone": "default"},
+            ]
+            if detail_code == "requisites":
+                panels = [form_panel("Реквизиты", "Карточка компании", [{"label": "Название компании", "name": "company_name", "type": "text", "value": "Financeavio", "required": True, "hint": "Основное название компании."}, {"label": "ИНН", "name": "company_inn", "type": "text", "value": "Указать ИНН"}, {"label": "ООО / ИП", "name": "company_type", "type": "text", "value": "Выбрать форму"}, {"label": "Юридический адрес", "name": "company_address", "type": "text", "value": "Указать адрес"}], "Сохранить")]
+            elif detail_code == "timezone":
+                panels = [form_panel("Часовой пояс", "Рабочее время системы", [{"label": "Часовой пояс", "name": "company_timezone", "type": "text", "value": "Europe/Moscow", "required": True, "hint": "По этому поясу будут показываться даты и время."}, {"label": "Рабочий день с", "name": "day_start", "type": "text", "value": "09:00"}, {"label": "Рабочий день до", "name": "day_end", "type": "text", "value": "18:00"}], "Сохранить")]
+            else:
+                panels = [form_panel("Профиль компании", "Основные поля профиля", [{"label": "Название", "name": "company_profile_name", "type": "text", "value": "Financeavio", "required": True}, {"label": "Контактный email", "name": "company_email", "type": "text", "value": "owner@financeavio.ru"}, {"label": "Телефон", "name": "company_phone", "type": "text", "value": "+7 (...) ...-..-.."}, {"label": "Сайт", "name": "company_site", "type": "text", "value": "app.financeavio.ru"}], "Сохранить")]
+        elif active_tab == "roles":
+            valid = {"roles", "access", "invites"}
+            detail_code = detail_code if detail_code in valid else "roles"
+            subtabs = [build_subtab("Роли", "roles", detail_code == "roles"), build_subtab("Доступы", "access", detail_code == "access"), build_subtab("Приглашения", "invites", detail_code == "invites")]
+            title = "Роли и доступы"
+            description = "Настройка ролей, доступов и приглашений."
+            metrics = [
+                {"label": "Роли", "value": "6", "meta": "активно в макете", "tone": "default"},
+                {"label": "Пользователи", "value": "24", "meta": "назначены по ролям", "tone": "default"},
+                {"label": "Приглашения", "value": "3", "meta": "ожидают подтверждения", "tone": "warning"},
+                {"label": "Права", "value": "Настроены", "meta": "матрица доступа", "tone": "success"},
+            ]
+            if detail_code == "access":
+                panels = [rows_panel("Матрица доступа", "Что видят роли", [("Owner", "полный доступ"), ("Финансы", "финансы, документы, KPI"), ("Склад", "склад, документы"), ("Маркетинг", "маркетинг, продажи"), ("Сотрудники", "люди и задачи")])]
+            elif detail_code == "invites":
+                panels = [form_panel("Приглашение", "Пригласить нового пользователя", [{"label": "Email", "name": "invite_email", "type": "text", "value": "user@company.ru", "required": True}, {"label": "Роль", "name": "invite_role", "type": "text", "value": "Выбрать роль", "required": True}, {"label": "Комментарий", "name": "invite_note", "type": "text", "value": "Комментарий к приглашению"}], "Сохранить"), rows_panel("Активные приглашения", "Текущие приглашения", [("finance@company.ru", "Финансы"), ("ops@company.ru", "Склад"), ("docs@company.ru", "Документы")])]
+            else:
+                panels = [rows_panel("Роли", "Доступные роли в системе", [("Owner", "полный доступ"), ("Финансы", "денежный контур"), ("Склад", "товар и движения"), ("Маркетинг", "источники и рекламные данные"), ("Продажи", "сделки и клиенты")])]
+        elif active_tab == "notifications":
+            valid = {"employees", "channels", "schedule"}
+            detail_code = detail_code if detail_code in valid else "employees"
+            notification_roles = NOTIFICATION_ROLES
+            notification_users = NOTIFICATION_USERS
+            notification_topics = NOTIFICATION_TOPICS
+            notification_channels = NOTIFICATION_CHANNELS
+            notification_frequencies = NOTIFICATION_FREQUENCIES
+            notification_intensities = NOTIFICATION_INTENSITIES
+            notification_times = NOTIFICATION_TIMES
+            subtabs = [
+                build_subtab("Сотрудники", "employees", detail_code == "employees"),
+                build_subtab("Каналы", "channels", detail_code == "channels"),
+                build_subtab("Периодичность", "schedule", detail_code == "schedule"),
+            ]
+            title = "Уведомления"
+            description = "Настройка, кому, что и с какой периодичностью отправлять, чтобы сотрудники не пропускали заполнение данных."
+            metrics = [
+                {"label": "Получатели", "value": "12", "meta": "взяты из ролей и доступов", "tone": "default"},
+                {"label": "Каналы", "value": "TG / MAX / Email", "meta": "доступные способы доставки", "tone": "default"},
+                {"label": "Правил на сотрудника", "value": "Несколько", "meta": "можно задать больше одного уведомления", "tone": "success"},
+                {"label": "Статус", "value": "Макет", "meta": "только дизайн", "tone": "default"},
+            ]
+            if detail_code == "channels":
+                panels = [
+                    form_panel(
+                        "Каналы уведомлений",
+                        "Какой канал использовать для сотрудника",
+                        [
+                            {"label": "Роль", "name": "notify_channel_role", "type": "select", "value": "Склад", "options": notification_roles, "required": True},
+                            {"label": "Сотрудник", "name": "notify_channel_user", "type": "select", "value": "Тимур", "options": notification_users, "required": True},
+                            {"label": "Основной канал", "name": "notify_channel_primary", "type": "select", "value": "Telegram", "options": notification_channels, "required": True},
+                            {"label": "Резервный канал", "name": "notify_channel_backup", "type": "select", "value": "Email", "options": [*notification_channels, "Без резерва"]},
+                            {"label": "Время", "name": "notify_channel_time", "type": "select", "value": "09:00", "options": notification_times, "required": True},
+                            {"label": "Комментарий", "name": "notify_channel_note", "type": "text", "value": "Основной канал для напоминаний по заполнению данных"},
+                        ],
+                        "Сохранить",
+                    ),
+                    rows_panel(
+                        "Текущие каналы",
+                        "Куда приходят уведомления",
+                        [
+                            ("Тимур · Склад", "Telegram / Email · 09:00"),
+                            ("Егор · Финансы", "Email / MAX · 10:00"),
+                            ("Алина · Документы", "Telegram · 12:00"),
+                            ("Мария · Продажи", "MAX / Email · 18:00"),
+                        ],
+                    ),
+                ]
+            elif detail_code == "schedule":
+                panels = [
+                    form_panel(
+                        "Периодичность и интенсивность",
+                        "Как часто и насколько жестко напоминать",
+                        [
+                            {"label": "Роль", "name": "notify_schedule_role", "type": "select", "value": "Продажи", "options": notification_roles, "required": True},
+                            {"label": "Сотрудник", "name": "notify_schedule_user", "type": "select", "value": "Мария", "options": notification_users, "required": True},
+                            {"label": "Что напоминать", "name": "notify_schedule_topic", "type": "select", "value": "Заполнение данных", "options": ["Заполнение данных", "Проверка задач", "Закрытие документов", "Финансовые записи"], "required": True},
+                            {"label": "Периодичность", "name": "notify_schedule_frequency", "type": "select", "value": "Каждый день", "options": notification_frequencies, "required": True},
+                            {"label": "Время", "name": "notify_schedule_time", "type": "select", "value": "18:00", "options": notification_times, "required": True},
+                            {"label": "Интенсивность", "name": "notify_schedule_intensity", "type": "select", "value": "Средняя", "options": notification_intensities, "required": True},
+                            {"label": "Комментарий уведомления", "name": "notify_schedule_note", "type": "text", "value": "Не забывай заносить данные до конца дня"},
+                        ],
+                        "Сохранить",
+                    ),
+                    form_panel(
+                        "Добавить еще правило",
+                        "Второе уведомление на того же сотрудника",
+                        [
+                            {"label": "Сотрудник", "name": "notify_schedule_user_extra", "type": "select", "value": "Мария", "options": notification_users, "required": True},
+                            {"label": "Что напоминать", "name": "notify_schedule_topic_extra", "type": "select", "value": "Проверка KPI", "options": notification_topics, "required": True},
+                            {"label": "Периодичность", "name": "notify_schedule_frequency_extra", "type": "select", "value": "Раз в неделю", "options": notification_frequencies, "required": True},
+                            {"label": "Время", "name": "notify_schedule_time_extra", "type": "select", "value": "10:00", "options": notification_times, "required": True},
+                            {"label": "Интенсивность", "name": "notify_schedule_intensity_extra", "type": "select", "value": "Мягкая", "options": notification_intensities, "required": True},
+                            {"label": "Комментарий", "name": "notify_schedule_note_extra", "type": "text", "value": "Отдельное правило на KPI"},
+                        ],
+                        "Сохранить",
+                    ),
+                    rows_panel(
+                        "Активные правила",
+                        "Кому и как часто отправлять",
+                        [
+                            ("Тимур · Приемка", "каждый день · 09:00 · высокая"),
+                            ("Егор · Финансы", "по будням · 10:00 · средняя"),
+                            ("Алина · Документы", "каждый день · 12:00 · средняя"),
+                            ("Мария · Продажи", "раз в неделю · 18:00 · мягкая"),
+                            ("Мария · KPI", "раз в неделю · 10:00 · мягкая"),
+                        ],
+                    ),
+                ]
+            else:
+                panels = [
+                    form_panel(
+                        "Назначить уведомление сотруднику",
+                        "Выбор сотрудника из ролей и доступов",
+                        [
+                            {"label": "Роль", "name": "notify_role", "type": "select", "value": "Склад", "options": notification_roles, "required": True, "hint": "Сначала выбирается роль, из которой берем сотрудника."},
+                            {"label": "Сотрудник", "name": "notify_user", "type": "select", "value": "Тимур", "options": notification_users, "required": True, "hint": "Сотрудник, которому будут приходить уведомления."},
+                            {"label": "Что отправлять", "name": "notify_topic", "type": "select", "value": "Заполнение данных", "options": notification_topics, "required": True},
+                            {"label": "Канал", "name": "notify_channel", "type": "select", "value": "Telegram", "options": notification_channels, "required": True},
+                            {"label": "Периодичность", "name": "notify_frequency", "type": "select", "value": "Каждый день", "options": notification_frequencies, "required": True},
+                            {"label": "Время", "name": "notify_time", "type": "select", "value": "18:00", "options": notification_times, "required": True},
+                            {"label": "Интенсивность", "name": "notify_intensity", "type": "select", "value": "Средняя", "options": notification_intensities, "required": True},
+                            {"label": "Комментарий уведомления", "name": "notify_comment", "type": "text", "value": "Напоминание по заполнению данных"},
+                        ],
+                        "Сохранить",
+                    ),
+                    form_panel(
+                        "Добавить еще уведомление",
+                        "Второе правило на того же сотрудника",
+                        [
+                            {"label": "Сотрудник", "name": "notify_user_extra", "type": "select", "value": "Тимур", "options": notification_users, "required": True},
+                            {"label": "Что отправлять", "name": "notify_topic_extra", "type": "select", "value": "Обновление склада", "options": notification_topics, "required": True},
+                            {"label": "Канал", "name": "notify_channel_extra", "type": "select", "value": "MAX", "options": notification_channels, "required": True},
+                            {"label": "Периодичность", "name": "notify_frequency_extra", "type": "select", "value": "По будням", "options": notification_frequencies, "required": True},
+                            {"label": "Время", "name": "notify_time_extra", "type": "select", "value": "09:00", "options": notification_times, "required": True},
+                            {"label": "Интенсивность", "name": "notify_intensity_extra", "type": "select", "value": "Высокая", "options": notification_intensities, "required": True},
+                            {"label": "Комментарий", "name": "notify_comment_extra", "type": "text", "value": "Утреннее напоминание по складу"},
+                        ],
+                        "Сохранить",
+                    ),
+                    rows_panel(
+                        "Кому уже назначено",
+                        "Текущие получатели уведомлений",
+                        [
+                            ("Тимур · Склад", "заполнение данных · Telegram · 18:00"),
+                            ("Тимур · Склад", "обновление склада · MAX · 09:00"),
+                            ("Егор · Финансы", "финансовые записи · Email · 10:00"),
+                            ("Алина · Документы", "закрытие документов · Telegram · 12:00"),
+                            ("Мария · Продажи", "обновление продаж · MAX · 18:00"),
+                        ],
+                    ),
+                ]
+        elif active_tab == "directories":
+            valid = {"categories", "statuses", "sources"}
+            detail_code = detail_code if detail_code in valid else "categories"
+            subtabs = [build_subtab("Категории", "categories", detail_code == "categories"), build_subtab("Статусы", "statuses", detail_code == "statuses"), build_subtab("Источники", "sources", detail_code == "sources")]
+            title = "Справочники"
+            description = "Базовые справочники системы."
+            metrics = [
+                {"label": "Категории", "value": "18", "meta": "справочник категорий", "tone": "default"},
+                {"label": "Статусы", "value": "12", "meta": "статусы процессов", "tone": "default"},
+                {"label": "Источники", "value": "7", "meta": "источники данных", "tone": "default"},
+                {"label": "Изменения", "value": "Макет", "meta": "только дизайн", "tone": "default"},
+            ]
+            if detail_code == "statuses":
+                panels = [rows_panel("Статусы", "Статусы для процессов", [("Черновик", "документы"), ("Согласовано", "документы"), ("Ожидает", "задачи"), ("Подписано", "документы"), ("Закрыто", "общий статус")])]
+            elif detail_code == "sources":
+                panels = [rows_panel("Источники", "Источники маркетинга и продаж", [("Все источники", "базовый макет"), ("Авито", "маркетинг"), ("Сайт", "маркетинг"), ("Telegram", "маркетинг"), ("Рефералы", "продажи")])]
+            else:
+                panels = [rows_panel("Категории", "Основные категории системы", [("Маркетинг", "расходы и лиды"), ("ФОТ", "расходы"), ("Логистика", "расходы"), ("Закуп", "финансы и склад"), ("Документы", "контур документов")])]
+        elif active_tab == "brand":
+            valid = {"visual", "templates", "files"}
+            detail_code = detail_code if detail_code in valid else "visual"
+            subtabs = [build_subtab("Визуал", "visual", detail_code == "visual"), build_subtab("Шаблоны", "templates", detail_code == "templates"), build_subtab("Файлы", "files", detail_code == "files")]
+            title = "Бренд"
+            description = "Логотип, цвета и шаблоны компании."
+            metrics = [
+                {"label": "Логотип", "value": "Черновик", "meta": "загружен в макете", "tone": "default"},
+                {"label": "Цвета", "value": "2 цвета", "meta": "основная палитра", "tone": "default"},
+                {"label": "Шаблоны", "value": "4", "meta": "документы и письма", "tone": "default"},
+                {"label": "Стиль", "value": "Собран", "meta": "единый каркас", "tone": "success"},
+            ]
+            if detail_code == "templates":
+                panels = [rows_panel("Шаблоны", "Фирменные шаблоны", [("Счет", "основной шаблон"), ("КП", "коммерческий шаблон"), ("Договор", "базовый шаблон"), ("Письмо", "шаблон отправки")])]
+            elif detail_code == "files":
+                panels = [form_panel("Файлы бренда", "Загрузка логотипа и файлов", [{"label": "Логотип", "name": "brand_logo", "type": "file"}, {"label": "Печать", "name": "brand_stamp", "type": "file"}, {"label": "Подпись", "name": "brand_sign", "type": "file"}], "Сохранить")]
+            else:
+                panels = [form_panel("Визуальные настройки", "Цвета и стиль", [{"label": "Основной цвет", "name": "brand_primary", "type": "text", "value": "#4A5563"}, {"label": "Дополнительный цвет", "name": "brand_secondary", "type": "text", "value": "#89929E"}, {"label": "Стиль кнопок", "name": "brand_buttons", "type": "text", "value": "Скругленные"}], "Сохранить")]
+        else:
+            valid = {"workspace", "notifications", "security"}
+            detail_code = detail_code if detail_code in valid else "workspace"
+            subtabs = [build_subtab("Рабочее пространство", "workspace", detail_code == "workspace"), build_subtab("Уведомления", "notifications", detail_code == "notifications"), build_subtab("Безопасность", "security", detail_code == "security")]
+            title = "Система"
+            description = "Системные параметры и рабочие настройки."
+            metrics = [
+                {"label": "Рабочее пространство", "value": "Активно", "meta": "базовая конфигурация", "tone": "success"},
+                {"label": "Уведомления", "value": "Настраиваются", "meta": "каналы и правила", "tone": "default"},
+                {"label": "Безопасность", "value": "Базовая", "meta": "доступы и защита", "tone": "default"},
+                {"label": "Резерв", "value": "Макет", "meta": "только дизайн", "tone": "default"},
+            ]
+            if detail_code == "notifications":
+                panels = [form_panel("Уведомления", "Каналы и правила", [{"label": "Telegram", "name": "system_notify_tg", "type": "text", "value": "Включено"}, {"label": "Email", "name": "system_notify_email", "type": "text", "value": "Включено"}, {"label": "Критичные алерты", "name": "system_notify_alerts", "type": "text", "value": "Сразу"}], "Сохранить")]
+            elif detail_code == "security":
+                panels = [rows_panel("Безопасность", "Основные настройки безопасности", [("Двухфакторка", "черновик"), ("Сессии", "1 активная"), ("Разрешенные устройства", "3"), ("Журнал действий", "включен")])]
+            else:
+                panels = [rows_panel("Рабочее пространство", "Системные параметры", [("Язык интерфейса", "Русский"), ("Формат даты", "ДД.ММ.ГГГГ"), ("Формат валюты", "₽"), ("Стартовый экран", "Показатели")])]
+
+        return {
+            "filters": filters,
+            "workspace_id": "settings-workspace",
+            "section_label": "Настройки",
+            "hide_periods": True,
+            "active_tab": active_tab,
+            "active_detail": detail_code,
+            "active_scope": str(scope_raw or ""),
+            "title": title,
+            "description": description,
+            "context_line": "Настройки аккаунта и базовые параметры системы.",
+            "tabs": tabs,
+            "tab_groups": [{"eyebrow": "Настройки", "title": "Разделы настроек", "primary": False, "items": tabs}],
+            "block_title": "Разделы настроек",
+            "subtabs": subtabs,
+            "states": states,
+            "metrics": metrics,
+            "panels": panels,
+        }
+
+    def _site_knowledge_surface_model(
+        selected_date_raw: str | None = None,
+        period_raw: str | None = None,
+        date_from_raw: str | None = None,
+        date_to_raw: str | None = None,
+        tab_raw: str | None = None,
+        detail_raw: str | None = None,
+        scope_raw: str | None = None,
+        request_params: dict[str, str] | None = None,
+    ) -> dict[str, object]:
+        request_params = request_params or {}
+        filters = _site_dashboard_filters(selected_date_raw, period_raw, date_from_raw, date_to_raw)
+        period_code = str(filters["period_code"])
+        section = _site_section("knowledge")
+        raw_tabs = list(section.get("knowledge_items", []))
+        allowed_codes = {str(item.get("code")) for item in raw_tabs if item.get("code")}
+        active_tab = str(tab_raw or "summary").strip().lower()
+        if active_tab not in allowed_codes:
+            active_tab = "summary"
+
+        def rows_panel(title: str, subtitle: str, rows: list[tuple[str, object]]) -> dict[str, object]:
+            return {"kind": "rows", "title": title, "subtitle": subtitle, "items": [{"label": str(label), "value": str(value)} for label, value in rows]}
+
+        def form_panel(title: str, subtitle: str, fields: list[dict[str, object]], button_label: str, period_value: str | None = None) -> dict[str, object]:
+            normalized_fields: list[dict[str, object]] = []
+            for field in fields:
+                field_copy = dict(field)
+                field_name = str(field_copy.get("name") or "")
+                if field_name and str(field_copy.get("type") or "") != "file" and field_name in request_params:
+                    field_copy["value"] = request_params[field_name]
+                normalized_fields.append(field_copy)
+            hidden = [{"name": "tab", "value": active_tab}, {"name": "detail", "value": detail_code}, {"name": "period", "value": period_value or period_code}]
+            if (period_value or period_code) == "custom":
+                hidden.append({"name": "date_from", "value": request_params.get("date_from", str(filters["date_from"]))})
+                hidden.append({"name": "date_to", "value": request_params.get("date_to", str(filters["date_to"]))})
+            return {"kind": "form", "title": title, "subtitle": subtitle, "items": normalized_fields, "button_label": button_label, "action": "/site/knowledge#knowledge-workspace", "hidden": hidden}
+
+        def knowledge_href(tab_code: str, detail_code_arg: str | None = None, period_override: str | None = None) -> str:
+            params: dict[str, str] = {"tab": tab_code, "period": period_override or period_code, "selected_date": str(filters["anchor_date"])}
+            if detail_code_arg:
+                params["detail"] = detail_code_arg
+            if params["period"] == "custom":
+                params["date_from"] = str(filters["date_from"])
+                params["date_to"] = str(filters["date_to"])
+            return f"/site/knowledge?{urlencode(params)}#knowledge-workspace"
+
+        def build_subtab(label: str, code: str, active: bool, period_override: str | None = None) -> dict[str, object]:
+            return {"label": label, "href": knowledge_href(active_tab, code, period_override), "active": active}
+
+        detail_code = str(detail_raw or {"summary": "period", "company_context": "profile", "articles": "list", "regulations": "active", "templates": "documents", "partner_map": "list", "search": "query"}.get(active_tab, "list")).strip().lower()
+        tabs = [{"code": str(item.get("code") or ""), "label": str(item.get("label") or ""), "icon": str(item.get("icon") or ""), "href": knowledge_href(str(item.get("code") or "")), "active": str(item.get("code") or "") == active_tab} for item in raw_tabs]
+        filters["periods"] = [{**item, "href": knowledge_href(active_tab, detail_code, str(item["code"]))} for item in list(filters["periods"])]
+        states = [
+            {"label": "Материалы", "value": "128", "meta": "статьи, шаблоны, регламенты", "tone": "default"},
+            {"label": "Активные", "value": "86", "meta": "используются в работе", "tone": "success"},
+            {"label": "Нужно обновить", "value": "14", "meta": "устаревшие материалы", "tone": "warning"},
+            {"label": "Поиск", "value": "Готов", "meta": "поиск по базе знаний", "tone": "default"},
+        ]
+        title = "База знаний"
+        description = ""
+        metrics: list[dict[str, str]] = []
+        panels: list[dict[str, object]] = []
+        subtabs: list[dict[str, object]] = []
+
+        if active_tab == "summary":
+            detail_code = "overview"
+            subtabs = []
+            title = "Сводка"
+            description = "Общий обзор базы знаний компании."
+            metrics = [
+                {"label": "Материалы", "value": "128", "meta": "в базе знаний", "tone": "default"},
+                {"label": "Регламенты", "value": "24", "meta": "активные инструкции", "tone": "default"},
+                {"label": "Шаблоны", "value": "18", "meta": "рабочие шаблоны", "tone": "default"},
+                {"label": "Обновления", "value": "6", "meta": "новые и обновленные материалы", "tone": "success"},
+            ]
+            panels = [rows_panel("Сводка", "Главные числа базы знаний", [("Материалы", "128"), ("Новые материалы", "6"), ("Обновленные", "14"), ("Поисковых запросов", "52")])]
+        elif active_tab == "company_context":
+            valid = {"profile", "prompt", "context", "import"}
+            detail_code = detail_code if detail_code in valid else "profile"
+            subtabs = [
+                build_subtab("Профиль", "profile", detail_code == "profile"),
+                build_subtab("Промт", "prompt", detail_code == "prompt"),
+                build_subtab("Контекст", "context", detail_code == "context"),
+                build_subtab("Импорт +", "import", detail_code == "import"),
+            ]
+            title = "О компании"
+            description = "Контекст о компании для ИИ, прогнозов и советов."
+            metrics = [
+                {"label": "Профиль", "value": "Собирается", "meta": "бизнес, ниши, города", "tone": "default"},
+                {"label": "Промт", "value": "Черновик", "meta": "главный контекст для ИИ", "tone": "warning"},
+                {"label": "Контекст", "value": "Частично", "meta": "данные о модели бизнеса", "tone": "default"},
+                {"label": "Назначение", "value": "Прогнозы и советы", "meta": "общая база для ИИ", "tone": "success"},
+            ]
+            if detail_code == "prompt":
+                panels = [
+                    form_panel(
+                        "Промт о компании",
+                        "Главный контекст для ИИ",
+                        [
+                            {
+                                "label": "Главный промт о компании",
+                                "name": "company_master_prompt",
+                                "type": "textarea",
+                                "value": "Опиши здесь компанию целиком: чем она занимается, что продает, как зарабатывает, в каких городах работает, кто ее клиенты, какая сезонность, что для владельца главное, какие разделы системы критичны, как ИИ должен думать, как расставлять приоритеты, что считать риском, что считать хорошим результатом и как формировать советы и прогнозы.",
+                                "required": True,
+                                "hint": "Здесь можно заполнить весь контекст компании одним большим текстом, чтобы ИИ лучше понимал бизнес и строил прогнозы, советы и риски по реальной логике компании.",
+                            },
+                        ],
+                        "Сохранить",
+                    ),
+                    rows_panel(
+                        "Как это будет использоваться",
+                        "Где ИИ опирается на этот контекст",
+                        [
+                            ("Советы", "понимание модели бизнеса"),
+                            ("Прогнозы", "учет темпа и структуры компании"),
+                            ("Риски", "приоритизация слабых мест"),
+                            ("Сценарии", "подстройка под владельца и процессы"),
+                        ],
+                    ),
+                ]
+            elif detail_code == "context":
+                panels = [
+                    form_panel(
+                        "Контекст компании",
+                        "Быстрый структурированный ввод",
+                        [
+                            {"label": "Города", "name": "company_context_cities", "type": "text", "value": "Москва, Санкт-Петербург, Казань", "hint": "Где компания реально работает."},
+                            {"label": "Каналы продаж", "name": "company_context_channels", "type": "text", "value": "Авито, сайт, рекомендации", "hint": "Основные каналы продаж и заявок."},
+                            {"label": "Тип клиентов", "name": "company_context_clients", "type": "text", "value": "B2B / B2C", "hint": "Кому компания продает."},
+                            {"label": "Сезонность", "name": "company_context_seasonality", "type": "text", "value": "Есть / Нет / По месяцам", "hint": "Что влияет на темп продаж и закупа."},
+                        ],
+                        "Сохранить",
+                    ),
+                    rows_panel(
+                        "Структура контекста",
+                        "Что ИИ будет учитывать",
+                        [
+                            ("Продукт", "что именно продается"),
+                            ("География", "города и точки роста"),
+                            ("Клиенты", "тип и цикл сделки"),
+                            ("Сезонность", "влияние на прогнозы"),
+                        ],
+                    ),
+                ]
+            elif detail_code == "import":
+                panels = [
+                    form_panel(
+                        "Импорт контекста о компании",
+                        "Выбрать, что загрузить",
+                        [
+                            {"label": "Что загрузить", "name": "knowledge_company_import_type", "type": "select", "value": KNOWLEDGE_COMPANY_IMPORT_OPTIONS[0], "options": KNOWLEDGE_COMPANY_IMPORT_OPTIONS, "required": True, "hint": "Можно догрузить части контекста отдельно."},
+                            {"label": "Файл", "name": "knowledge_company_import_file", "type": "file"},
+                            {"label": "Комментарий", "name": "knowledge_company_import_note", "type": "text", "value": "Импорт контекста компании"},
+                        ],
+                        "Сохранить",
+                    )
+                ]
+            else:
+                panels = [
+                    form_panel(
+                        "Профиль компании",
+                        "Базовый контекст для ИИ",
+                        [
+                            {"label": "Название компании", "name": "company_context_name", "type": "text", "value": "Financeavio", "required": True},
+                            {"label": "Ниша", "name": "company_context_niche", "type": "text", "value": "Оптовые и операционные продажи", "required": True},
+                            {"label": "Главная цель владельца", "name": "company_context_goal", "type": "text", "value": "Рост прибыли и контроль процессов", "hint": "Главный ориентир для советов ИИ."},
+                            {"label": "Ключевые зоны контроля", "name": "company_context_focus", "type": "text", "value": "Финансы, склад, продажи, документы", "hint": "Что для владельца наиболее важно."},
+                        ],
+                        "Сохранить",
+                    )
+                ]
+        elif active_tab == "articles":
+            valid = {"list", "new", "archive", "import"}
+            detail_code = detail_code if detail_code in valid else "list"
+            subtabs = [build_subtab("Список", "list", detail_code == "list"), build_subtab("Новая статья", "new", detail_code == "new"), build_subtab("Архив", "archive", detail_code == "archive"), build_subtab("Импорт +", "import", detail_code == "import")]
+            title = "Статьи"
+            description = "Статьи и внутренние материалы."
+            metrics = [{"label": "Статьи", "value": "62", "meta": "в базе", "tone": "default"}, {"label": "Активные", "value": "49", "meta": "в работе", "tone": "success"}, {"label": "Архив", "value": "13", "meta": "архивные статьи", "tone": "default"}, {"label": "Черновики", "value": "5", "meta": "на доработке", "tone": "warning"}]
+            if detail_code == "new":
+                panels = [form_panel("Новая статья", "Создание нового материала", [{"label": "Название статьи", "name": "knowledge_article_title", "type": "text", "value": "Новая статья", "required": True}, {"label": "Раздел", "name": "knowledge_article_section", "type": "text", "value": "Выбрать раздел"}, {"label": "Короткое описание", "name": "knowledge_article_desc", "type": "text", "value": "Описание статьи"}], "Сохранить")]
+            elif detail_code == "import":
+                panels = [form_panel("Импорт статей", "Выбрать, что загрузить", [{"label": "Что загрузить", "name": "knowledge_articles_import_type", "type": "select", "value": KNOWLEDGE_ARTICLE_IMPORT_OPTIONS[0], "options": KNOWLEDGE_ARTICLE_IMPORT_OPTIONS, "required": True, "hint": "Выбери тип материала для загрузки."}, {"label": "Файл", "name": "knowledge_articles_import_file", "type": "file"}, {"label": "Комментарий", "name": "knowledge_articles_import_note", "type": "text", "value": "Импорт материалов"}], "Сохранить")]
+            elif detail_code == "archive":
+                panels = [rows_panel("Архив статей", "Архивные материалы", [("Регламент 2024", "архив"), ("Старый шаблон КП", "архив"), ("Инструкция v1", "архив"), ("FAQ 2025", "архив")])]
+            else:
+                panels = [rows_panel("Список статей", "Текущие материалы", [("Как выставлять счет", "финансы"), ("Как собирать закуп", "склад"), ("Как вести лиды", "продажи"), ("Как работать с актами", "документы")])]
+        elif active_tab == "regulations":
+            valid = {"active", "by_role", "updates", "import"}
+            detail_code = detail_code if detail_code in valid else "active"
+            subtabs = [build_subtab("Активные", "active", detail_code == "active"), build_subtab("По ролям", "by_role", detail_code == "by_role"), build_subtab("Обновления", "updates", detail_code == "updates"), build_subtab("Импорт +", "import", detail_code == "import")]
+            title = "Регламенты"
+            description = "Рабочие регламенты компании."
+            metrics = [{"label": "Регламенты", "value": "24", "meta": "в базе", "tone": "default"}, {"label": "По ролям", "value": "8", "meta": "маршруты работы", "tone": "default"}, {"label": "Обновления", "value": "3", "meta": "последние изменения", "tone": "success"}, {"label": "Под пересмотром", "value": "4", "meta": "нужны правки", "tone": "warning"}]
+            if detail_code == "by_role":
+                panels = [rows_panel("Регламенты по ролям", "Маршруты работы", [("Owner", "15 материалов"), ("Финансы", "11 материалов"), ("Склад", "9 материалов"), ("Документы", "8 материалов")])]
+            elif detail_code == "import":
+                panels = [form_panel("Импорт регламентов", "Выбрать, что загрузить", [{"label": "Что загрузить", "name": "knowledge_regulations_import_type", "type": "select", "value": KNOWLEDGE_REGULATION_IMPORT_OPTIONS[0], "options": KNOWLEDGE_REGULATION_IMPORT_OPTIONS, "required": True, "hint": "Выбери тип регламентов для загрузки."}, {"label": "Файл", "name": "knowledge_regulations_import_file", "type": "file"}, {"label": "Комментарий", "name": "knowledge_regulations_import_note", "type": "text", "value": "Импорт регламентов"}], "Сохранить")]
+            elif detail_code == "updates":
+                panels = [rows_panel("Обновления", "Последние изменения", [("Регламент закупа", "обновлен"), ("Регламент закрытия актов", "обновлен"), ("Маркетинговый словарь", "обновлен"), ("Процесс выставления счета", "обновлен")])]
+            else:
+                panels = [rows_panel("Активные регламенты", "Основные регламенты", [("Закуп", "активный"), ("Приемка", "активный"), ("Выставление счета", "активный"), ("Постановка задач", "активный")])]
+        elif active_tab == "templates":
+            valid = {"documents", "scripts", "checklists", "import"}
+            detail_code = detail_code if detail_code in valid else "documents"
+            subtabs = [build_subtab("Документы", "documents", detail_code == "documents"), build_subtab("Скрипты", "scripts", detail_code == "scripts"), build_subtab("Чек-листы", "checklists", detail_code == "checklists"), build_subtab("Импорт +", "import", detail_code == "import")]
+            title = "Шаблоны"
+            description = "Шаблоны документов, скриптов и чек-листов."
+            metrics = [{"label": "Документы", "value": "12", "meta": "несколько шаблонов по типам", "tone": "default"}, {"label": "Скрипты", "value": "9", "meta": "речевые шаблоны", "tone": "default"}, {"label": "Чек-листы", "value": "14", "meta": "пошаговые проверки", "tone": "default"}, {"label": "Готовность", "value": "Высокая", "meta": "для работы команды", "tone": "success"}]
+            if detail_code == "scripts":
+                panels = [rows_panel("Скрипты", "Шаблоны общения", [("Первичный звонок", "продажи"), ("Повторный контакт", "продажи"), ("Уточнение по счету", "финансы"), ("Закрытие по документам", "документы")])]
+            elif detail_code == "import":
+                panels = [form_panel("Импорт шаблонов", "Выбрать, что загрузить", [{"label": "Что загрузить", "name": "knowledge_templates_import_type", "type": "select", "value": KNOWLEDGE_TEMPLATE_IMPORT_OPTIONS[0], "options": KNOWLEDGE_TEMPLATE_IMPORT_OPTIONS, "required": True, "hint": "Выбери тип шаблонов для загрузки."}, {"label": "Файл", "name": "knowledge_templates_import_file", "type": "file"}, {"label": "Комментарий", "name": "knowledge_templates_import_note", "type": "text", "value": "Импорт шаблонов"}], "Сохранить")]
+            elif detail_code == "checklists":
+                panels = [rows_panel("Чек-листы", "Пошаговые списки", [("Запуск закупа", "7 шагов"), ("Выставление счета", "6 шагов"), ("Отгрузка", "9 шагов"), ("Закрытие акта", "5 шагов")])]
+            else:
+                panels = [
+                    form_panel(
+                        "Добавить шаблон документа",
+                        "Можно хранить несколько шаблонов на каждый тип документа",
+                        [
+                            {"label": "Тип документа", "name": "knowledge_document_template_type", "type": "select", "value": KNOWLEDGE_DOCUMENT_TEMPLATE_TYPES[0], "options": KNOWLEDGE_DOCUMENT_TEMPLATE_TYPES, "required": True, "hint": "На один тип документа можно завести несколько шаблонов."},
+                            {"label": "Название шаблона", "name": "knowledge_document_template_name", "type": "text", "value": "Основной шаблон", "required": True},
+                            {"label": "Для какого сценария", "name": "knowledge_document_template_case", "type": "text", "value": "Основной / Регион / B2B / B2C", "hint": "Чтобы было удобно различать шаблоны между собой."},
+                            {"label": "Файл шаблона", "name": "knowledge_document_template_file", "type": "file"},
+                            {"label": "Комментарий", "name": "knowledge_document_template_note", "type": "text", "value": "Шаблон для документов"},
+                        ],
+                        "Сохранить",
+                    ),
+                    rows_panel(
+                        "Библиотека шаблонов",
+                        "Шаблоны документов по типам",
+                        [
+                            ("Счет", "3 шаблона"),
+                            ("КП", "2 шаблона"),
+                            ("Договор", "3 шаблона"),
+                            ("Акт", "2 шаблона"),
+                            ("Акт выполненных работ", "1 шаблон"),
+                            ("Гарантия", "1 шаблон"),
+                            ("Претензия", "0 шаблонов"),
+                        ],
+                    ),
+                    rows_panel(
+                        "Текущие документные шаблоны",
+                        "Несколько шаблонов в одном разделе",
+                        [
+                            ("Счет · Основной", "основной"),
+                            ("Счет · Регион", "дополнительный"),
+                            ("Счет · B2B", "для юрлиц"),
+                            ("КП · Основное", "основной"),
+                            ("КП · Короткое", "быстрый вариант"),
+                            ("Договор · Базовый", "основной"),
+                            ("Договор · С монтажом", "расширенный"),
+                            ("Акт · Стандарт", "основной"),
+                        ],
+                    ),
+                ]
+        elif active_tab == "partner_map":
+            valid = {"list", "counterparties", "recipient_cards", "issuer_cards", "add", "import"}
+            detail_code = detail_code if detail_code in valid else "list"
+            subtabs = [
+                build_subtab("Список", "list", detail_code == "list"),
+                build_subtab("Контрагенты", "counterparties", detail_code == "counterparties"),
+                build_subtab("Карты кому", "recipient_cards", detail_code == "recipient_cards"),
+                build_subtab("Свои карты", "issuer_cards", detail_code == "issuer_cards"),
+                build_subtab("Добавить", "add", detail_code == "add"),
+                build_subtab("Импорт +", "import", detail_code == "import"),
+            ]
+            title = "Карта партнеров для документов"
+            description = "Контрагенты и партнерские карточки для счетов, документов и актов."
+            metrics = [
+                {"label": "Карты партнеров", "value": "12", "meta": "для документов и счетов", "tone": "default"},
+                {"label": "Контрагенты", "value": "24", "meta": "доступны для выбора", "tone": "success"},
+                {"label": "Свои карты", "value": "4", "meta": "с каких юрлиц выставлять", "tone": "default"},
+                {"label": "Статус", "value": "Макет", "meta": "только дизайн", "tone": "default"},
+            ]
+            if detail_code == "add":
+                panels = [
+                    form_panel(
+                        "Добавить карту партнера",
+                        "Поштучное добавление карты для документов",
+                        [
+                            {"label": "Тип карты", "name": "knowledge_partner_card_type", "type": "select", "value": KNOWLEDGE_PARTNER_CARD_TYPES[0], "options": KNOWLEDGE_PARTNER_CARD_TYPES, "required": True},
+                            {"label": "Название партнера", "name": "knowledge_partner_name", "type": "text", "value": "Новый партнер", "required": True},
+                            {"label": "Роль", "name": "knowledge_partner_role", "type": "text", "value": "Поставщик / Исполнитель / Юрлицо"},
+                            {"label": "Реквизиты", "name": "knowledge_partner_requisites", "type": "text", "value": "Заполнить"},
+                            {"label": "Комментарий", "name": "knowledge_partner_note", "type": "text", "value": "Для счетов, документов и актов"},
+                        ],
+                        "Сохранить",
+                    ),
+                    rows_panel("Текущие карты", "Можно добавлять несколько партнеров по одной карте", [("СтройИмпульс", "Кому выставляем"), ("МонтажПро", "Кому выставляем"), ("ООО ФинАвио", "С кого выставляем"), ("ИП Айдар", "С кого выставляем")]),
+                ]
+            elif detail_code == "counterparties":
+                panels = [
+                    form_panel(
+                        "Импорт контрагентов",
+                        "Загрузить список контрагентов в базу знаний",
+                        [
+                            {"label": "Что загрузить", "name": "knowledge_counterparty_import_type", "type": "select", "value": "Контрагенты", "options": ["Контрагенты", "Карточки контрагентов", "Реквизиты контрагентов"], "required": True, "hint": "Импорт отдельным сценарием именно для контрагентов."},
+                            {"label": "Файл", "name": "knowledge_counterparty_import_file", "type": "file"},
+                            {"label": "Комментарий", "name": "knowledge_counterparty_import_note", "type": "text", "value": "Импорт контрагентов"},
+                        ],
+                        "Сохранить",
+                    ),
+                    rows_panel(
+                        "Список контрагентов",
+                        "Контрагенты для выбора в документах",
+                        [
+                            ("СтройИмпульс", "покупатель"),
+                            ("МонтажПро", "исполнитель"),
+                            ("ГородСнаб", "поставщик"),
+                            ("СеверПроект", "заказчик"),
+                        ],
+                    ),
+                ]
+            elif detail_code == "recipient_cards":
+                panels = [
+                    form_panel(
+                        "Добавить карту партнера",
+                        "Кому выставляем счета, документы и акты",
+                        [
+                            {"label": "Контрагент", "name": "knowledge_recipient_counterparty", "type": "text", "value": "Выбрать контрагента", "required": True},
+                            {"label": "Название карты", "name": "knowledge_recipient_card_name", "type": "text", "value": "Основная карта клиента", "required": True},
+                            {"label": "Реквизиты", "name": "knowledge_recipient_card_requisites", "type": "text", "value": "Заполнить"},
+                            {"label": "Комментарий", "name": "knowledge_recipient_card_note", "type": "text", "value": "Для счетов и актов"},
+                        ],
+                        "Сохранить",
+                    ),
+                    rows_panel(
+                        "Карты кому выставляем",
+                        "Можно хранить несколько карт партнеров",
+                        [
+                            ("СтройИмпульс · Основная", "счет / договор / акт"),
+                            ("СтройИмпульс · Регион", "отдельная карта"),
+                            ("МонтажПро · Основная", "счет / акт"),
+                            ("СеверПроект · Основная", "договор / акт"),
+                        ],
+                    ),
+                ]
+            elif detail_code == "issuer_cards":
+                panels = [
+                    form_panel(
+                        "Добавить свою карту",
+                        "С какой карты выставлять счета, документы и акты",
+                        [
+                            {"label": "Название юрлица", "name": "knowledge_issuer_name", "type": "text", "value": "ООО ФинАвио", "required": True},
+                            {"label": "Формат", "name": "knowledge_issuer_type", "type": "select", "value": KNOWLEDGE_ISSUER_ENTITY_TYPES[0], "options": KNOWLEDGE_ISSUER_ENTITY_TYPES, "required": True},
+                            {"label": "Реквизиты", "name": "knowledge_issuer_requisites", "type": "text", "value": "Заполнить"},
+                            {"label": "Комментарий", "name": "knowledge_issuer_note", "type": "text", "value": "Использовать для счетов и актов"},
+                        ],
+                        "Сохранить",
+                    ),
+                    rows_panel(
+                        "Свои карты",
+                        "Несколько карт, с которых можно выставлять документы",
+                        [
+                            ("ООО ФинАвио", "основная карта"),
+                            ("ИП Айдар", "для части клиентов"),
+                            ("ООО ФинАвио Север", "региональная карта"),
+                            ("ИП Тимур", "резервная карта"),
+                        ],
+                    ),
+                ]
+            elif detail_code == "import":
+                panels = [
+                    form_panel(
+                        "Импорт карт и контрагентов",
+                        "Выбрать, что загрузить",
+                        [
+                            {"label": "Что загрузить", "name": "knowledge_partner_import_type", "type": "select", "value": "Карты кому выставляем", "options": ["Карты кому выставляем", "Свои карты с которых выставляем", "Контрагенты", "Реквизиты партнеров"], "required": True, "hint": "Можно загрузить отдельно контрагентов, карты клиентов и свои карты выставления."},
+                            {"label": "Файл", "name": "knowledge_partner_import_file", "type": "file"},
+                            {"label": "Комментарий", "name": "knowledge_partner_import_note", "type": "text", "value": "Импорт партнерских карт и контрагентов"},
+                        ],
+                        "Сохранить",
+                    ),
+                    rows_panel(
+                        "Что хранится здесь",
+                        "Логика базы знаний по документам",
+                        [
+                            ("Контрагенты", "кого выбираем в документах"),
+                            ("Карты кому", "кому выставляем счета и акты"),
+                            ("Свои карты", "с каких юрлиц выставляем"),
+                            ("Импорт", "можно загрузить несколько карт сразу"),
+                        ],
+                    ),
+                ]
+            else:
+                panels = [
+                    rows_panel(
+                        "Список карт партнеров",
+                        "Общий реестр карт для документов",
+                        [
+                            ("СтройИмпульс", "кому выставляем"),
+                            ("МонтажПро", "кому выставляем"),
+                            ("ООО ФинАвио", "с кого выставляем"),
+                            ("ИП Айдар", "с кого выставляем"),
+                        ],
+                    )
+                ]
+        else:
+            title = "Поиск"
+            description = "Поиск по базе знаний."
+            metrics = [{"label": "Запросы", "value": "52", "meta": "по базе знаний", "tone": "default"}, {"label": "Попадания", "value": "41", "meta": "релевантные результаты", "tone": "success"}, {"label": "Без ответа", "value": "11", "meta": "нужны материалы", "tone": "warning"}, {"label": "Статус", "value": "Макет", "meta": "только дизайн", "tone": "default"}]
+            panels = [form_panel("Поиск", "Умный поиск по базе знаний", [{"label": "Запрос", "name": "knowledge_query", "type": "text", "value": "Как выставлять счет", "required": True}, {"label": "Раздел", "name": "knowledge_section", "type": "text", "value": "Все разделы"}, {"label": "Тип материала", "name": "knowledge_type", "type": "text", "value": "Все материалы"}], "Сохранить"), rows_panel("Результаты", "Найденные материалы", [("Как выставлять счет", "финансы"), ("Шаблон счета", "шаблоны"), ("Регламент выставления счета", "регламенты"), ("FAQ по счетам", "статьи")])]
+
+        return {
+            "filters": filters,
+            "workspace_id": "knowledge-workspace",
+            "section_label": "База знаний",
+            "hide_periods": True,
+            "active_tab": active_tab,
+            "active_detail": detail_code,
+            "active_scope": str(scope_raw or ""),
+            "title": title,
+            "description": description,
+            "context_line": "Регламенты, статьи, шаблоны и быстрый поиск по материалам.",
+            "tabs": tabs,
+            "tab_groups": [{"eyebrow": "База знаний", "title": "Разделы базы знаний", "primary": False, "items": tabs}],
+            "block_title": "Разделы базы знаний",
+            "subtabs": subtabs,
+            "states": states,
+            "metrics": metrics,
+            "panels": panels,
+        }
+
+    def _site_ai_surface_model(
+        selected_date_raw: str | None = None,
+        period_raw: str | None = None,
+        date_from_raw: str | None = None,
+        date_to_raw: str | None = None,
+        tab_raw: str | None = None,
+        detail_raw: str | None = None,
+        scope_raw: str | None = None,
+        request_params: dict[str, str] | None = None,
+    ) -> dict[str, object]:
+        request_params = request_params or {}
+        filters = _site_dashboard_filters(selected_date_raw, period_raw, date_from_raw, date_to_raw)
+        period_code = str(filters["period_code"])
+        period_meta = _site_period_meta(period_code, str(filters["date_from_label"]), str(filters["date_to_label"]))
+        section = _site_section("ai")
+        raw_tabs = list(section.get("ai_items", []))
+        allowed_codes = {str(item.get("code")) for item in raw_tabs if item.get("code")}
+        active_tab = str(tab_raw or "summary").strip().lower()
+        if active_tab not in allowed_codes:
+            active_tab = "summary"
+
+        def rows_panel(title: str, subtitle: str, rows: list[tuple[str, object]]) -> dict[str, object]:
+            return {"kind": "rows", "title": title, "subtitle": subtitle, "items": [{"label": str(label), "value": str(value)} for label, value in rows]}
+
+        def form_panel(title: str, subtitle: str, fields: list[dict[str, object]], button_label: str, period_value: str | None = None) -> dict[str, object]:
+            normalized_fields: list[dict[str, object]] = []
+            for field in fields:
+                field_copy = dict(field)
+                field_name = str(field_copy.get("name") or "")
+                if field_name and str(field_copy.get("type") or "") != "file" and field_name in request_params:
+                    field_copy["value"] = request_params[field_name]
+                normalized_fields.append(field_copy)
+            hidden = [{"name": "tab", "value": active_tab}, {"name": "detail", "value": detail_code}, {"name": "period", "value": period_value or period_code}]
+            if (period_value or period_code) == "custom":
+                hidden.append({"name": "date_from", "value": request_params.get("date_from", str(filters["date_from"]))})
+                hidden.append({"name": "date_to", "value": request_params.get("date_to", str(filters["date_to"]))})
+            return {"kind": "form", "title": title, "subtitle": subtitle, "items": normalized_fields, "button_label": button_label, "action": "/site/ai#ai-workspace", "hidden": hidden}
+
+        def ai_href(tab_code: str, detail_code_arg: str | None = None, period_override: str | None = None) -> str:
+            params: dict[str, str] = {"tab": tab_code, "period": period_override or period_code, "selected_date": str(filters["anchor_date"])}
+            if detail_code_arg:
+                params["detail"] = detail_code_arg
+            if params["period"] == "custom":
+                params["date_from"] = str(filters["date_from"])
+                params["date_to"] = str(filters["date_to"])
+            return f"/site/ai?{urlencode(params)}#ai-workspace"
+
+        def build_subtab(label: str, code: str, active: bool, period_override: str | None = None) -> dict[str, object]:
+            return {"label": label, "href": ai_href(active_tab, code, period_override), "active": active}
+
+        detail_code = str(detail_raw or {"summary": "period", "workspace": "quick", "output": "advice", "advice": "owner", "risks": "critical", "forecasts": "cash_gap", "scenarios": "owner", "history": "period"}.get(active_tab, "period")).strip().lower()
+        tabs = [{"code": str(item.get("code") or ""), "label": str(item.get("label") or ""), "icon": str(item.get("icon") or ""), "href": ai_href(str(item.get("code") or "")), "active": str(item.get("code") or "") == active_tab} for item in raw_tabs]
+        filters["periods"] = [{**item, "href": ai_href(active_tab, detail_code, str(item["code"]))} for item in list(filters["periods"])]
+        states = [
+            {"label": "Советы", "value": "12", "meta": "активные рекомендации", "tone": "success"},
+            {"label": "Риски", "value": "5", "meta": "нужна проверка", "tone": "warning"},
+            {"label": "Сценарии", "value": "9", "meta": "готовые шаблоны работы", "tone": "default"},
+            {"label": "История", "value": "28", "meta": "последние AI-сессии", "tone": "default"},
+        ]
+        title = "ИИ"
+        description = ""
+        metrics: list[dict[str, str]] = []
+        panels: list[dict[str, object]] = []
+        subtabs: list[dict[str, object]] = []
+
+        if active_tab == "summary":
+            valid = {"date", "period"}
+            detail_code = detail_code if detail_code in valid else "period"
+            subtabs = [build_subtab("Дата", "date", detail_code == "date"), build_subtab("Период", "period", detail_code == "period"), build_subtab("Сегодня", detail_code, period_code == "day", "day"), build_subtab("Вчера", detail_code, period_code == "yesterday", "yesterday"), build_subtab("Неделя", detail_code, period_code == "week", "week"), build_subtab("Месяц", detail_code, period_code == "month", "month")]
+            title = "Сводка"
+            description = f"Сводка ИИ-подсказок {period_meta['window']}."
+            metrics = [
+                {"label": "Новые советы", "value": "4", "meta": f"за {period_meta['window']}", "tone": "success"},
+                {"label": "Риски", "value": "5", "meta": "подсветка по доменам", "tone": "warning"},
+                {"label": "Сценарии", "value": "9", "meta": "готовые маршруты", "tone": "default"},
+                {"label": "История", "value": "28", "meta": "последние сессии", "tone": "default"},
+            ]
+            if detail_code == "period":
+                panels = [form_panel("Период", "Выбрать диапазон", [{"label": "С", "name": "date_from", "type": "date", "value": str(filters["date_from"])}, {"label": "По", "name": "date_to", "type": "date", "value": str(filters["date_to"])}], "Сохранить", "custom"), rows_panel("Сводка", "Ключевые подсказки", [("Фокус", "Просрочки и CPL"), ("Следующий шаг", "Открыть риски"), ("Лучший совет", "Проверить документы"), ("Последняя AI-сессия", "Сегодня 11:20")])]
+            else:
+                panels = [rows_panel("Дата", "AI-срез по дате", [("Дата", str(filters["selected_date_label"])), ("Новые советы", "2"), ("Риски", "3"), ("Сценарии", "4"), ("Последняя сессия", "Сегодня 11:20")])]
+        elif active_tab == "workspace":
+            valid = {"quick", "domain", "format"}
+            detail_code = detail_code if detail_code in valid else "quick"
+            subtabs = [
+                build_subtab("Быстрый ввод", "quick", detail_code == "quick"),
+                build_subtab("По разделу", "domain", detail_code == "domain"),
+                build_subtab("Формат ответа", "format", detail_code == "format"),
+            ]
+            title = "Умный ввод"
+            description = "Структурированный ввод для более легкой работы с ИИ."
+            metrics = [
+                {"label": "Режим", "value": "Умный ввод", "meta": "быстрый запуск запроса", "tone": "success"},
+                {"label": "Шаблоны", "value": "Готовы", "meta": "совет, прогноз, риск", "tone": "default"},
+                {"label": "Разделы", "value": "Все домены", "meta": "финансы, склад, продажи и др.", "tone": "default"},
+                {"label": "Статус", "value": "Макет", "meta": "только дизайн", "tone": "default"},
+            ]
+            if detail_code == "domain":
+                panels = [
+                    form_panel(
+                        "Умный ввод по разделу",
+                        "Выбери, что именно разобрать",
+                        [
+                            {"label": "Раздел", "name": "ai_domain_section", "type": "select", "value": "Финансы", "options": ["Финансы", "Склад", "Маркетинг", "Продажи", "Сотрудники", "Документы", "KPI"], "required": True, "hint": "ИИ будет мыслить в контексте выбранного раздела."},
+                            {"label": "Режим", "name": "ai_domain_mode", "type": "select", "value": "Прогноз", "options": ["Совет", "Прогноз", "Риск", "Следующий шаг"], "required": True, "hint": "Что именно должен выдать ИИ."},
+                            {"label": "Фокус", "name": "ai_domain_focus", "type": "text", "value": "Что разобрать в разделе", "hint": "Коротко сформулируй задачу."},
+                            {"label": "Приоритет", "name": "ai_domain_priority", "type": "select", "value": "Высокий", "options": ["Высокий", "Средний", "Низкий"]},
+                        ],
+                        "Сохранить",
+                    )
+                ]
+            elif detail_code == "format":
+                panels = [
+                    form_panel(
+                        "Формат ответа",
+                        "Как ИИ должен вернуть результат",
+                        [
+                            {"label": "Тип ответа", "name": "ai_output_type", "type": "select", "value": "Коротко и по делу", "options": ["Коротко и по делу", "Топ-3 вывода", "Пошаговый план", "Риски и действия"], "required": True},
+                            {"label": "Глубина", "name": "ai_output_depth", "type": "select", "value": "Owner-уровень", "options": ["Owner-уровень", "Операционный уровень", "Детально по цифрам"]},
+                            {"label": "Нужны ли числа", "name": "ai_output_numbers", "type": "select", "value": "Да", "options": ["Да", "Нет"]},
+                            {"label": "Финальный акцент", "name": "ai_output_focus", "type": "text", "value": "Что делать дальше", "hint": "На чем ИИ должен закончить ответ."},
+                        ],
+                        "Сохранить",
+                    )
+                ]
+            else:
+                panels = [
+                    form_panel(
+                        "Быстрый умный ввод",
+                        "Самый простой способ задать запрос",
+                        [
+                            {"label": "Что нужно", "name": "ai_quick_mode", "type": "select", "value": "Совет", "options": ["Совет", "Прогноз", "Риск", "Разбор"], "required": True, "hint": "Быстро выбери тип запроса."},
+                            {"label": "По какому периоду", "name": "ai_quick_period", "type": "select", "value": "Текущий период", "options": ["Сегодня", "Вчера", "Неделя", "Месяц", "Текущий период"], "required": True},
+                            {"label": "Что разобрать", "name": "ai_quick_prompt", "type": "text", "value": "Коротко опиши задачу", "required": True, "hint": "Например: где риск по cashflow или почему просели продажи."},
+                            {"label": "Доп. контекст", "name": "ai_quick_context", "type": "text", "value": "Что важно учесть", "hint": "Можно указать город, источник, отдел или сотрудника."},
+                        ],
+                        "Сохранить",
+                    )
+                ]
+        elif active_tab == "output":
+            valid = {"advice", "forecasts", "risks", "feed"}
+            detail_code = detail_code if detail_code in valid else "advice"
+            subtabs = [
+                build_subtab("Советы", "advice", detail_code == "advice"),
+                build_subtab("Прогнозы", "forecasts", detail_code == "forecasts"),
+                build_subtab("Риски", "risks", detail_code == "risks"),
+                build_subtab("Лента", "feed", detail_code == "feed"),
+            ]
+            title = "Вывод ИИ"
+            description = "Место, где ИИ пишет советы, прогнозы и выводы."
+            metrics = [
+                {"label": "Советы", "value": "12", "meta": "собраны в один поток", "tone": "success"},
+                {"label": "Прогнозы", "value": "4", "meta": "основные сценарии", "tone": "default"},
+                {"label": "Риски", "value": "5", "meta": "подсветка проблем", "tone": "warning"},
+                {"label": "Статус", "value": "Лента активна", "meta": "единая точка чтения", "tone": "default"},
+            ]
+            if detail_code == "forecasts":
+                panels = [rows_panel("Вывод ИИ: прогнозы", "Собранные прогнозы ИИ", [("Кассовый разрыв", "в ближайшие 14 дней низкий риск"), ("Планы", "ожидаемое выполнение 88%"), ("Цели", "2 цели под риском"), ("При нынешнем темпе", "выручка не доберет 8%")])]
+            elif detail_code == "risks":
+                panels = [rows_panel("Вывод ИИ: риски", "Ключевые риски и пояснения", [("Просрочки", "ИИ рекомендует проверить блокеры по отделам"), ("Документы", "ИИ видит задержки 2 дня"), ("Cashflow", "ИИ советует удержать расходы"), ("Маржа", "ИИ просит сверить себестоимость")])]
+            elif detail_code == "feed":
+                panels = [rows_panel("Лента ИИ", "Последние выводы в одном месте", [("Сегодня 11:20", "Совет: проверить документы и просрочки"), ("Сегодня 10:40", "Прогноз: планы выполнятся на 88%"), ("Сегодня 09:30", "Риск: CPL растет по одному городу"), ("Вчера 18:20", "Сценарий: owner-разбор на завтра")])]
+            else:
+                panels = [rows_panel("Вывод ИИ: советы", "Основные советы ИИ", [("Финансы", "сверить баланс и расход"), ("Продажи", "разобрать просадку по городу"), ("Документы", "ускорить закрытие актов"), ("Склад", "перепроверить критические остатки")])]
+        elif active_tab == "advice":
+            valid = {"owner", "finance", "operations"}
+            detail_code = detail_code if detail_code in valid else "owner"
+            subtabs = [build_subtab("Owner", "owner", detail_code == "owner"), build_subtab("Финансы", "finance", detail_code == "finance"), build_subtab("Операции", "operations", detail_code == "operations")]
+            title = "Советы"
+            description = "Подсказки по доменам."
+            metrics = [{"label": "Owner", "value": "4", "meta": "советы владельцу", "tone": "default"}, {"label": "Финансы", "value": "3", "meta": "денежный контур", "tone": "default"}, {"label": "Операции", "value": "5", "meta": "исполнение и процессы", "tone": "default"}, {"label": "Приоритет", "value": "Высокий", "meta": "текущие рекомендации", "tone": "warning"}]
+            if detail_code == "finance":
+                panels = [rows_panel("Финансовые советы", "Что проверить первым", [("Кассовый разрыв", "проверить баланс и расходы"), ("Дебиторка", "разобрать просроченные оплаты"), ("Маржа", "сравнить с планом"), ("Закуп", "сверить сумму заявки")])]
+            elif detail_code == "operations":
+                panels = [rows_panel("Операционные советы", "Что проверить первым", [("Приемка", "разобрать зависшие задачи"), ("Документы", "ускорить закрытие актов"), ("Склад", "сверить критические остатки"), ("Команда", "проверить просрочки")])]
+            else:
+                panels = [rows_panel("Советы владельцу", "Основные рекомендации", [("Просрочки", "проверить узкие места"), ("CPL", "разобрать рост по городу"), ("Документы", "ускорить закрытие"), ("Cashflow", "сверить план/факт")])]
+        elif active_tab == "risks":
+            valid = {"critical", "medium", "watch"}
+            detail_code = detail_code if detail_code in valid else "critical"
+            subtabs = [build_subtab("Критичные", "critical", detail_code == "critical"), build_subtab("Средние", "medium", detail_code == "medium"), build_subtab("Наблюдать", "watch", detail_code == "watch")]
+            title = "Риски"
+            description = "Риски и проблемные зоны."
+            metrics = [{"label": "Критичные", "value": "2", "meta": "нужна реакция", "tone": "danger"}, {"label": "Средние", "value": "3", "meta": "нужен контроль", "tone": "warning"}, {"label": "Наблюдать", "value": "6", "meta": "фоновые сигналы", "tone": "default"}, {"label": "Статус", "value": "Макет", "meta": "только дизайн", "tone": "default"}]
+            if detail_code == "medium":
+                panels = [rows_panel("Средние риски", "Что держать под контролем", [("Маржа", "ниже плана"), ("Склад", "рост критических SKU"), ("Задачи", "копятся на приемке"), ("Документы", "задержки по закрытию")])]
+            elif detail_code == "watch":
+                panels = [rows_panel("Наблюдать", "Фоновые сигналы", [("Реклама", "рост CPL"), ("Источники", "падение лидов"), ("Сотрудники", "средняя реакция"), ("Контрагенты", "рост дебиторки")])]
+            else:
+                panels = [rows_panel("Критичные риски", "Что требует реакции", [("Просрочки", "+14 задач"), ("Cashflow", "ниже плана"), ("Документы", "2 дня задержки"), ("Интеграции", "ошибка по банку")])]
+        elif active_tab == "forecasts":
+            valid = {"cash_gap", "plans", "goals", "pace"}
+            detail_code = detail_code if detail_code in valid else "cash_gap"
+            subtabs = [build_subtab("Кассовый разрыв", "cash_gap", detail_code == "cash_gap"), build_subtab("Выполнение планов", "plans", detail_code == "plans"), build_subtab("Выполнение целей", "goals", detail_code == "goals"), build_subtab("При нынешнем темпе", "pace", detail_code == "pace")]
+            title = "Прогнозы"
+            description = "Прогнозные сценарии по текущим данным."
+            metrics = [{"label": "Кассовый разрыв", "value": "под контролем", "meta": "горизонт 14 дней", "tone": "success"}, {"label": "Планы", "value": "88%", "meta": "ожидаемое выполнение", "tone": "default"}, {"label": "Цели", "value": "2 под риском", "meta": "по текущему темпу", "tone": "warning"}, {"label": "Темп", "value": "ровный", "meta": "по основным метрикам", "tone": "default"}]
+            if detail_code == "plans":
+                panels = [rows_panel("Прогноз выполнения планов", "Ожидаемое выполнение планов", [("Выручка", "88% к концу периода"), ("Маржа", "95% к концу периода"), ("Cashflow", "91% к концу периода"), ("Просрочки", "118% нормы")])]
+            elif detail_code == "goals":
+                panels = [rows_panel("Прогноз выполнения целей", "Ожидаемый статус целей", [("Выручка", "цель под риском"), ("Маржа", "цель достижима"), ("Просрочки", "нужна корректировка"), ("Скорость реакции", "цель достижима")])]
+            elif detail_code == "pace":
+                panels = [rows_panel("Прогноз при нынешнем темпе", "Что будет без изменений", [("Выручка", "не доберет 8%"), ("Маржа", "почти в плане"), ("Просрочки", "останутся выше нормы"), ("Документы", "задержки сохранятся")])]
+            else:
+                panels = [rows_panel("Прогноз кассового разрыва", "Движение денег вперед", [("7 дней", "разрыва не ожидается"), ("14 дней", "риск низкий"), ("21 день", "нужен контроль расходов"), ("Точка внимания", "крупный закуп")])]
+        elif active_tab == "scenarios":
+            valid = {"owner", "sales", "ops", "finance"}
+            detail_code = detail_code if detail_code in valid else "owner"
+            subtabs = [build_subtab("Owner", "owner", detail_code == "owner"), build_subtab("Продажи", "sales", detail_code == "sales"), build_subtab("Операции", "ops", detail_code == "ops"), build_subtab("Финансы", "finance", detail_code == "finance")]
+            title = "Сценарии"
+            description = "Готовые AI-сценарии работы."
+            metrics = [{"label": "Owner", "value": "3", "meta": "главные сценарии", "tone": "default"}, {"label": "Продажи", "value": "2", "meta": "воронка и лиды", "tone": "default"}, {"label": "Операции", "value": "2", "meta": "контроль исполнения", "tone": "default"}, {"label": "Финансы", "value": "2", "meta": "разбор денежных сигналов", "tone": "default"}]
+            mapping = {
+                "owner": [("Ежедневный owner-разбор", "сводка и следующий шаг"), ("Что проверить сегодня", "риски и узкие места"), ("Разбор отклонений", "план/факт и сигналы")],
+                "sales": [("Разбор продаж", "лиды, сделки, города"), ("Провал воронки", "где теряются клиенты")],
+                "ops": [("Разбор просрочек", "команда и задачи"), ("Склад под контролем", "остатки, приемка, отгрузки")],
+                "finance": [("Разбор cashflow", "баланс, расходы, дебиторка"), ("Маржа под контролем", "выручка и себестоимость")],
+            }
+            panels = [rows_panel("Сценарии", "Готовые маршруты работы", mapping[detail_code])]
+        else:
+            valid = {"date", "period"}
+            detail_code = detail_code if detail_code in valid else "period"
+            subtabs = [build_subtab("Дата", "date", detail_code == "date"), build_subtab("Период", "period", detail_code == "period"), build_subtab("Сегодня", detail_code, period_code == "day", "day"), build_subtab("Вчера", detail_code, period_code == "yesterday", "yesterday"), build_subtab("Неделя", detail_code, period_code == "week", "week"), build_subtab("Месяц", detail_code, period_code == "month", "month")]
+            title = "История"
+            description = "История AI-запросов и сессий."
+            metrics = [{"label": "Сессии", "value": "28", "meta": f"за {period_meta['window']}", "tone": "default"}, {"label": "Советы", "value": "12", "meta": "сформировано", "tone": "success"}, {"label": "Риски", "value": "5", "meta": "выявлено", "tone": "warning"}, {"label": "Последняя сессия", "value": "Сегодня 11:20", "meta": "в макете", "tone": "default"}]
+            if detail_code == "period":
+                panels = [form_panel("Период", "Выбрать диапазон", [{"label": "С", "name": "date_from", "type": "date", "value": str(filters["date_from"])}, {"label": "По", "name": "date_to", "type": "date", "value": str(filters["date_to"])}], "Сохранить", "custom"), rows_panel("История", "AI-сессии периода", [("Owner-разбор", "сегодня 11:20"), ("Риски недели", "сегодня 09:10"), ("Разбор cashflow", "вчера 18:40"), ("Просрочки команды", "вчера 16:25")])]
+            else:
+                panels = [rows_panel("Дата", "AI-сессии по дате", [("Дата", str(filters["selected_date_label"])), ("Owner-разбор", "выполнен"), ("Разбор рисков", "выполнен"), ("Финансовый срез", "выполнен"), ("Сценарии", "просмотрены")])]
+
+        return {
+            "filters": filters,
+            "workspace_id": "ai-workspace",
+            "section_label": "ИИ",
+            "active_tab": active_tab,
+            "active_detail": detail_code,
+            "active_scope": str(scope_raw or ""),
+            "title": title,
+            "description": description,
+            "context_line": "Советы, риски, сценарии и история работы с ИИ.",
+            "tabs": tabs,
+            "tab_groups": [{"eyebrow": "ИИ", "title": "Разделы ИИ", "primary": False, "items": tabs}],
+            "block_title": "Разделы ИИ",
+            "subtabs": subtabs,
+            "states": states,
+            "metrics": metrics,
+            "panels": panels,
+        }
+
+    def _site_help_surface_model(
+        selected_date_raw: str | None = None,
+        period_raw: str | None = None,
+        date_from_raw: str | None = None,
+        date_to_raw: str | None = None,
+        tab_raw: str | None = None,
+        detail_raw: str | None = None,
+        scope_raw: str | None = None,
+        request_params: dict[str, str] | None = None,
+    ) -> dict[str, object]:
+        request_params = request_params or {}
+        filters = _site_dashboard_filters(selected_date_raw, period_raw, date_from_raw, date_to_raw)
+        period_code = str(filters["period_code"])
+        period_meta = _site_period_meta(period_code, str(filters["date_from_label"]), str(filters["date_to_label"]))
+        section = _site_section("help")
+        raw_tabs = list(section.get("help_items", []))
+        allowed_codes = {str(item.get("code")) for item in raw_tabs if item.get("code")}
+        active_tab = str(tab_raw or "summary").strip().lower()
+        if active_tab not in allowed_codes:
+            active_tab = "summary"
+
+        def rows_panel(title: str, subtitle: str, rows: list[tuple[str, object]]) -> dict[str, object]:
+            return {"kind": "rows", "title": title, "subtitle": subtitle, "items": [{"label": str(label), "value": str(value)} for label, value in rows]}
+
+        def form_panel(title: str, subtitle: str, fields: list[dict[str, object]], button_label: str, period_value: str | None = None) -> dict[str, object]:
+            normalized_fields: list[dict[str, object]] = []
+            for field in fields:
+                field_copy = dict(field)
+                field_name = str(field_copy.get("name") or "")
+                if field_name and str(field_copy.get("type") or "") != "file" and field_name in request_params:
+                    field_copy["value"] = request_params[field_name]
+                normalized_fields.append(field_copy)
+            hidden = [{"name": "tab", "value": active_tab}, {"name": "detail", "value": detail_code}, {"name": "period", "value": period_value or period_code}]
+            if (period_value or period_code) == "custom":
+                hidden.append({"name": "date_from", "value": request_params.get("date_from", str(filters["date_from"]))})
+                hidden.append({"name": "date_to", "value": request_params.get("date_to", str(filters["date_to"]))})
+            return {"kind": "form", "title": title, "subtitle": subtitle, "items": normalized_fields, "button_label": button_label, "action": "/site/help#help-workspace", "hidden": hidden}
+
+        def help_href(tab_code: str, detail_code_arg: str | None = None, period_override: str | None = None) -> str:
+            params: dict[str, str] = {"tab": tab_code, "period": period_override or period_code, "selected_date": str(filters["anchor_date"])}
+            if detail_code_arg:
+                params["detail"] = detail_code_arg
+            if params["period"] == "custom":
+                params["date_from"] = str(filters["date_from"])
+                params["date_to"] = str(filters["date_to"])
+            return f"/site/help?{urlencode(params)}#help-workspace"
+
+        def build_subtab(label: str, code: str, active: bool, period_override: str | None = None) -> dict[str, object]:
+            return {"label": label, "href": help_href(active_tab, code, period_override), "active": active}
+
+        detail_code = str(detail_raw or {"summary": "period", "guides": "owner", "faq": "popular", "support": "channels", "requests": "new"}.get(active_tab, "period")).strip().lower()
+        tabs = [{"code": str(item.get("code") or ""), "label": str(item.get("label") or ""), "icon": str(item.get("icon") or ""), "href": help_href(str(item.get("code") or "")), "active": str(item.get("code") or "") == active_tab} for item in raw_tabs]
+        filters["periods"] = [{**item, "href": help_href(active_tab, detail_code, str(item["code"]))} for item in list(filters["periods"])]
+        states = [
+            {"label": "Гайды", "value": "18", "meta": "маршруты и инструкции", "tone": "default"},
+            {"label": "FAQ", "value": "42", "meta": "готовые ответы", "tone": "success"},
+            {"label": "Поддержка", "value": "Онлайн", "meta": "каналы связи", "tone": "success"},
+            {"label": "Запросы", "value": "6", "meta": "открытые обращения", "tone": "warning"},
+        ]
+        title = "Помощь"
+        description = ""
+        metrics: list[dict[str, str]] = []
+        panels: list[dict[str, object]] = []
+        subtabs: list[dict[str, object]] = []
+
+        if active_tab == "summary":
+            valid = {"date", "period"}
+            detail_code = detail_code if detail_code in valid else "period"
+            subtabs = [build_subtab("Дата", "date", detail_code == "date"), build_subtab("Период", "period", detail_code == "period"), build_subtab("Сегодня", detail_code, period_code == "day", "day"), build_subtab("Вчера", detail_code, period_code == "yesterday", "yesterday"), build_subtab("Неделя", detail_code, period_code == "week", "week"), build_subtab("Месяц", detail_code, period_code == "month", "month")]
+            title = "Сводка"
+            description = f"Сводка по помощи и поддержке {period_meta['window']}."
+            metrics = [{"label": "Открыто запросов", "value": "6", "meta": f"за {period_meta['window']}", "tone": "warning"}, {"label": "Закрыто", "value": "14", "meta": "обработано", "tone": "success"}, {"label": "FAQ", "value": "42", "meta": "доступные ответы", "tone": "default"}, {"label": "Гайды", "value": "18", "meta": "готовые маршруты", "tone": "default"}]
+            if detail_code == "period":
+                panels = [form_panel("Период", "Выбрать диапазон", [{"label": "С", "name": "date_from", "type": "date", "value": str(filters["date_from"])}, {"label": "По", "name": "date_to", "type": "date", "value": str(filters["date_to"])}], "Сохранить", "custom"), rows_panel("Сводка", "Главные точки помощи", [("Новые запросы", "6"), ("Закрытые запросы", "14"), ("Популярный FAQ", "Как выставлять счет"), ("Самый частый гайд", "Сформировать закуп")])]
+            else:
+                panels = [rows_panel("Дата", "Срез помощи по дате", [("Дата", str(filters["selected_date_label"])), ("Новые запросы", "2"), ("Закрытые", "4"), ("Просмотры FAQ", "16"), ("Открытия гайдов", "9")])]
+        elif active_tab == "guides":
+            valid = {"owner", "team", "routes"}
+            detail_code = detail_code if detail_code in valid else "owner"
+            subtabs = [build_subtab("Owner", "owner", detail_code == "owner"), build_subtab("Команда", "team", detail_code == "team"), build_subtab("Маршруты", "routes", detail_code == "routes")]
+            title = "Гайды"
+            description = "Пошаговые гайды по работе в системе."
+            metrics = [{"label": "Owner", "value": "6", "meta": "гайды владельца", "tone": "default"}, {"label": "Команда", "value": "8", "meta": "гайды для сотрудников", "tone": "default"}, {"label": "Маршруты", "value": "4", "meta": "сквозные сценарии", "tone": "default"}, {"label": "Статус", "value": "Готово", "meta": "для работы", "tone": "success"}]
+            mapping = {
+                "owner": [("Проверить показатели", "главный экран"), ("Разобрать KPI", "сводка и антитопы"), ("Проверить финансы", "баланс и расходы"), ("Проверить риски", "слабые места")],
+                "team": [("Работа со счетами", "документы"), ("Работа с закупом", "склад"), ("Постановка задач", "сотрудники"), ("Заполнение маркетинга", "маркетинг")],
+                "routes": [("Сделка -> счет -> акт", "документы"), ("Закуп -> приемка -> остатки", "склад"), ("Лиды -> продажи", "маркетинг и продажи"), ("Задачи -> KPI", "сотрудники и KPI")],
+            }
+            panels = [rows_panel("Гайды", "Основные маршруты", mapping[detail_code])]
+        elif active_tab == "faq":
+            valid = {"popular", "finance", "operations"}
+            detail_code = detail_code if detail_code in valid else "popular"
+            subtabs = [build_subtab("Популярное", "popular", detail_code == "popular"), build_subtab("Финансы", "finance", detail_code == "finance"), build_subtab("Операции", "operations", detail_code == "operations")]
+            title = "FAQ"
+            description = "Частые вопросы и ответы."
+            metrics = [{"label": "Вопросы", "value": "42", "meta": "в базе FAQ", "tone": "default"}, {"label": "Популярные", "value": "12", "meta": "часто открывают", "tone": "success"}, {"label": "Финансы", "value": "10", "meta": "по финансовому контуру", "tone": "default"}, {"label": "Операции", "value": "9", "meta": "по процессам", "tone": "default"}]
+            mapping = {
+                "popular": [("Как выставлять счет?", "раздел документы"), ("Как сформировать закуп?", "раздел склад"), ("Как посмотреть KPI?", "раздел KPI"), ("Как подключить банк?", "раздел интеграции")],
+                "finance": [("Как изменить баланс?", "финансы"), ("Как добавить расход?", "финансы"), ("Как смотреть дебиторку?", "финансы"), ("Как изменить капитал?", "финансы")],
+                "operations": [("Как принять товар?", "склад"), ("Как отгрузить товар?", "склад"), ("Как поставить задачу?", "сотрудники"), ("Как закрыть акт?", "документы")],
+            }
+            panels = [rows_panel("FAQ", "Частые вопросы", mapping[detail_code])]
+        elif active_tab == "support":
+            valid = {"channels", "contacts", "status"}
+            detail_code = detail_code if detail_code in valid else "channels"
+            subtabs = [build_subtab("Каналы", "channels", detail_code == "channels"), build_subtab("Контакты", "contacts", detail_code == "contacts"), build_subtab("Статус", "status", detail_code == "status")]
+            title = "Поддержка"
+            description = "Каналы связи и состояние поддержки."
+            metrics = [{"label": "Каналы", "value": "3", "meta": "основные каналы", "tone": "default"}, {"label": "Онлайн", "value": "Да", "meta": "поддержка доступна", "tone": "success"}, {"label": "Ответ", "value": "до 15 мин", "meta": "ориентир в макете", "tone": "default"}, {"label": "Статус", "value": "Нормально", "meta": "рабочий режим", "tone": "success"}]
+            if detail_code == "contacts":
+                panels = [rows_panel("Контакты", "Куда писать", [("Telegram", "@support"), ("Email", "support@financeavio.ru"), ("Внутренний чат", "Рабочее пространство"), ("Owner-канал", "по критичным вопросам")])]
+            elif detail_code == "status":
+                panels = [rows_panel("Статус поддержки", "Текущее состояние", [("Обращения", "обрабатываются"), ("Скорость ответа", "нормальная"), ("Критичные запросы", "без очереди"), ("База знаний", "доступна")])]
+            else:
+                panels = [rows_panel("Каналы поддержки", "Основные каналы", [("Telegram", "быстрые вопросы"), ("Email", "развернутые запросы"), ("Внутренний чат", "рабочие обращения")])]
+        else:
+            valid = {"new", "open", "history"}
+            detail_code = detail_code if detail_code in valid else "new"
+            subtabs = [build_subtab("Новый запрос", "new", detail_code == "new"), build_subtab("Открытые", "open", detail_code == "open"), build_subtab("История", "history", detail_code == "history")]
+            title = "Запросы"
+            description = "Запросы в поддержку и история обращений."
+            metrics = [{"label": "Новые", "value": "2", "meta": "готовы к отправке", "tone": "default"}, {"label": "Открытые", "value": "6", "meta": "в работе", "tone": "warning"}, {"label": "Закрытые", "value": "14", "meta": "за период", "tone": "success"}, {"label": "История", "value": "28", "meta": "всего обращений", "tone": "default"}]
+            if detail_code == "open":
+                panels = [rows_panel("Открытые запросы", "Текущие обращения", [("Настроить права доступа", "в работе"), ("Добавить шаблон договора", "в очереди"), ("Проверить интеграцию банка", "ожидает"), ("Уточнить гайд по KPI", "в работе")])]
+            elif detail_code == "history":
+                panels = [rows_panel("История запросов", "Последние обращения", [("Как подключить Telegram?", "закрыт"), ("Как смотреть дебиторку?", "закрыт"), ("Как загрузить контрагентов?", "закрыт"), ("Как изменить бренд?", "закрыт")])]
+            else:
+                panels = [form_panel("Новый запрос", "Создание обращения в поддержку", [{"label": "Тема", "name": "help_request_topic", "type": "text", "value": "Новый запрос", "required": True}, {"label": "Раздел", "name": "help_request_section", "type": "text", "value": "Выбрать раздел"}, {"label": "Описание", "name": "help_request_description", "type": "text", "value": "Кратко описать вопрос", "required": True}, {"label": "Приоритет", "name": "help_request_priority", "type": "text", "value": "Обычный"}], "Сохранить")]
+
+        return {
+            "filters": filters,
+            "workspace_id": "help-workspace",
+            "section_label": "Помощь",
+            "hide_periods": True,
+            "active_tab": active_tab,
+            "active_detail": detail_code,
+            "active_scope": str(scope_raw or ""),
+            "title": title,
+            "description": description,
+            "context_line": "FAQ, гайды, поддержка и обращения в одном месте.",
+            "tabs": tabs,
+            "tab_groups": [{"eyebrow": "Помощь", "title": "Разделы помощи", "primary": False, "items": tabs}],
+            "block_title": "Разделы помощи",
+            "subtabs": subtabs,
+            "states": states,
+            "metrics": metrics,
+            "panels": panels,
+        }
+
+    def _site_chart_groups(period_meta: dict[str, str], period_query: str, period_code: str, source: str = "all") -> dict[str, dict[str, object]]:
+        groups = {
+            "finance": {
+                "eyebrow": "Финансы",
+                "title": "Все графики по финансам",
+                "description": "Финансовый срез {window}: выручка, валовая прибыль, расходы и денежный поток.",
+                "dashboard_subtitle": "баланс, выручка, расходы · {window}",
+                "dashboard_values": {"day": "Маржа 18.4%", "yesterday": "Маржа 17.1%", "week": "Маржа 19.6%", "month": "Маржа 21.3%", "custom": "Маржа 20.4%"},
+                "dashboard_bars": [34, 42, 47, 55, 58, 64, 69],
+                "href": f"/site/finance?view=charts&{period_query}",
+                "charts": [
+                    {"title": "Баланс", "subtitle": "денежные средства · {window}", "values": {"day": "3.48 млн ₽", "yesterday": "3.31 млн ₽", "week": "3.92 млн ₽", "month": "4.26 млн ₽", "custom": "4.08 млн ₽"}, "bars": [29, 33, 38, 43, 49, 54, 58]},
+                    {"title": "Выручка", "subtitle": "суммарно {window}", "values": {"day": "1.24 млн ₽", "yesterday": "1.08 млн ₽", "week": "6.84 млн ₽", "month": "27.6 млн ₽", "custom": "19.4 млн ₽"}, "bars": [32, 41, 45, 53, 57, 63, 69]},
+                    {"title": "Средний чек", "subtitle": "средний платеж · {window}", "values": {"day": "48 600 ₽", "yesterday": "46 900 ₽", "week": "50 200 ₽", "month": "51 800 ₽", "custom": "50 900 ₽"}, "bars": [27, 30, 35, 39, 43, 47, 52]},
+                    {"title": "Валовая прибыль", "subtitle": "до операционных расходов · {window}", "values": {"day": "618 тыс ₽", "yesterday": "574 тыс ₽", "week": "3.84 млн ₽", "month": "15.9 млн ₽", "custom": "11.1 млн ₽"}, "bars": [24, 29, 34, 39, 45, 51, 56]},
+                    {"title": "Чистая прибыль", "subtitle": "после расходов · {window}", "values": {"day": "432 тыс ₽", "yesterday": "386 тыс ₽", "week": "2.61 млн ₽", "month": "10.8 млн ₽", "custom": "7.7 млн ₽"}, "bars": [18, 24, 29, 31, 35, 39, 44]},
+                    {"title": "Расходы", "subtitle": "операционные расходы · {window}", "values": {"day": "682 тыс ₽", "yesterday": "705 тыс ₽", "week": "3.76 млн ₽", "month": "14.8 млн ₽", "custom": "10.9 млн ₽"}, "bars": [57, 55, 59, 53, 49, 46, 43]},
+                    {"title": "Маржинальность", "subtitle": "маржа · {window}", "values": {"day": "18.4%", "yesterday": "17.1%", "week": "19.6%", "month": "21.3%", "custom": "20.4%"}, "bars": [26, 31, 36, 41, 46, 51, 56]},
+                    {"title": "Денежный поток", "subtitle": "чистое движение денег · {window}", "values": {"day": "214 тыс ₽", "yesterday": "168 тыс ₽", "week": "1.22 млн ₽", "month": "4.84 млн ₽", "custom": "3.42 млн ₽"}, "bars": [17, 22, 28, 34, 39, 44, 49]},
+                    {"title": "Дебиторка", "subtitle": "долги клиентов · {window}", "values": {"day": "2.14 млн ₽", "yesterday": "2.22 млн ₽", "week": "2.06 млн ₽", "month": "1.88 млн ₽", "custom": "1.96 млн ₽"}, "bars": [61, 58, 54, 50, 46, 41, 38]},
+                    {"title": "Кредиторка", "subtitle": "обязательства поставщикам · {window}", "values": {"day": "1.36 млн ₽", "yesterday": "1.42 млн ₽", "week": "1.31 млн ₽", "month": "1.24 млн ₽", "custom": "1.28 млн ₽"}, "bars": [49, 46, 44, 41, 38, 35, 31]},
+                    {"title": "Налоги к оплате", "subtitle": "ближайшие обязательства · {window}", "values": {"day": "318 тыс ₽", "yesterday": "324 тыс ₽", "week": "318 тыс ₽", "month": "1.28 млн ₽", "custom": "946 тыс ₽"}, "bars": [41, 43, 42, 40, 37, 34, 32]},
+                    {"title": "ФОТ / зарплаты", "subtitle": "фонд оплаты труда · {window}", "values": {"day": "184 тыс ₽", "yesterday": "176 тыс ₽", "week": "1.02 млн ₽", "month": "4.06 млн ₽", "custom": "2.88 млн ₽"}, "bars": [23, 25, 29, 34, 38, 43, 47]},
+                    {"title": "Операционные расходы", "subtitle": "постоянные траты · {window}", "values": {"day": "428 тыс ₽", "yesterday": "441 тыс ₽", "week": "2.31 млн ₽", "month": "9.18 млн ₽", "custom": "6.54 млн ₽"}, "bars": [52, 49, 46, 43, 40, 36, 33]},
+                ],
+            },
+            "inventory": {
+                "eyebrow": "Склад",
+                "title": "Все графики по складу",
+                "description": "Складской срез {window}: остатки, отгрузки, приемка и пополнение.",
+                "dashboard_subtitle": "критические SKU, отгрузки, приемка · {window}",
+                "dashboard_values": {"day": "27 SKU под риском", "yesterday": "31 SKU под риском", "week": "22 SKU под риском", "month": "18 SKU под риском", "custom": "20 SKU под риском"},
+                "dashboard_bars": [68, 63, 58, 52, 47, 41, 36],
+                "href": f"/site/inventory?view=charts&{period_query}",
+                "charts": [
+                    {"kind": "bars", "title": "Отгрузки", "subtitle": "объем закрытых отгрузок · {window}", "values": {"day": "126 шт.", "yesterday": "118 шт.", "week": "742 шт.", "month": "2 980 шт.", "custom": "2 140 шт."}, "bars": [26, 31, 39, 44, 49, 56, 61]},
+                    {"kind": "list", "title": "Топ товары", "subtitle": "наименования лидеров отгрузки · {window}", "items": [{"label": "Профиль 60x40", "value": "412 шт."}, {"label": "Лист оцинкованный", "value": "356 шт."}, {"label": "Кронштейн усиленный", "value": "214 шт."}, {"label": "Комплект крепежа", "value": "188 шт."}]},
+                    {"kind": "bars", "title": "Кол-во товара", "subtitle": "общее движение в штуках · {window}", "values": {"day": "4 860 шт.", "yesterday": "4 420 шт.", "week": "27 600 шт.", "month": "112 400 шт.", "custom": "79 300 шт."}, "bars": [34, 39, 43, 49, 54, 58, 62]},
+                    {"kind": "list", "title": "Топ контрагенты", "subtitle": "ключевые контрагенты по отгрузкам · {window}", "items": [{"label": "СтройПоставка", "value": "94 отгр."}, {"label": "МонтажСервис", "value": "81 отгр."}, {"label": "ТехноСнаб", "value": "67 отгр."}, {"label": "ГородПроект", "value": "51 отгр."}]},
+                ],
+            },
+            "marketing": {
+                "eyebrow": "Маркетинг",
+                "title": "Все графики по маркетингу",
+                "description": "Маркетинговый срез {window}: расход, лиды, CPL и цена клиента.",
+                "dashboard_subtitle": "расход, лиды, CPL, CAC · {window}",
+                "dashboard_values": {"day": "CAC 3 620 ₽", "yesterday": "CAC 3 740 ₽", "week": "CAC 3 410 ₽", "month": "CAC 3 280 ₽", "custom": "CAC 3 350 ₽"},
+                "dashboard_bars": [24, 29, 35, 39, 43, 49, 54],
+                "href": f"/site/marketing?view=charts&{_site_source_query(period_query, 'all')}",
+                "sources": [{"code": "all", "label": MARKETING_SOURCES[0]}],
+                "charts": [
+                    {"kind": "bars", "title": "Расходы", "subtitle": "маркетинговый расход · {window}", "values": {"day": "268 тыс ₽", "yesterday": "251 тыс ₽", "week": "1.58 млн ₽", "month": "6.42 млн ₽", "custom": "4.66 млн ₽"}, "bars": [21, 24, 28, 34, 39, 45, 50]},
+                    {"kind": "bars", "title": "Стоимость клиента", "subtitle": "CAC · {window}", "values": {"day": "3 620 ₽", "yesterday": "3 740 ₽", "week": "3 410 ₽", "month": "3 280 ₽", "custom": "3 350 ₽"}, "bars": [53, 49, 46, 42, 39, 35, 32]},
+                    {"kind": "bars", "title": "Стоимость лида", "subtitle": "CPL · {window}", "values": {"day": "1 420 ₽", "yesterday": "1 468 ₽", "week": "1 386 ₽", "month": "1 312 ₽", "custom": "1 348 ₽"}, "bars": [58, 54, 50, 47, 43, 39, 35]},
+                    {"kind": "bars", "title": "Кол-во лидов", "subtitle": "входящий поток · {window}", "values": {"day": "186 лидов", "yesterday": "171 лид", "week": "1 140 лидов", "month": "4 680 лидов", "custom": "3 220 лидов"}, "bars": [24, 31, 36, 40, 44, 49, 55]},
+                    {"kind": "list", "title": "Топ города", "subtitle": "города по объему лидов · {window}", "items": [{"label": label, "value": value} for label, value in MARKETING_CITY_ROWS]},
+                    {"kind": "bars", "title": "Конверсия", "subtitle": "в клиента · {window}", "values": {"day": "29.4%", "yesterday": "27.8%", "week": "30.6%", "month": "31.2%", "custom": "30.9%"}, "bars": [20, 24, 27, 31, 34, 37, 41]},
+                ],
+            },
+            "sales": {
+                "eyebrow": "Продажи",
+                "title": "Все графики по продажам",
+                "description": "Продажи {window}: новые сделки, конверсия, средний чек и зависания.",
+                "dashboard_subtitle": "сделки, конверсия, средний чек · {window}",
+                "dashboard_values": {"day": "Конверсия 21.7%", "yesterday": "Конверсия 20.2%", "week": "Конверсия 23.4%", "month": "Конверсия 24.1%", "custom": "Конверсия 23.8%"},
+                "dashboard_bars": [22, 27, 31, 36, 40, 45, 49],
+                "href": f"/site/sales?view=charts&{_site_source_query(period_query, 'all')}",
+                "sources": [{"code": "all", "label": SALES_SOURCES[0]}],
+                "charts": [
+                    {"kind": "bars", "title": "Средний чек", "subtitle": "по оплатам · {window}", "values": {"day": "48 600 ₽", "yesterday": "46 900 ₽", "week": "50 200 ₽", "month": "51 800 ₽", "custom": "50 900 ₽"}, "bars": [28, 31, 35, 39, 43, 46, 51]},
+                    {"kind": "bars", "title": "Дни", "subtitle": "кол-во продаж по дням периода", "values": {"day": "74 продажи", "yesterday": "69 продаж", "week": "418 продаж", "month": "1 740 продаж", "custom": "1 220 продаж"}, "bars": [20, 26, 30, 35, 39, 44, 50]},
+                    {"kind": "list", "title": "Города", "subtitle": "лидеры по продажам · {window}", "items": [{"label": label, "value": value} for label, value in SALES_CITY_ROWS]},
+                ],
+            },
+            "employees": {
+                "eyebrow": "Сотрудники",
+                "title": "Все графики по сотрудникам",
+                "description": "Команда {window}: исполнение, просрочки, загрузка и скорость реакции.",
+                "dashboard_subtitle": "исполнение, просрочки, реакция · {window}",
+                "dashboard_values": {"day": "14 просроченных", "yesterday": "17 просроченных", "week": "39 просроченных", "month": "62 просроченных", "custom": "48 просроченных"},
+                "dashboard_bars": [56, 51, 48, 44, 41, 37, 33],
+                "href": f"/site/employees?view=charts&{period_query}",
+                "charts": [
+                    {"kind": "bars", "title": "KPI", "subtitle": "средний индекс команды · {window}", "values": {"day": "86%", "yesterday": "84%", "week": "88%", "month": "91%", "custom": "89%"}, "bars": [29, 34, 39, 44, 48, 53, 57]},
+                    {"kind": "bars", "title": "Просроченные задачи", "subtitle": "вне срока · {window}", "values": {"day": "14", "yesterday": "17", "week": "39", "month": "62", "custom": "48"}, "bars": [56, 51, 48, 44, 41, 37, 33]},
+                    {"kind": "bars", "title": "Исполнение задач в срок", "subtitle": "доля закрытых вовремя · {window}", "values": {"day": "78%", "yesterday": "74%", "week": "81%", "month": "84%", "custom": "82%"}, "bars": [32, 37, 42, 47, 51, 56, 61]},
+                    {"kind": "bars", "title": "Загрузка команды", "subtitle": "распределение нагрузки · {window}", "values": {"day": "82%", "yesterday": "79%", "week": "85%", "month": "88%", "custom": "86%"}, "bars": [41, 43, 45, 48, 50, 49, 47]},
+                    {"kind": "bars", "title": "Средняя реакция", "subtitle": "ответ на задачи и запросы · {window}", "values": {"day": "1.6 ч", "yesterday": "1.8 ч", "week": "1.4 ч", "month": "1.2 ч", "custom": "1.3 ч"}, "bars": [24, 28, 31, 36, 39, 43, 47]},
+                ],
+            },
+        }
+        source_profiles = {
+            "marketing": {
+                "all": {"Расходы": "268 тыс ₽", "Стоимость клиента": "3 620 ₽", "Стоимость лида": "1 420 ₽", "Кол-во лидов": "186 лидов", "Конверсия": "29.4%"},
+            },
+            "sales": {
+                "all": {"Средний чек": "48 600 ₽", "Дни": "74 продажи"},
+            },
+        }
+        for key, group in groups.items():
+            group["description"] = str(group["description"]).format(window=period_meta["window"])
+            group["dashboard_subtitle"] = str(group["dashboard_subtitle"]).format(window=period_meta["window"])
+            group["dashboard_value"] = str(group["dashboard_values"][period_code])
+            group["dashboard_bars"] = _site_periodize_bars(list(group["dashboard_bars"]), period_code)
+            del group["dashboard_values"]
+            if "sources" in group:
+                selected_source = source if source in {item["code"] for item in group["sources"]} else "all"
+                group["active_source"] = selected_source
+                for item in group["sources"]:
+                    item["href"] = f"/site/{key}?view=charts&{_site_source_query(period_query, item['code'])}"
+                    item["active"] = item["code"] == selected_source
+            for chart in list(group["charts"]):
+                chart["subtitle"] = str(chart["subtitle"]).format(window=period_meta["window"])
+                if chart.get("kind") == "list":
+                    chart.setdefault("kind", "list")
+                    if key == "marketing" and chart["title"] == "Топ города":
+                        city_sets = {
+                            "all": MARKETING_CITY_ROWS,
+                        }
+                        active = group.get("active_source", "all")
+                        chart["items"] = [{"label": label, "value": value} for label, value in city_sets.get(active, city_sets["all"])]
+                    if key == "sales" and chart["title"] == "Города":
+                        city_sets = {
+                            "all": SALES_CITY_ROWS,
+                        }
+                        active = group.get("active_source", "all")
+                        chart["items"] = [{"label": label, "value": value} for label, value in city_sets.get(active, city_sets["all"])]
+                    continue
+                chart.setdefault("kind", "bars")
+                chart["value"] = str(chart["values"][period_code])
+                if key in source_profiles and chart["title"] in source_profiles[key]:
+                    active = group.get("active_source", "all")
+                    chart["value"] = source_profiles[key].get(active, source_profiles[key]["all"]).get(chart["title"], chart["value"])
+                chart["bars"] = _site_periodize_bars(list(chart["bars"]), period_code)
+                del chart["values"]
+        return groups
+
+    def _site_chart_detail_model(
+        section_key: str,
+        selected_date_raw: str | None = None,
+        period_raw: str | None = None,
+        date_from_raw: str | None = None,
+        date_to_raw: str | None = None,
+        source_raw: str | None = None,
+    ) -> dict[str, object] | None:
+        filters = _site_dashboard_filters(selected_date_raw, period_raw, date_from_raw, date_to_raw)
+        period_code = str(filters["period_code"])
+        period_meta = _site_period_meta(period_code, str(filters["date_from_label"]), str(filters["date_to_label"]))
+        period_query = _site_period_query(period_code, str(filters["date_from"]), str(filters["date_to"]))
+        chart_groups = _site_chart_groups(
+            period_meta=period_meta,
+            period_query=period_query,
+            period_code=period_code,
+            source=str(source_raw or "all").strip().lower(),
+        )
+        group = chart_groups.get(section_key)
+        if not group:
+            return None
+        return {
+            "filters": filters,
+            "eyebrow": str(group["eyebrow"]),
+            "title": f"{group['title']} · {period_meta['label']}",
+            "description": str(group["description"]),
+            "charts": list(group["charts"]),
+            "sources": list(group.get("sources", [])),
+            "active_source": str(group.get("active_source", "")),
+        }
+
+    def _site_charts_model(
+        period_code: str = "month",
+        selected_date_label: str | None = None,
+        selected_date: str | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+    ) -> dict[str, object]:
+        selected_period = {
+            "day": "Сегодня",
+            "yesterday": "Вчера",
+            "week": "Неделя",
+            "month": "Месяц",
+            "custom": "Период",
+        }.get(period_code, "Месяц")
+        label = selected_date_label or datetime.now(timezone.utc).date().strftime("%d.%m.%Y")
+        period_meta = _site_period_meta(period_code, date_from, date_to)
+        period_query = _site_period_query(period_code, date_from, date_to)
+        chart_groups = _site_chart_groups(
+            period_meta=period_meta,
+            period_query=period_query,
+            period_code=period_code,
+        )
+        return {
+            "selected_period": selected_period,
+            "periods": ["Сегодня", "Вчера", "Неделя", "Месяц", "Период"],
+            "charts": [
+                {
+                    "key": key,
+                    "title": str(group["eyebrow"]),
+                    "subtitle": "",
+                    "meta": f"{len(group['charts'])} {'показателей' if len(group['charts']) != 1 else 'показатель'}",
+                    "value": str(group["dashboard_value"]),
+                    "bars": list(group["dashboard_bars"]),
+                    "href": str(group["href"]),
+                }
+                for key, group in chart_groups.items()
+            ],
+        }
+
+    def _public_base_url() -> str:
+        return settings.public_base_url or ""
+
+    def _public_app_url() -> str:
+        if settings.public_app_url:
+            return settings.public_app_url
+        if settings.public_base_url:
+            return f"{settings.public_base_url}/tgapp"
+        return "/tgapp"
+
+    def _telegram_startapp_url(startapp: str = "home") -> str | None:
+        if not settings.telegram_bot_username:
+            return None
+        return f"https://t.me/{settings.telegram_bot_username}?startapp={startapp}"
+
+    def _telegram_start_url(start: str = "start") -> str | None:
+        if not settings.telegram_bot_username:
+            return None
+        return f"https://t.me/{settings.telegram_bot_username}?start={start}"
+
+    def _telegram_bot_url() -> str | None:
+        if not settings.telegram_bot_username:
+            return None
+        return f"https://t.me/{settings.telegram_bot_username}"
+
     def _admin_page_path(page: str) -> str:
         return {
             "portfolio": "portfolio",
@@ -295,11 +7586,25 @@ def create_app() -> FastAPI:
             "brief": "brief",
             "delivery": "delivery",
             "dashboard": "dashboard",
+            "ai_workspace": "ai-workspace",
             "integrations": "integrations",
             "alerts_tasks": "alerts-tasks",
             "ops_sync": "ops-sync",
             "knowledge": "knowledge",
+            "legacy": "legacy",
             "people": "people",
+            "payroll": "payroll",
+            "finance": "finance",
+            "billing": "billing",
+            "documents": "documents",
+            "ads": "ads",
+            "inventory": "inventory",
+            "operations": "operations",
+            "communications": "communications",
+            "crm": "crm",
+            "notifications": "notifications",
+            "advisor": "advisor",
+            "copilot": "copilot",
             "goals": "goals",
             "members": "members",
             "settings": "settings",
@@ -315,7 +7620,7 @@ def create_app() -> FastAPI:
         ).scalars().all()
 
     def _is_manager_role(role_code: str | None) -> bool:
-        return role_code in {"owner", "admin"}
+        return role_code in {"owner", "admin", "manager"}
 
     def _is_owner_role(role_code: str | None) -> bool:
         return role_code == "owner"
@@ -404,6 +7709,15 @@ def create_app() -> FastAPI:
             rows.append({"user": user, "memberships": memberships})
         return rows
 
+    def _telegram_links_by_email(emails: list[str]) -> dict[str, list[dict[str, object]]]:
+        normalized = {str(email).strip().lower() for email in emails if str(email).strip()}
+        grouped: dict[str, list[dict[str, object]]] = defaultdict(list)
+        for row in bot_storage.list_platform_links():
+            email = str(row.get("platform_user_email") or "").strip().lower()
+            if email and email in normalized:
+                grouped[email].append(row)
+        return grouped
+
     def _assert_user_visible_to_actor(session: Session, actor_email: str, user_id: int) -> User:
         account_ids = _accessible_account_ids(session, actor_email)
         user = session.execute(
@@ -449,42 +7763,87 @@ def create_app() -> FastAPI:
         permissions = runtime.permissions
         items: list[dict[str, str]] = []
         feature_access = _feature_access_map(runtime.account)
+
+        def _add(section: str, key: str, label: str, path: str) -> None:
+            items.append({"section": section, "key": key, "label": label, "path": path})
+
         if "dashboard.read" in permissions or "*" in permissions:
-            if feature_access["owner_briefs"]["allowed"]:
-                items.append({"key": "brief", "label": "Brief", "path": "brief"})
-                items.append({"key": "delivery", "label": "Delivery", "path": "delivery"})
-            items.append({"key": "dashboard", "label": "Dashboard", "path": "dashboard"})
-            if feature_access["knowledge_base"]["allowed"]:
-                items.append({"key": "knowledge", "label": "Knowledge", "path": "knowledge"})
-            if feature_access["people_execution"]["allowed"]:
-                items.append({"key": "people", "label": "People", "path": "people"})
-            if feature_access["payroll_kpi"]["allowed"]:
-                items.append({"key": "payroll", "label": "Payroll", "path": "payroll"})
+            _add("Core", "dashboard", "Главная", "dashboard")
             if feature_access["operations_workflows"]["allowed"]:
-                items.append({"key": "operations", "label": "Operations", "path": "operations"})
-                items.append({"key": "billing", "label": "Billing", "path": "billing"})
-            if feature_access["communication_intelligence"]["allowed"]:
-                items.append({"key": "communications", "label": "Communications", "path": "communications"})
-            if feature_access["business_os"]["allowed"]:
-                items.append({"key": "crm", "label": "CRM", "path": "crm"})
-                items.append({"key": "inventory", "label": "Inventory", "path": "inventory"})
-                items.append({"key": "notifications", "label": "Notifications", "path": "notifications"})
-                items.append({"key": "advisor", "label": "Advisor", "path": "advisor"})
-            if feature_access["ai_copilot"]["allowed"]:
-                items.append({"key": "copilot", "label": "Copilot", "path": "copilot"})
+                _add("Core", "operations", "Операции", "operations")
             if feature_access["goals_tracking"]["allowed"]:
-                items.append({"key": "goals", "label": "Goals", "path": "goals"})
+                _add("Management", "goals", "KPI", "goals")
+        if feature_access["business_os"]["allowed"]:
+            _add("Domains", "finance", "Финансы", "finance")
+            _add("Domains", "inventory", "Склад", "inventory")
+            _add("Domains", "documents", "Документы", "documents")
+            _add("Domains", "ads", "Реклама", "ads")
+            _add("Domains", "crm", "Продажи", "crm")
+        if feature_access["operations_workflows"]["allowed"]:
+            if not feature_access["business_os"]["allowed"]:
+                _add("Domains", "finance", "Финансы", "finance")
+                _add("Domains", "documents", "Документы", "documents")
+                _add("Domains", "ads", "Реклама", "ads")
+            _add("Domains", "billing", "Банк и оплаты", "billing")
+        if feature_access["people_execution"]["allowed"]:
+            _add("Management", "people", "Люди", "people")
+        if feature_access["payroll_kpi"]["allowed"]:
+            _add("Management", "payroll", "Зарплата", "payroll")
+        if _is_manager_role(runtime.role_code):
+            _add("Management", "members", "Команда", "members")
         if "alerts.read" in permissions or "tasks.read" in permissions or "*" in permissions:
-            items.append({"key": "alerts_tasks", "label": "Alerts / Tasks", "path": "alerts-tasks"})
-        if _is_manager_role(runtime.role_code):
-            items.append({"key": "members", "label": "Members", "path": "members"})
+            _add("Management", "alerts_tasks", "Задачи", "alerts-tasks")
+        if feature_access["communication_intelligence"]["allowed"]:
+            _add("Management", "communications", "Коммуникации", "communications")
         if ("integrations.manage" in permissions or "*" in permissions) and feature_access["integrations_setup"]["allowed"]:
-            items.append({"key": "integrations", "label": "Integrations", "path": "integrations"})
+            _add("System", "integrations", "Интеграции", "integrations")
         if ({"integrations.manage", "rules.manage", "tasks.read", "alerts.read"}.issubset(permissions) or "*" in permissions) and feature_access["ops_console"]["allowed"]:
-            items.append({"key": "ops_sync", "label": "Ops / Sync", "path": "ops-sync"})
+            _add("System", "ops_sync", "Синхронизация", "ops-sync")
+        if feature_access["knowledge_base"]["allowed"]:
+            _add("System", "knowledge", "База знаний", "knowledge")
+        if feature_access["ai_copilot"]["allowed"]:
+            _add("System", "ai_workspace", "ИИ", "ai-workspace")
         if _is_manager_role(runtime.role_code):
-            items.append({"key": "settings", "label": "Settings", "path": "settings"})
+            _add("System", "settings", "Настройки", "settings")
         return items
+
+    def _primary_contours(runtime: ResolvedRuntimeContext, page: str) -> list[dict[str, object]]:
+        feature_access = _feature_access_map(runtime.account)
+        account_slug = runtime.account.slug
+        team_href = f"/admin/{account_slug}/people" if feature_access["people_execution"]["allowed"] else f"/admin/{account_slug}/alerts-tasks"
+        money_href = f"/admin/{account_slug}/finance" if feature_access["operations_workflows"]["allowed"] else f"/admin/{account_slug}/dashboard"
+        warehouse_href = f"/admin/{account_slug}/inventory"
+        control_href = f"/admin/{account_slug}/dashboard"
+        return [
+            {
+                "key": "team",
+                "label": "Команда",
+                "hint": "люди, задачи, KPI и зарплата",
+                "href": team_href,
+                "active": page in {"people", "alerts_tasks", "payroll", "members"},
+            },
+            {
+                "key": "money",
+                "label": "Деньги",
+                "hint": "расходы, оплаты и обязательства",
+                "href": money_href,
+                "active": page in {"billing", "finance", "ads"},
+            },
+            {
+                "key": "warehouse",
+                "label": "Склад",
+                "hint": "остатки, пополнение, закупка и приемка",
+                "href": warehouse_href,
+                "active": page in {"operations", "inventory", "delivery"},
+            },
+            {
+                "key": "control",
+                "label": "Контроль",
+                "hint": "главная панель, ИИ и настройка процессов",
+                "href": control_href,
+                "active": page in {"dashboard", "brief", "ai_workspace", "settings", "integrations", "notifications", "legacy", "advisor", "copilot", "goals"},
+            },
+        ]
 
     def _provider_catalog() -> list[dict[str, object]]:
         return [
@@ -493,19 +7852,27 @@ def create_app() -> FastAPI:
                 "provider_kind": "ads",
                 "provider_name": "avito",
                 "label": "Avito",
-                "description": "Avito ads + leads sync with token-based credentials.",
+                "description": "Синхронизация кампаний, метрик и лидов Avito по токену доступа.",
+                "supports_sync": True,
+                "supported_connection_modes": ["polling", "manual"],
+                "supported_sync_modes": ["manual", "scheduled"],
+                "connection_mode_default": "polling",
+                "sync_mode_default": "manual",
+                "workflow_label": "загрузка по запросу",
+                "setup_hint": "После сохранения проверьте соединение и запускайте первый sync из этого экрана.",
+                "quick_tip": "Обычно хватает токена доступа и внешнего ID аккаунта.",
                 "fields": [
-                    {"key": "access_token", "label": "Access token", "kind": "secret", "required": True},
-                    {"key": "account_external_id", "label": "Account external id", "kind": "text", "required": True},
-                    {"key": "base_url", "label": "Base URL", "kind": "text"},
-                    {"key": "timeout_seconds", "label": "Timeout seconds", "kind": "number"},
-                    {"key": "max_retries", "label": "Max retries", "kind": "number"},
-                    {"key": "backoff_seconds", "label": "Backoff seconds", "kind": "number"},
-                    {"key": "campaigns_params", "label": "Campaign params JSON", "kind": "json"},
-                    {"key": "metrics_params", "label": "Metrics params JSON", "kind": "json"},
-                    {"key": "leads_params", "label": "Leads params JSON", "kind": "json"},
-                    {"key": "lead_sources", "label": "Lead sources JSON", "kind": "json"},
-                    {"key": "fixture_payload", "label": "Fixture payload JSON", "kind": "json"},
+                    {"key": "access_token", "label": "API token", "kind": "secret", "required": True, "basic": True},
+                    {"key": "account_external_id", "label": "ID аккаунта в Avito", "kind": "text", "required": True, "basic": True},
+                    {"key": "base_url", "label": "API URL", "kind": "text", "advanced": True},
+                    {"key": "timeout_seconds", "label": "Таймаут, сек", "kind": "number", "advanced": True},
+                    {"key": "max_retries", "label": "Повторы при ошибке", "kind": "number", "advanced": True},
+                    {"key": "backoff_seconds", "label": "Пауза между повторами, сек", "kind": "number", "advanced": True},
+                    {"key": "campaigns_params", "label": "Параметры кампаний JSON", "kind": "json", "advanced": True},
+                    {"key": "metrics_params", "label": "Параметры метрик JSON", "kind": "json", "advanced": True},
+                    {"key": "leads_params", "label": "Параметры лидов JSON", "kind": "json", "advanced": True},
+                    {"key": "lead_sources", "label": "Источники лидов JSON", "kind": "json", "advanced": True},
+                    {"key": "fixture_payload", "label": "Тестовый payload JSON", "kind": "json", "advanced": True},
                 ],
             },
             {
@@ -513,25 +7880,79 @@ def create_app() -> FastAPI:
                 "provider_kind": "erp",
                 "provider_name": "moysklad",
                 "label": "MoySklad",
-                "description": "MoySklad ERP sync for canonical business tables.",
+                "description": "Синхронизация товаров, остатков, движений и закупок из МойСклад.",
+                "supports_sync": True,
+                "supported_connection_modes": ["polling", "manual"],
+                "supported_sync_modes": ["manual", "scheduled"],
+                "connection_mode_default": "polling",
+                "sync_mode_default": "manual",
+                "workflow_label": "загрузка по запросу",
+                "setup_hint": "Используйте для products, stock, movements и purchases sync в canonical tables.",
+                "quick_tip": "Обычно достаточно логина и пароля от API МойСклад.",
                 "fields": [
-                    {"key": "login", "label": "Login", "kind": "text", "required": True},
-                    {"key": "password", "label": "Password", "kind": "secret", "required": True},
-                    {"key": "base_url", "label": "Base URL", "kind": "text"},
-                    {"key": "timeout_seconds", "label": "Timeout seconds", "kind": "number"},
-                    {"key": "fixture_payload", "label": "Fixture payload JSON", "kind": "json"},
+                    {"key": "login", "label": "Логин API", "kind": "text", "required": True, "basic": True},
+                    {"key": "password", "label": "Пароль API", "kind": "secret", "required": True, "basic": True},
+                    {"key": "base_url", "label": "API URL", "kind": "text", "advanced": True},
+                    {"key": "timeout_seconds", "label": "Таймаут, сек", "kind": "number", "advanced": True},
+                    {"key": "fixture_payload", "label": "Тестовый payload JSON", "kind": "json", "advanced": True},
                 ],
             },
             {
                 "key": "banking:generic_bank",
                 "provider_kind": "banking",
                 "provider_name": "generic_bank",
-                "label": "Generic Bank Feed",
-                "description": "Canonical bank feed path. Fixture payload is the primary local setup mode.",
+                "label": "Банк",
+                "description": "Загрузка банковских счетов, остатков и операций через тестовый или рабочий канал.",
+                "supports_sync": True,
+                "supported_connection_modes": ["polling", "manual"],
+                "supported_sync_modes": ["manual", "scheduled"],
+                "connection_mode_default": "polling",
+                "sync_mode_default": "manual",
+                "workflow_label": "загрузка по запросу",
+                "setup_hint": "Для local setup можно начать с fixture_payload, затем переключиться на live feed.",
+                "quick_tip": "Для боевого подключения чаще всего нужен API URL и API token. JSON-фикстура нужна только для тестового режима.",
                 "fields": [
-                    {"key": "fixture_payload", "label": "Fixture payload JSON", "kind": "json"},
-                    {"key": "base_url", "label": "Bank feed URL", "kind": "text"},
-                    {"key": "access_token", "label": "Access token", "kind": "secret"},
+                    {"key": "base_url", "label": "API URL банка", "kind": "text", "basic": True},
+                    {"key": "access_token", "label": "API token", "kind": "secret", "basic": True},
+                    {"key": "fixture_payload", "label": "Тестовый payload JSON", "kind": "json", "advanced": True},
+                ],
+            },
+            {
+                "key": "messaging:telegram",
+                "provider_kind": "messaging",
+                "provider_name": "telegram",
+                "label": "Telegram",
+                "description": "Подключение обычного Telegram-аккаунта через QR и отправка уведомлений в Saved Messages.",
+                "supports_sync": False,
+                "supported_connection_modes": ["manual"],
+                "supported_sync_modes": ["manual"],
+                "connection_mode_default": "manual",
+                "sync_mode_default": "manual",
+                "workflow_label": "qr login",
+                "setup_hint": "Создайте интеграцию, откройте QR-блок и войдите обычным Telegram-аккаунтом через сканирование.",
+                "quick_tip": "Бот-токен больше не нужен. Нужны только PLATFORM_TELEGRAM_API_ID и PLATFORM_TELEGRAM_API_HASH на уровне платформы.",
+                "fields": [],
+            },
+            {
+                "key": "messaging:whatsapp",
+                "provider_kind": "messaging",
+                "provider_name": "whatsapp",
+                "label": "WhatsApp",
+                "description": "Прием входящих сообщений WhatsApp через webhook и отправка через Graph API.",
+                "supports_sync": False,
+                "supported_connection_modes": ["webhook"],
+                "supported_sync_modes": ["manual"],
+                "connection_mode_default": "webhook",
+                "sync_mode_default": "manual",
+                "workflow_label": "только webhook",
+                "setup_hint": "После сохранения зарегистрируйте webhook Meta/WhatsApp на runtime endpoint ниже.",
+                "quick_tip": "Минимум для запуска: API token и Phone Number ID. Для production добавьте verify token и app secret.",
+                "fields": [
+                    {"key": "api_token", "label": "API token", "kind": "secret", "required": True, "basic": True},
+                    {"key": "phone_number_id", "label": "Phone Number ID", "kind": "text", "required": True, "basic": True},
+                    {"key": "app_secret", "label": "App secret", "kind": "secret", "advanced": True},
+                    {"key": "verify_token", "label": "Verify token", "kind": "secret", "advanced": True},
+                    {"key": "timeout_seconds", "label": "Таймаут, сек", "kind": "number", "advanced": True},
                 ],
             },
         ]
@@ -542,6 +7963,328 @@ def create_app() -> FastAPI:
             if item["key"] == provider_key:
                 return item
         return None
+
+    def _integration_webhook_url(integration: Integration) -> str | None:
+        if integration.provider_kind != "messaging":
+            return None
+        if integration.webhook_url:
+            return integration.webhook_url
+        if settings.public_base_url:
+            return f"{settings.public_base_url}/webhooks/messaging/{integration.id}"
+        return f"/webhooks/messaging/{integration.id}"
+
+    def _qr_data_uri(value: str | None) -> str | None:
+        if not value:
+            return None
+        qr_image = qrcode.make(value)
+        buffer = BytesIO()
+        qr_image.save(buffer, format="PNG")
+        encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+        return f"data:image/png;base64,{encoded}"
+
+    def _telegram_identity_from_settings(settings_payload: dict[str, object] | None) -> dict[str, object] | None:
+        payload = settings_payload if isinstance(settings_payload, dict) else {}
+        user_id = payload.get("telegram_user_id")
+        if user_id in (None, ""):
+            return None
+        display_name = str(payload.get("telegram_display_name") or "").strip()
+        username = str(payload.get("telegram_username") or "").strip() or None
+        phone = str(payload.get("telegram_phone") or "").strip() or None
+        return {
+            "user_id": int(user_id),
+            "username": username,
+            "phone": phone,
+            "display_name": display_name or (f"@{username}" if username else (f"+{phone}" if phone else str(user_id))),
+        }
+
+    def _telegram_connection_payload(
+        integration: Integration,
+        *,
+        manager_snapshot=None,
+        setup: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        setup_payload = setup if isinstance(setup, dict) else {}
+        masked = setup_payload.get("masked_credentials") if isinstance(setup_payload.get("masked_credentials"), dict) else {}
+        settings_payload = integration.settings_json if isinstance(integration.settings_json, dict) else {}
+        connected_identity = _telegram_identity_from_settings(settings_payload)
+        connected = bool(masked.get("session_string")) and connected_identity is not None
+        response: dict[str, object] = {
+            "integration_id": integration.id,
+            "display_name": integration.display_name,
+            "connected": connected,
+            "state": "connected" if connected else "idle",
+            "message": "Telegram-аккаунт подключен." if connected else "Telegram-аккаунт еще не подключен.",
+            "account": connected_identity,
+            "qr_url": None,
+            "qr_image_data_uri": None,
+            "expires_at": None,
+            "requires_password": False,
+            "pending": False,
+        }
+        if manager_snapshot is not None and getattr(manager_snapshot, "state", "idle") != "idle":
+            response.update(
+                {
+                    "state": getattr(manager_snapshot, "state", "idle"),
+                    "message": (
+                        getattr(manager_snapshot, "error_message", None)
+                        or (
+                            "QR-код готов. Отсканируйте его в приложении Telegram."
+                            if getattr(manager_snapshot, "state", "idle") == "pending"
+                            else "Telegram-аккаунт подключен."
+                            if getattr(manager_snapshot, "state", "idle") == "connected"
+                            else "Для этого аккаунта нужен облачный пароль Telegram."
+                            if getattr(manager_snapshot, "state", "idle") == "password_required"
+                            else "Не удалось подключить Telegram-аккаунт."
+                        )
+                    ),
+                    "account": getattr(getattr(manager_snapshot, "identity", None), "as_dict", lambda: response["account"])(),
+                    "qr_url": getattr(manager_snapshot, "qr_url", None),
+                    "qr_image_data_uri": _qr_data_uri(getattr(manager_snapshot, "qr_url", None)),
+                    "expires_at": _serialize_datetime(getattr(manager_snapshot, "expires_at", None)),
+                    "requires_password": getattr(manager_snapshot, "state", "idle") == "password_required",
+                    "pending": getattr(manager_snapshot, "state", "idle") == "pending",
+                }
+            )
+        return response
+
+    async def _refresh_telegram_qr_login(runtime: ResolvedRuntimeContext, session: Session, integration_id: int) -> dict[str, object]:
+        if not settings.telegram_api_id or not settings.telegram_api_hash:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="PLATFORM_TELEGRAM_API_ID and PLATFORM_TELEGRAM_API_HASH must be configured first.",
+            )
+        integration = session.execute(
+            select(Integration).where(
+                Integration.account_id == runtime.account.id,
+                Integration.id == integration_id,
+                Integration.provider_kind == "messaging",
+                Integration.provider_name == "telegram",
+            )
+        ).scalar_one_or_none()
+        if integration is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Telegram integration not found.")
+        manager_snapshot = await telegram_qr_login_manager.refresh(
+            integration_id=integration.id,
+            api_id=settings.telegram_api_id,
+            api_hash=settings.telegram_api_hash,
+        )
+        setup = RuntimeIntegrationService(session).integration_setup_payload(runtime.context, integration_id=integration.id)
+        return _telegram_connection_payload(integration, manager_snapshot=manager_snapshot, setup=setup)
+
+    async def _telegram_qr_status_payload(runtime: ResolvedRuntimeContext, session: Session, integration_id: int) -> dict[str, object]:
+        integration = session.execute(
+            select(Integration).where(
+                Integration.account_id == runtime.account.id,
+                Integration.id == integration_id,
+                Integration.provider_kind == "messaging",
+                Integration.provider_name == "telegram",
+            )
+        ).scalar_one_or_none()
+        if integration is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Telegram integration not found.")
+        manager_snapshot = telegram_qr_login_manager.snapshot(integration.id)
+        if manager_snapshot.state == "connected":
+            consumed = await telegram_qr_login_manager.consume_authorized_session(integration.id)
+            if consumed is not None:
+                session_string, identity = consumed
+                service = RuntimeIntegrationService(session)
+                service.save_credentials(
+                    runtime.context,
+                    integration_id=integration.id,
+                    secret_payload={"session_string": session_string},
+                    replace_mode="replace",
+                )
+                settings_payload = dict(integration.settings_json) if isinstance(integration.settings_json, dict) else {}
+                settings_payload.update(
+                    {
+                        "auth_kind": "telegram_user_account",
+                        "telegram_user_id": identity.user_id,
+                        "telegram_username": identity.username,
+                        "telegram_phone": identity.phone,
+                        "telegram_display_name": identity.display_name,
+                        "connected_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                )
+                service.update_integration(
+                    runtime.context,
+                    integration_id=integration.id,
+                    settings_json=settings_payload,
+                    connection_mode="manual",
+                    sync_mode="manual",
+                )
+                integration = session.execute(select(Integration).where(Integration.id == integration.id)).scalar_one()
+                manager_snapshot = telegram_qr_login_manager.snapshot(integration.id)
+        setup = RuntimeIntegrationService(session).integration_setup_payload(runtime.context, integration_id=integration.id)
+        return _telegram_connection_payload(integration, manager_snapshot=manager_snapshot, setup=setup)
+
+    async def _submit_telegram_qr_password(
+        runtime: ResolvedRuntimeContext,
+        session: Session,
+        integration_id: int,
+        password: str,
+    ) -> dict[str, object]:
+        integration = session.execute(
+            select(Integration).where(
+                Integration.account_id == runtime.account.id,
+                Integration.id == integration_id,
+                Integration.provider_kind == "messaging",
+                Integration.provider_name == "telegram",
+            )
+        ).scalar_one_or_none()
+        if integration is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Telegram integration not found.")
+        await telegram_qr_login_manager.submit_password(integration.id, password)
+        return await _telegram_qr_status_payload(runtime, session, integration.id)
+
+    def _integration_credential_health(provider_spec: dict[str, object] | None, setup: dict[str, object] | None) -> dict[str, object]:
+        masked = setup.get("masked_credentials") if isinstance(setup, dict) else {}
+        masked = masked if isinstance(masked, dict) else {}
+        rotated_at = setup.get("credential_last_rotated_at") if isinstance(setup, dict) else None
+        required_fields = [
+            str(item.get("key"))
+            for item in (provider_spec or {}).get("fields", [])
+            if isinstance(item, dict) and item.get("required")
+        ]
+        missing_required = [key for key in required_fields if key not in masked]
+        configured = bool(masked)
+        stale = False
+        if isinstance(rotated_at, datetime):
+            stale = rotated_at < datetime.now(timezone.utc) - timedelta(days=90)
+        status_code = "healthy" if configured and not missing_required and not stale else "warning" if configured else "critical"
+        return {
+            "configured": configured,
+            "required_fields": required_fields,
+            "missing_required": missing_required,
+            "stale": stale,
+            "status": status_code,
+        }
+
+    def _integration_security_posture(provider_spec: dict[str, object] | None, setup: dict[str, object] | None) -> dict[str, object]:
+        integration = setup.get("integration") if isinstance(setup, dict) else None
+        masked = setup.get("masked_credentials") if isinstance(setup, dict) else {}
+        masked = masked if isinstance(masked, dict) else {}
+        if integration is None or getattr(integration, "provider_kind", None) != "messaging":
+            return {
+                "mode": "n/a",
+                "status": "healthy",
+                "summary": "Для этого типа провайдера отдельные настройки webhook-защиты не нужны.",
+                "checklist": [],
+            }
+        provider_name = str(getattr(integration, "provider_name", "") or "")
+        checklist: list[dict[str, object]] = []
+        if provider_name == "telegram":
+            has_session = "session_string" in masked
+            identity = _telegram_identity_from_settings(integration.settings_json if isinstance(integration.settings_json, dict) else {})
+            checklist = [
+                {"label": "QR-вход завершен", "ready": has_session},
+                {"label": "Профиль Telegram определен", "ready": identity is not None},
+                {"label": "Platform Telegram dev app задан", "ready": bool(settings.telegram_api_id and settings.telegram_api_hash)},
+            ]
+            mode = "user-session"
+            if has_session and identity is not None:
+                status_code = "healthy"
+                summary = "Подключен обычный Telegram-аккаунт. Уведомления отправляются в Saved Messages этого аккаунта."
+            elif has_session:
+                status_code = "warning"
+                summary = "Telegram session сохранена, но профиль пока не записан в metadata интеграции."
+            else:
+                status_code = "critical"
+                summary = "Telegram-аккаунт еще не подключен через QR."
+            return {"mode": mode, "status": status_code, "summary": summary, "checklist": checklist}
+        if provider_name == "whatsapp":
+            has_api_token = "api_token" in masked
+            has_app_secret = "app_secret" in masked
+            has_verify_token = "verify_token" in masked
+            checklist = [
+                {"label": "API-токен сохранен", "ready": has_api_token},
+                {"label": "App secret задан для проверки подписи", "ready": has_app_secret},
+                {"label": "Verify token задан для проверки Meta webhook", "ready": has_verify_token},
+                {"label": "Адрес webhook подтвержден у WhatsApp", "ready": bool(getattr(integration, "webhook_url", None))},
+            ]
+            if has_api_token and has_app_secret and has_verify_token:
+                status_code = "healthy"
+                mode = "hmac+verify"
+                summary = "Запросы WhatsApp webhook проверяются по подписи и по verify token."
+            elif has_api_token and (has_app_secret or has_verify_token):
+                status_code = "warning"
+                mode = "partial"
+                summary = "Настройка выполнена частично: для production нужны и app_secret, и verify_token."
+            elif has_api_token:
+                status_code = "warning"
+                mode = "open"
+                summary = "API-токен задан, но webhook пока недостаточно защищен."
+            else:
+                status_code = "critical"
+                mode = "open"
+                summary = "API-токен WhatsApp не задан."
+            return {"mode": mode, "status": status_code, "summary": summary, "checklist": checklist}
+        return {
+            "mode": "none",
+            "status": "warning",
+            "summary": "Для этого провайдера пока нет отдельного профиля webhook-защиты.",
+            "checklist": [],
+        }
+
+    def _load_integration_credentials(session: Session, integration: Integration) -> dict[str, object]:
+        return RuntimeIntegrationService(session)._load_credentials(integration)
+
+    def _log_integration_event(
+        session: Session,
+        integration: Integration,
+        *,
+        level: str,
+        event_type: str,
+        status_code: str,
+        message: str,
+        payload: dict[str, object] | None = None,
+        request_id: str | None = None,
+    ) -> None:
+        session.add(
+            IntegrationLog(
+                account_id=integration.account_id,
+                integration_id=integration.id,
+                sync_job_id=None,
+                level=level,
+                event_type=event_type,
+                status=status_code,
+                provider_kind=integration.provider_kind,
+                provider_name=integration.provider_name,
+                request_id=request_id,
+                message=message,
+                payload_json=payload or {},
+            )
+        )
+        session.flush()
+
+    def _verify_messaging_webhook(
+        *,
+        integration: Integration,
+        credentials: dict[str, object],
+        headers: dict[str, str],
+        body: bytes,
+    ) -> tuple[bool, str, dict[str, object]]:
+        normalized_headers = {str(key).lower(): str(value) for key, value in headers.items()}
+        if integration.provider_name == "telegram":
+            expected_secret = str(credentials.get("webhook_secret") or "").strip()
+            if not expected_secret:
+                return True, "telegram webhook secret not configured", {"auth_mode": "open"}
+            actual_secret = normalized_headers.get("x-telegram-bot-api-secret-token", "").strip()
+            if secrets.compare_digest(actual_secret, expected_secret):
+                return True, "telegram webhook secret validated", {"auth_mode": "secret_token"}
+            return False, "telegram webhook secret mismatch", {"auth_mode": "secret_token"}
+        if integration.provider_name == "whatsapp":
+            app_secret = str(credentials.get("app_secret") or "").strip()
+            if not app_secret:
+                return True, "whatsapp app secret not configured", {"auth_mode": "open"}
+            signature = normalized_headers.get("x-hub-signature-256", "").strip()
+            if not signature.startswith("sha256="):
+                return False, "whatsapp signature header missing", {"auth_mode": "hmac_sha256"}
+            expected = hmac.new(app_secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+            actual = signature.removeprefix("sha256=").strip()
+            if secrets.compare_digest(actual, expected):
+                return True, "whatsapp signature validated", {"auth_mode": "hmac_sha256"}
+            return False, "whatsapp signature mismatch", {"auth_mode": "hmac_sha256"}
+        return True, "webhook verification is not configured for this provider", {"auth_mode": "none"}
 
     def _admin_context(
         request: Request,
@@ -559,6 +8302,7 @@ def create_app() -> FastAPI:
             "page_path": _admin_page_path(page),
             "accessible_accounts": _accessible_accounts(session, actor_email),
             "nav_items": _admin_nav_items(runtime),
+            "primary_contours": _primary_contours(runtime, page),
             "can_manage_integrations": "*" in runtime.permissions or "integrations.manage" in runtime.permissions,
             "can_manage_goals": "*" in runtime.permissions or "rules.manage" in runtime.permissions,
             "can_manage_knowledge": "*" in runtime.permissions or "documents.manage" in runtime.permissions,
@@ -572,9 +8316,28 @@ def create_app() -> FastAPI:
             "feature_access": feature_access,
             "csrf_token": _ensure_session_csrf_token(request),
             "flashes": _pop_flashes(request),
+            "admin_asset_version": settings.app_version,
             "shell_brand_title": account_settings["branding_title"] or "Hermes Admin",
             "shell_brand_subtitle": account_settings["branding_subtitle"] or "Owner / operator console",
         }
+
+    def _rebuild_nav_items(account_slug: str) -> list[dict[str, str]]:
+        return [
+            {"key": "home", "label": "Главная", "href": f"/admin/{account_slug}/v2"},
+            {"key": "finance", "label": "Финансы", "href": f"/admin/{account_slug}/v2/finance"},
+            {"key": "inventory", "label": "Склад", "href": f"/admin/{account_slug}/v2/inventory"},
+            {"key": "documents", "label": "Документы", "href": f"/admin/{account_slug}/v2/documents"},
+            {"key": "ads", "label": "Реклама", "href": f"/admin/{account_slug}/v2/ads"},
+            {"key": "sales", "label": "Продажи", "href": f"/admin/{account_slug}/v2/sales"},
+            {"key": "tasks", "label": "Задачи", "href": f"/admin/{account_slug}/v2/tasks"},
+            {"key": "control", "label": "Контроль", "href": f"/admin/{account_slug}/v2/control"},
+            {"key": "people", "label": "Люди", "href": f"/admin/{account_slug}/v2/people"},
+            {"key": "kpi", "label": "KPI", "href": f"/admin/{account_slug}/v2/kpi"},
+            {"key": "integrations", "label": "Интеграции", "href": f"/admin/{account_slug}/v2/integrations"},
+            {"key": "knowledge", "label": "База знаний", "href": f"/admin/{account_slug}/v2/knowledge"},
+            {"key": "ai", "label": "ИИ", "href": f"/admin/{account_slug}/v2/ai"},
+            {"key": "settings", "label": "Настройки", "href": f"/admin/{account_slug}/v2/settings"},
+        ]
 
     def _status_weight(status_code: str | None) -> int:
         return {"critical": 3, "warning": 2, "healthy": 1, "on_track": 1}.get(str(status_code or "").strip(), 0)
@@ -1113,6 +8876,7 @@ def create_app() -> FastAPI:
             "default_owner_user_id": None,
             "default_operator_user_id": None,
             "notification_email_recipients": [],
+            "notification_telegram_integration_ids": [],
             "notification_telegram_chat_ids": [],
             "notification_webhook_url": "",
             "export_notifications_to_obsidian": True,
@@ -1164,6 +8928,547 @@ def create_app() -> FastAPI:
                 }
             )
         return rows
+
+    def _ai_workspace_scenarios(runtime: ResolvedRuntimeContext, session: Session) -> list[dict[str, object]]:
+        defaults = _default_account_users(runtime, session)
+        owner_name = (defaults.get("owner").full_name if defaults.get("owner") is not None else None) or "owner"
+        operator_name = (defaults.get("operator").full_name if defaults.get("operator") is not None else None) or "operator"
+        account_slug = runtime.account.slug
+        return [
+            {
+                "key": "finance_expense",
+                "label": "Расход или платеж",
+                "summary": "ИИ задает вопросы по сумме, категории, контрагенту и основанию, затем подсказывает куда вносить запись.",
+                "target_label": "Финансы",
+                "target_href": f"/admin/{account_slug}/finance",
+                "bot_command": "/expense",
+                "required_fields": ["сумма", "категория", "дата", "комментарий или основание"],
+                "roles": [owner_name, operator_name, "финансы / бухгалтер"],
+                "create_enabled": True,
+                "create_label": "Создать расход",
+                "fields": [
+                    {"key": "amount", "label": "Сумма", "kind": "number", "required": True, "placeholder": "1500"},
+                    {"key": "category", "label": "Категория", "kind": "select", "required": True, "options_key": "expense_categories"},
+                    {"key": "expense_date", "label": "Дата", "kind": "date", "required": True},
+                    {"key": "description", "label": "Комментарий", "kind": "textarea", "required": False, "placeholder": "За что платим и на каком основании"},
+                ],
+            },
+            {
+                "key": "warehouse_purchase",
+                "label": "Закупка",
+                "summary": "ИИ собирает данные по товару, поставщику, количеству, цене и сроку поставки, затем ведет в закупку.",
+                "target_label": "Склад",
+                "target_href": f"/admin/{account_slug}/inventory?section=purchase&period=month",
+                "bot_command": "/purchase",
+                "required_fields": ["товар", "поставщик", "количество", "цена", "срок"],
+                "roles": [operator_name, "склад / снабжение"],
+                "create_enabled": True,
+                "create_label": "Создать закупку",
+                "fields": [
+                    {"key": "product_id", "label": "Товар", "kind": "select", "required": True, "options_key": "products"},
+                    {"key": "warehouse_id", "label": "Склад", "kind": "select", "required": False, "options_key": "warehouses"},
+                    {"key": "supplier_customer_id", "label": "Поставщик", "kind": "select", "required": False, "options_key": "customers"},
+                    {"key": "quantity", "label": "Количество", "kind": "number", "required": True, "placeholder": "1"},
+                    {"key": "unit_cost", "label": "Цена за единицу", "kind": "number", "required": True, "placeholder": "0"},
+                    {"key": "notes", "label": "Комментарий", "kind": "textarea", "required": False, "placeholder": "Срок, условия, что уточнить"},
+                ],
+            },
+            {
+                "key": "warehouse_receive",
+                "label": "Приемка",
+                "summary": "ИИ проверяет наличие накладной, склад, товарные позиции и расхождения перед приемкой.",
+                "target_label": "Склад",
+                "target_href": f"/admin/{account_slug}/inventory?section=receiving&period=month",
+                "bot_command": "/receive",
+                "required_fields": ["документ поставщика", "склад", "позиции", "количество", "расхождения"],
+                "roles": [operator_name, "склад"],
+            },
+            {
+                "key": "team_task",
+                "label": "Задача сотруднику",
+                "summary": "ИИ помогает сформулировать задачу, срок, критерий готовности и ответственного, затем отправляет в задачи.",
+                "target_label": "Люди и задачи",
+                "target_href": f"/admin/{account_slug}/people",
+                "bot_command": "/hub",
+                "required_fields": ["что сделать", "кто отвечает", "срок", "критерий готовности", "приоритет"],
+                "roles": [owner_name, operator_name],
+                "create_enabled": True,
+                "create_label": "Создать задачу",
+                "fields": [
+                    {"key": "title", "label": "Что сделать", "kind": "text", "required": True, "placeholder": "Позвонить поставщику и подтвердить наличие"},
+                    {"key": "description", "label": "Описание", "kind": "textarea", "required": False, "placeholder": "Что считается результатом и что эскалировать"},
+                    {"key": "assignee_employee_id", "label": "Ответственный", "kind": "select", "required": True, "options_key": "employees"},
+                    {"key": "priority", "label": "Приоритет", "kind": "select", "required": True, "options_key": "task_priorities"},
+                    {"key": "due_at", "label": "Срок", "kind": "datetime-local", "required": False},
+                ],
+            },
+            {
+                "key": "customer_deal",
+                "label": "Клиент / сделка",
+                "summary": "ИИ уточняет клиента, источник, этап, сумму и следующий шаг, после чего ведет в CRM или документы.",
+                "target_label": "CRM",
+                "target_href": f"/admin/{account_slug}/crm",
+                "bot_command": "/docs",
+                "required_fields": ["клиент", "контакт", "источник", "этап", "следующий шаг"],
+                "roles": [owner_name, operator_name, "продажи"],
+            },
+        ]
+
+    def _ai_workspace_option_lists(runtime: ResolvedRuntimeContext, session: Session) -> dict[str, list[dict[str, object]]]:
+        employees = [
+            {
+                "value": employee.id,
+                "label": employee.full_name,
+                "hint": employee.role_title or employee.department or employee.email or "",
+            }
+            for employee in PeopleService(session).list_employees(runtime.context, status="active")
+        ]
+        operations_service = OperationsService(session)
+        products = [
+            {
+                "value": product.id,
+                "label": product.name,
+                "hint": product.sku or product.unit or "",
+            }
+            for product in operations_service.list_products(runtime.context)
+        ]
+        warehouses = [
+            {
+                "value": warehouse.id,
+                "label": warehouse.name,
+                "hint": warehouse.location or warehouse.code or "",
+            }
+            for warehouse in operations_service.list_warehouses(runtime.context)
+        ]
+        customers = [
+            {
+                "value": customer.id,
+                "label": customer.name,
+                "hint": customer.inn or customer.phone or customer.email or "",
+            }
+            for customer in session.execute(
+                select(Customer).where(Customer.account_id == runtime.account.id).order_by(Customer.name.asc(), Customer.id.asc()).limit(120)
+            ).scalars().all()
+        ]
+        return {
+            "employees": employees,
+            "products": products,
+            "warehouses": warehouses,
+            "customers": customers,
+            "expense_categories": [
+                {"value": "реклама", "label": "Реклама"},
+                {"value": "логистика", "label": "Логистика"},
+                {"value": "зарплата", "label": "Зарплата"},
+                {"value": "аренда", "label": "Аренда"},
+                {"value": "закупка", "label": "Закупка"},
+                {"value": "налоги", "label": "Налоги"},
+                {"value": "хозрасходы", "label": "Хозрасходы"},
+                {"value": "прочее", "label": "Прочее"},
+            ],
+            "task_priorities": [
+                {"value": "low", "label": "Низкий"},
+                {"value": "normal", "label": "Обычный"},
+                {"value": "high", "label": "Высокий"},
+                {"value": "critical", "label": "Критичный"},
+            ],
+        }
+
+    def _ai_workspace_normalize(value: str | None) -> str:
+        return " ".join(str(value or "").strip().lower().split())
+
+    def _ai_workspace_match_option(raw_value: str | None, options: list[dict[str, object]]) -> int | None:
+        normalized = _ai_workspace_normalize(raw_value)
+        if not normalized:
+            return None
+        for item in options:
+            if str(item.get("value")) == normalized:
+                return int(item["value"])
+        for item in options:
+            label = _ai_workspace_normalize(str(item.get("label") or ""))
+            hint = _ai_workspace_normalize(str(item.get("hint") or ""))
+            if normalized == label or (hint and normalized == hint):
+                return int(item["value"])
+        for item in options:
+            label = _ai_workspace_normalize(str(item.get("label") or ""))
+            hint = _ai_workspace_normalize(str(item.get("hint") or ""))
+            if normalized in label or label in normalized or (hint and (normalized in hint or hint in normalized)):
+                return int(item["value"])
+        return None
+
+    def _ai_workspace_parse_date(raw_value: str | None) -> str | None:
+        text = str(raw_value or "").strip()
+        if not text:
+            return None
+        for pattern in ("%Y-%m-%d", "%d.%m.%Y", "%d-%m-%Y"):
+            try:
+                return datetime.strptime(text, pattern).date().isoformat()
+            except ValueError:
+                continue
+        return None
+
+    def _ai_workspace_parse_due_at(raw_value: str | None) -> str | None:
+        text = str(raw_value or "").strip()
+        if not text:
+            return None
+        candidates = [
+            text,
+            text.replace(" ", "T"),
+        ]
+        for candidate in candidates:
+            try:
+                parsed = datetime.fromisoformat(candidate)
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                return parsed.isoformat()
+            except ValueError:
+                continue
+        parsed_date = _ai_workspace_parse_date(text)
+        return f"{parsed_date}T18:00:00+00:00" if parsed_date else None
+
+    def _ai_workspace_extract_fallback(
+        scenario: dict[str, object],
+        note_text: str,
+        option_lists: dict[str, list[dict[str, object]]],
+    ) -> dict[str, object]:
+        text = note_text.strip()
+        lines = [line.strip(" -•\t") for line in text.splitlines() if line.strip()]
+        joined = " ".join(lines)
+        amount_match = re.search(r"(\d+(?:[.,]\d{1,2})?)", joined.replace(" ", ""))
+        iso_date_match = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", joined)
+        ru_date_match = re.search(r"\b(\d{2}[.]\d{2}[.]\d{4})\b", joined)
+        prefill: dict[str, object] = {}
+        if scenario["key"] == "finance_expense":
+            if amount_match:
+                prefill["amount"] = amount_match.group(1).replace(",", ".")
+            prefill["expense_date"] = (
+                _ai_workspace_parse_date(iso_date_match.group(1) if iso_date_match else None)
+                or _ai_workspace_parse_date(ru_date_match.group(1) if ru_date_match else None)
+                or date.today().isoformat()
+            )
+            category_hits = {item["value"]: _ai_workspace_normalize(str(item["label"])) for item in option_lists.get("expense_categories", [])}
+            matched_category = next((key for key, value in category_hits.items() if value and value in _ai_workspace_normalize(joined)), None)
+            prefill["category"] = matched_category or "прочее"
+            prefill["description"] = text
+        elif scenario["key"] == "team_task":
+            prefill["title"] = lines[0][:120] if lines else ""
+            prefill["description"] = text
+            normalized = _ai_workspace_normalize(joined)
+            if any(token in normalized for token in ["крит", "сроч", "urgent"]):
+                prefill["priority"] = "critical"
+            elif any(token in normalized for token in ["высок", "важно", "важн"]):
+                prefill["priority"] = "high"
+            else:
+                prefill["priority"] = "normal"
+            prefill["due_at"] = (
+                _ai_workspace_parse_due_at(iso_date_match.group(1) if iso_date_match else None)
+                or _ai_workspace_parse_due_at(ru_date_match.group(1) if ru_date_match else None)
+            )
+            prefill["assignee_employee_id"] = _ai_workspace_match_option(joined, option_lists.get("employees", []))
+        elif scenario["key"] == "warehouse_purchase":
+            if amount_match:
+                prefill["quantity"] = amount_match.group(1).replace(",", ".")
+            all_numbers = re.findall(r"\d+(?:[.,]\d{1,2})?", joined.replace(" ", ""))
+            if len(all_numbers) >= 2:
+                prefill["unit_cost"] = all_numbers[-1].replace(",", ".")
+            prefill["product_id"] = _ai_workspace_match_option(joined, option_lists.get("products", []))
+            prefill["warehouse_id"] = _ai_workspace_match_option(joined, option_lists.get("warehouses", []))
+            prefill["supplier_customer_id"] = _ai_workspace_match_option(joined, option_lists.get("customers", []))
+            prefill["notes"] = text
+        return prefill
+
+    def _ai_workspace_extract_prefill(
+        runtime: ResolvedRuntimeContext,
+        scenario: dict[str, object],
+        note_text: str,
+        session: Session,
+    ) -> dict[str, object]:
+        option_lists = _ai_workspace_option_lists(runtime, session)
+        fallback = _ai_workspace_extract_fallback(scenario, note_text, option_lists)
+        if not settings.openai_api_key:
+            return fallback
+        if not scenario.get("create_enabled"):
+            return fallback
+        try:
+            from openai import OpenAI
+
+            client = OpenAI(api_key=settings.openai_api_key, timeout=20)
+            response = client.responses.create(
+                model=settings.openai_model,
+                input=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "Ты операционный ассистент. "
+                            "Из описания нужно извлечь поля для формы. "
+                            "Верни JSON-объект с ключом prefill. "
+                            "Используй только реальные факты из текста. "
+                            "Если не уверен, оставляй поле пустым. "
+                            "Для select-полей выбирай id только из переданных option lists."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": json.dumps(
+                            {
+                                "scenario_key": scenario["key"],
+                                "fields": scenario.get("fields", []),
+                                "known_context": note_text.strip(),
+                                "option_lists": option_lists,
+                                "fallback_prefill": fallback,
+                            },
+                            ensure_ascii=False,
+                        ),
+                    },
+                ],
+                text={"format": {"type": "json_object"}},
+            )
+            payload = json.loads((response.output_text or "").strip() or "{}")
+            prefill = payload.get("prefill") if isinstance(payload, dict) else {}
+            if not isinstance(prefill, dict):
+                return fallback
+            merged = {**fallback}
+            for key, value in prefill.items():
+                if value in (None, "", []):
+                    continue
+                merged[str(key)] = value
+            return merged
+        except Exception:
+            return fallback
+
+    def _ai_workspace_role_rows(runtime: ResolvedRuntimeContext, session: Session) -> list[dict[str, object]]:
+        defaults = _default_account_users(runtime, session)
+        owner_name = (defaults.get("owner").full_name if defaults.get("owner") is not None else None) or "не назначен"
+        operator_name = (defaults.get("operator").full_name if defaults.get("operator") is not None else None) or "не назначен"
+        return [
+            {
+                "role": "Владелец",
+                "person": owner_name,
+                "must_fill": "цели, приоритеты недели, подтверждение критичных решений",
+                "should_not_fill": "потоковые расходы и складскую рутину",
+                "surface": "Сайт / Mini App",
+            },
+            {
+                "role": "Оператор",
+                "person": operator_name,
+                "must_fill": "задачи, check-in по исполнению, закупка, приемка, монтаж",
+                "should_not_fill": "стратегические цели и тарифные настройки",
+                "surface": "Сайт / бот",
+            },
+            {
+                "role": "Финансы / бухгалтер",
+                "person": "по процессу",
+                "must_fill": "расходы, приходы, платежи, долги, закрытие документов",
+                "should_not_fill": "постановку задач команде",
+                "surface": "Бот / сайт",
+            },
+            {
+                "role": "Склад / снабжение",
+                "person": "по процессу",
+                "must_fill": "закупки, приемка, счета поставщиков, остатки и PDF",
+                "should_not_fill": "финансовые KPI и доступы",
+                "surface": "Бот / сайт",
+            },
+        ]
+
+    def _ai_workspace_fallback_plan(scenario: dict[str, object], note_text: str) -> dict[str, object]:
+        required_fields = [str(item) for item in scenario.get("required_fields", [])]
+        questions = [
+            f"Уточните поле: {field}."
+            for field in required_fields[:5]
+        ]
+        if note_text.strip():
+            questions.append("Что из этого уже подтверждено фактами, а что пока предположение?")
+        return {
+            "summary": f"Сценарий: {scenario['label']}. ИИ должен собрать обязательный минимум, убрать двусмысленность и направить в правильный рабочий раздел.",
+            "questions": questions,
+            "required_fields": required_fields,
+            "target_label": scenario["target_label"],
+            "target_href": scenario["target_href"],
+            "bot_command": scenario["bot_command"],
+            "roles": scenario["roles"],
+            "next_step": (
+                f"После проверки создайте запись прямо здесь и затем откройте {scenario['target_label']}."
+                if scenario.get("create_enabled")
+                else f"После ответов внесите данные через {scenario['target_label']} или команду {scenario['bot_command']}."
+            ),
+            "create_enabled": bool(scenario.get("create_enabled")),
+            "create_label": str(scenario.get("create_label") or "Создать запись"),
+            "fields": scenario.get("fields", []),
+        }
+
+    def _ai_workspace_plan(runtime: ResolvedRuntimeContext, scenario_key: str, note_text: str, session: Session) -> dict[str, object]:
+        scenarios = {item["key"]: item for item in _ai_workspace_scenarios(runtime, session)}
+        scenario = scenarios.get(scenario_key)
+        if scenario is None:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unknown AI workspace scenario.")
+        fallback = _ai_workspace_fallback_plan(scenario, note_text)
+        fallback["prefill"] = _ai_workspace_extract_prefill(runtime, scenario, note_text, session)
+        if not settings.openai_api_key:
+            return fallback
+        try:
+            from openai import OpenAI
+
+            client = OpenAI(api_key=settings.openai_api_key, timeout=20)
+            response = client.responses.create(
+                model=settings.openai_model,
+                input=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "Ты операционный ИИ-ассистент. "
+                            "Твоя задача: по выбранному сценарию составить короткий план дозаполнения данных на русском языке. "
+                            "Верни JSON с ключами summary, questions, next_step. "
+                            "questions должен быть массивом коротких конкретных вопросов. "
+                            "Не выдумывай факты, не заполняй отсутствующие значения."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": json.dumps(
+                            {
+                                "scenario_label": scenario["label"],
+                                "scenario_summary": scenario["summary"],
+                                "required_fields": scenario["required_fields"],
+                                "roles": scenario["roles"],
+                                "known_context": note_text.strip(),
+                            },
+                            ensure_ascii=False,
+                        ),
+                    },
+                ],
+                text={"format": {"type": "json_object"}},
+            )
+            payload = json.loads((response.output_text or "").strip())
+            return {
+                **fallback,
+                "summary": str(payload.get("summary") or fallback["summary"]).strip(),
+                "questions": [str(item).strip() for item in payload.get("questions", []) if str(item).strip()][:8] or fallback["questions"],
+                "next_step": str(payload.get("next_step") or fallback["next_step"]).strip(),
+            }
+        except Exception:
+            return fallback
+
+    def _ai_workspace_create_record(
+        runtime: ResolvedRuntimeContext,
+        actor: User,
+        scenario_key: str,
+        values: dict[str, object],
+        session: Session,
+    ) -> dict[str, object]:
+        scenario_map = {item["key"]: item for item in _ai_workspace_scenarios(runtime, session)}
+        scenario = scenario_map.get(scenario_key)
+        if scenario is None:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unknown AI workspace scenario.")
+        if not scenario.get("create_enabled"):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="This scenario is not ready for direct creation yet.")
+        if scenario_key == "finance_expense":
+            ensure_permission(runtime, "business.write")
+            amount = Decimal(str(values.get("amount") or "0"))
+            if amount <= 0:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Сумма расхода должна быть больше нуля.")
+            category = str(values.get("category") or "").strip()
+            if not category:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Категория расхода обязательна.")
+            expense_date_raw = _ai_workspace_parse_date(str(values.get("expense_date") or "")) or date.today().isoformat()
+            expense = Expense(
+                account_id=runtime.account.id,
+                category=category,
+                status="posted",
+                expense_date=date.fromisoformat(expense_date_raw),
+                currency="RUB",
+                amount=amount,
+                reference_type="ai_workspace",
+                reference_id=f"actor:{actor.id}",
+                description=str(values.get("description") or "").strip() or None,
+            )
+            session.add(expense)
+            session.flush()
+            AuditLogService(session).log(runtime.context, "ai_workspace.expense.created", "expense", str(expense.id), details={"category": category, "amount": str(amount)})
+            return {
+                "entity_type": "expense",
+                "entity_id": expense.id,
+                "title": f"Расход #{expense.id} создан",
+                "summary": f"{category} · {amount} ₽",
+                "target_href": scenario["target_href"],
+            }
+        if scenario_key == "team_task":
+            ensure_permission(runtime, "tasks.manage")
+            _ensure_account_feature(runtime, "people_execution", "People execution")
+            title = str(values.get("title") or "").strip()
+            if not title:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Название задачи обязательно.")
+            employee_id = int(values["assignee_employee_id"]) if values.get("assignee_employee_id") else None
+            if employee_id is None:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Нужно выбрать ответственного.")
+            employee = PeopleService(session).get_employee(runtime.context, employee_id)
+            due_at = _ai_workspace_parse_due_at(str(values.get("due_at") or ""))
+            due_dt = datetime.fromisoformat(due_at) if due_at else None
+            task = Task(
+                account_id=runtime.account.id,
+                assignee_user_id=employee.user_id,
+                assignee_employee_id=employee.id,
+                created_by_user_id=actor.id,
+                source="ai_workspace",
+                title=title,
+                description=str(values.get("description") or "").strip() or None,
+                status="open",
+                priority=str(values.get("priority") or "normal").strip() or "normal",
+                due_at=due_dt,
+                related_entity_type="employee",
+                related_entity_id=str(employee.id),
+            )
+            session.add(task)
+            session.flush()
+            session.add(
+                TaskEvent(
+                    account_id=runtime.account.id,
+                    task_id=task.id,
+                    actor_user_id=actor.id,
+                    event_type="task.created_from_ai_workspace",
+                    event_at=datetime.now(timezone.utc),
+                    payload_json={"assignee_employee_id": employee.id, "assignee_user_id": employee.user_id},
+                )
+            )
+            AuditLogService(session).log(runtime.context, "ai_workspace.task.created", "task", str(task.id), details={"assignee_employee_id": employee.id})
+            session.flush()
+            return {
+                "entity_type": "task",
+                "entity_id": task.id,
+                "title": f"Задача #{task.id} создана",
+                "summary": f"{task.title} · {employee.full_name}",
+                "target_href": scenario["target_href"],
+            }
+        if scenario_key == "warehouse_purchase":
+            ensure_permission(runtime, "business.write")
+            _ensure_account_feature(runtime, "operations_workflows", "Operations")
+            product_id = int(values["product_id"]) if values.get("product_id") else None
+            if product_id is None:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Нужно выбрать товар.")
+            quantity = Decimal(str(values.get("quantity") or "0"))
+            if quantity <= 0:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Количество должно быть больше нуля.")
+            unit_cost = Decimal(str(values.get("unit_cost") or "0"))
+            if unit_cost < 0:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Цена не может быть отрицательной.")
+            purchase = OperationsService(session).create_purchase_request(
+                runtime.context,
+                supplier_customer_id=int(values["supplier_customer_id"]) if values.get("supplier_customer_id") else None,
+                warehouse_id=int(values["warehouse_id"]) if values.get("warehouse_id") else None,
+                product_id=product_id,
+                quantity=quantity,
+                unit_cost=unit_cost,
+                notes=str(values.get("notes") or "").strip() or None,
+            )
+            AuditLogService(session).log(runtime.context, "ai_workspace.purchase.created", "purchase", str(purchase.id), details={"purchase_number": purchase.purchase_number})
+            session.flush()
+            return {
+                "entity_type": "purchase",
+                "entity_id": purchase.id,
+                "title": f"Закупка #{purchase.id} создана",
+                "summary": f"{purchase.purchase_number} · {purchase.total_amount} ₽",
+                "target_href": scenario["target_href"],
+            }
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Scenario creation is not implemented.")
 
     def _account_feature_access(account: Account, feature_key: str) -> dict[str, object]:
         flags = _account_feature_flags(account)
@@ -1825,6 +10130,47 @@ def create_app() -> FastAPI:
     def _notification_channel_options() -> list[str]:
         return ["internal", "telegram", "email", "webhook"]
 
+    def _telegram_notification_targets(account: Account, session: Session) -> list[dict[str, object]]:
+        service = RuntimeIntegrationService(session)
+        context = TenantContext(
+            account_id=account.id,
+            actor_user_id=None,
+            source="admin-ui",
+            request_id=None,
+            role_code=None,
+            is_system=False,
+        )
+        targets: list[dict[str, object]] = []
+        for integration in service.list_integrations(context):
+            if integration.provider_kind != "messaging" or integration.provider_name != "telegram":
+                continue
+            if integration.status == "archived":
+                continue
+            setup = service.integration_setup_payload(context, integration_id=integration.id)
+            masked = setup.get("masked_credentials") if isinstance(setup, dict) else {}
+            masked = masked if isinstance(masked, dict) else {}
+            connected = "session_string" in masked
+            settings_payload = integration.settings_json if isinstance(integration.settings_json, dict) else {}
+            identity_label = str(settings_payload.get("telegram_display_name") or "").strip()
+            username = str(settings_payload.get("telegram_username") or "").strip()
+            subtitle_parts = [integration.status]
+            if identity_label:
+                subtitle_parts.append(identity_label)
+            elif username:
+                subtitle_parts.append(f"@{username}")
+            subtitle_parts.append("подключен" if connected else "не подключен")
+            targets.append(
+                {
+                    "id": integration.id,
+                    "display_name": integration.display_name,
+                    "status": integration.status,
+                    "connected": connected,
+                    "label": integration.display_name,
+                    "subtitle": " · ".join(subtitle_parts),
+                }
+            )
+        return targets
+
     def _render_text_pdf(title: str, body_text: str) -> bytes:
         buffer = BytesIO()
         pdf = canvas.Canvas(buffer, pagesize=A4)
@@ -2103,10 +10449,29 @@ def create_app() -> FastAPI:
     def _human_sync_error(job) -> str | None:
         if job is None:
             return None
-        if job.error_message:
-            return job.error_message
-        if job.error_code:
-            return f"{job.error_code}: sync failed."
+        error_code = str(getattr(job, "error_code", "") or "").strip()
+        error_message = str(getattr(job, "error_message", "") or "").strip()
+        lowered = error_message.lower()
+        if "401" in lowered or "unauthorized" in lowered:
+            return "МойСклад не принял логин или пароль. Проверьте API key и API secret."
+        if "403" in lowered or "forbidden" in lowered:
+            return "МойСклад отклонил доступ. Проверьте права пользователя API."
+        if "404" in lowered:
+            return "МойСклад вернул 404. Проверьте URL или доступность аккаунта."
+        if "429" in lowered or "too many requests" in lowered:
+            return "МойСклад временно ограничил запросы. Повторите синхронизацию позже."
+        if "timeout" in lowered or "timed out" in lowered:
+            return "МойСклад не ответил вовремя. Повторите синхронизацию позже."
+        if (
+            error_code == "UnicodeEncodeError"
+            or "latin-1" in lowered
+            or "moysklad auth encoding failed" in lowered
+        ):
+            return "Ошибка кодировки авторизации МойСклад. Пересохраните API key и API secret и повторите синхронизацию."
+        if error_message:
+            return error_message
+        if error_code:
+            return f"{error_code}: sync failed."
         if job.status in {"failed", "retry"}:
             return f"Last sync ended with status {job.status}."
         return None
@@ -2218,6 +10583,881 @@ def create_app() -> FastAPI:
             "database": "ok",
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
+
+    @app.get("/", response_class=HTMLResponse)
+    def public_home(
+        request: Request,
+        session: Session = Depends(get_db_session),
+    ) -> HTMLResponse:
+        return templates.TemplateResponse(
+            request,
+            "public/index.html",
+            {
+                "brand_title": _public_brand_title(),
+                "brand_subtitle": _public_brand_subtitle(),
+                "account_href": "/admin",
+                "login_href": "/admin/login",
+                "register_href": "/register",
+                "admin_asset_version": settings.app_version,
+            },
+            headers=_public_html_headers(),
+        )
+
+    @app.get("/register", response_class=HTMLResponse)
+    def public_register_page(request: Request) -> HTMLResponse:
+        return _public_register_response(request)
+
+    @app.post("/register", response_class=HTMLResponse)
+    async def public_register_submit(
+        request: Request,
+        session: Session = Depends(get_db_session),
+    ) -> HTMLResponse:
+        await _require_csrf(request)
+        payload = parse_qs((await request.body()).decode("utf-8"), keep_blank_values=True)
+        first_name = str((payload.get("first_name") or [""])[0]).strip()
+        last_name = str((payload.get("last_name") or [""])[0]).strip()
+        email = str((payload.get("email") or [""])[0]).strip().lower()
+        company_name = str((payload.get("company_name") or [""])[0]).strip()
+        agree_rules = str((payload.get("agree_rules") or [""])[0]).strip().lower() in {"on", "1", "true", "yes"}
+        form_values = {
+            "first_name": first_name,
+            "last_name": last_name,
+            "email": email,
+            "company_name": company_name,
+            "agree_rules": "1" if agree_rules else "",
+        }
+        if not first_name or not email or not company_name:
+            return _public_register_response(
+                request,
+                form_values=form_values,
+                error_message="Имя, email и название компании обязательны.",
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+        if "@" not in email or "." not in email.split("@", 1)[-1]:
+            return _public_register_response(
+                request,
+                form_values=form_values,
+                error_message="Укажи корректный email.",
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+        if not agree_rules:
+            return _public_register_response(
+                request,
+                form_values=form_values,
+                error_message="Подтверди согласие с правилами и обработкой данных.",
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+
+        full_name = " ".join(part for part in [first_name, last_name] if part).strip() or email
+        account_slug = _public_registration_account_slug(session, company_name, email)
+        account_service = AccountService(session)
+        membership_service = MembershipService(session)
+        user_security = UserSecurityService(session)
+        bootstrap_service = CoreBootstrapService(session, settings.default_timezone)
+        try:
+            bootstrap_service.ensure_role_catalog()
+            if account_service.get_by_slug(account_slug) is not None:
+                raise PlatformCoreError("Не удалось подготовить уникальный slug аккаунта. Повтори регистрацию.")
+            existing_user = user_security.get_by_email(email)
+            if existing_user is not None and existing_user.status == "disabled":
+                raise PlatformCoreError("Пользователь с этим email отключен. Используй другой email или включи доступ в админке.")
+            if existing_user is None:
+                user, _ = user_security.create_or_update_user(email=email, full_name=full_name, status="invited")
+            else:
+                target_status = existing_user.status if existing_user.status in {"active", "invited"} else "invited"
+                user, _ = user_security.create_or_update_user(
+                    email=email,
+                    full_name=full_name,
+                    status=target_status,
+                    user_id=existing_user.id,
+                )
+            account, _ = account_service.ensure_account(account_slug, company_name, settings.default_timezone)
+            membership_service.ensure_membership(account, user, "owner", status="active")
+            session.flush()
+            if user.password_hash and user.status == "active":
+                request.session.clear()
+                request.session["admin_actor_email"] = user.email
+                request.session["admin_auth_version"] = int(user.auth_version or 1)
+                request.session["admin_account_slug"] = account.slug
+                request.session["admin_csrf_token"] = secrets.token_urlsafe(24)
+                return RedirectResponse(url="/admin", status_code=status.HTTP_303_SEE_OTHER)
+            token = user_security.issue_invite(user)
+        except (PlatformCoreError, IntegrityError) as exc:
+            session.rollback()
+            return _public_register_response(
+                request,
+                form_values=form_values,
+                error_message=str(exc),
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+        return RedirectResponse(url=f"/admin/password/claim?token={token}", status_code=status.HTTP_303_SEE_OTHER)
+
+    @app.get("/site")
+    def public_site_entry() -> RedirectResponse:
+        return RedirectResponse(url="/site/dashboard", status_code=status.HTTP_302_FOUND)
+
+    @app.get("/site/{section_key}", response_class=HTMLResponse)
+    def public_site_section(
+        request: Request,
+        section_key: str,
+        selected_date: str | None = Query(default=None),
+        period: str | None = Query(default=None),
+        date_from: str | None = Query(default=None),
+        date_to: str | None = Query(default=None),
+        source: str | None = Query(default=None),
+        tab: str | None = Query(default=None),
+        detail: str | None = Query(default=None),
+        scope: str | None = Query(default=None),
+        view: str | None = Query(default=None),
+        session: Session = Depends(get_db_session),
+    ) -> HTMLResponse:
+        section = _site_section(section_key)
+        public_user = _current_session_user(session, request)
+        public_runtime = _public_site_runtime(session, request)
+        is_authenticated = public_user is not None
+        domain_chart_view = str(view or "").strip().lower() == "charts"
+        integrations_request_params = dict(request.query_params)
+        avito_oauth_state: str | None = None
+        if str(section.get("key")) == "integrations" and str(tab or "").strip().lower() == "avito" and public_runtime is not None:
+            avito_oauth_state = secrets.token_urlsafe(24)
+            request.session["avito_oauth_state"] = {
+                "state": avito_oauth_state,
+                "account_slug": public_runtime.account.slug,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+        site_domain_charts = None
+        site_finance_surface = None
+        site_inventory_surface = None
+        site_marketing_surface = None
+        site_sales_surface = None
+        site_employees_surface = None
+        site_documents_surface = None
+        site_kpi_surface = None
+        site_integrations_surface = None
+        site_settings_surface = None
+        site_knowledge_surface = None
+        site_ai_surface = None
+        site_help_surface = None
+        if domain_chart_view and str(section.get("key")) != "dashboard":
+            site_domain_charts = _site_chart_detail_model(str(section.get("key")), selected_date, period, date_from, date_to, source)
+        if str(section.get("key")) == "finance" and not domain_chart_view:
+            site_finance_surface = _site_finance_surface_model(selected_date, period, date_from, date_to, tab, detail, scope, dict(request.query_params), session=session, runtime=public_runtime)
+        if str(section.get("key")) == "inventory" and not domain_chart_view:
+            site_inventory_surface = _site_inventory_surface_model(selected_date, period, date_from, date_to, tab, detail, scope, dict(request.query_params), session=session, runtime=public_runtime)
+        if str(section.get("key")) == "marketing" and not domain_chart_view:
+            site_marketing_surface = _site_marketing_surface_model(selected_date, period, date_from, date_to, tab, detail, scope, dict(request.query_params))
+        if str(section.get("key")) == "sales" and not domain_chart_view:
+            site_sales_surface = _site_sales_surface_model(selected_date, period, date_from, date_to, tab, detail, scope, dict(request.query_params))
+        if str(section.get("key")) == "employees" and not domain_chart_view:
+            site_employees_surface = _site_employees_surface_model(selected_date, period, date_from, date_to, tab, detail, scope, dict(request.query_params))
+        if str(section.get("key")) == "documents" and not domain_chart_view:
+            site_documents_surface = _site_documents_surface_model(selected_date, period, date_from, date_to, tab, detail, scope, dict(request.query_params))
+        if str(section.get("key")) == "kpi" and not domain_chart_view:
+            site_kpi_surface = _site_kpi_surface_model(selected_date, period, date_from, date_to, tab, detail, scope, dict(request.query_params))
+        if str(section.get("key")) == "integrations" and not domain_chart_view:
+            site_integrations_surface = _site_integrations_surface_model(
+                selected_date,
+                period,
+                date_from,
+                date_to,
+                tab,
+                detail,
+                scope,
+                integrations_request_params,
+                session=session,
+                runtime=public_runtime,
+                csrf_token=_ensure_session_csrf_token(request),
+                avito_oauth_state=avito_oauth_state,
+            )
+        if str(section.get("key")) == "settings" and not domain_chart_view:
+            site_settings_surface = _site_settings_surface_model(selected_date, period, date_from, date_to, tab, detail, scope, dict(request.query_params))
+        if str(section.get("key")) == "knowledge" and not domain_chart_view:
+            site_knowledge_surface = _site_knowledge_surface_model(selected_date, period, date_from, date_to, tab, detail, scope, dict(request.query_params))
+        if str(section.get("key")) == "ai" and not domain_chart_view:
+            site_ai_surface = _site_ai_surface_model(selected_date, period, date_from, date_to, tab, detail, scope, dict(request.query_params))
+        if str(section.get("key")) == "help" and not domain_chart_view:
+            site_help_surface = _site_help_surface_model(selected_date, period, date_from, date_to, tab, detail, scope, dict(request.query_params))
+        site_workspace_surface = (
+            site_finance_surface
+            or site_inventory_surface
+            or site_marketing_surface
+            or site_sales_surface
+            or site_employees_surface
+            or site_documents_surface
+            or site_kpi_surface
+            or site_integrations_surface
+            or site_settings_surface
+            or site_knowledge_surface
+            or site_ai_surface
+            or site_help_surface
+        )
+        return templates.TemplateResponse(
+            request,
+            "public/site_shell.html",
+            {
+                "brand_title": _public_brand_title(),
+                "brand_subtitle": _public_brand_subtitle(),
+                "site_nav": _site_shell_sections(),
+                "site_section": section,
+                "site_breadcrumbs": _public_site_breadcrumbs(section, site_workspace_surface, site_domain_charts),
+                "site_global_search": {
+                    "action": "/site/knowledge#knowledge-workspace",
+                    "hidden": [
+                        {"name": "tab", "value": "search"},
+                    ],
+                    "field_name": "knowledge_query",
+                    "placeholder": "Поиск по сайту, кнопкам и базе знаний",
+                },
+                "site_section_status": _public_site_section_status(section),
+                "site_workspace_back_button": _public_site_workspace_back_button(section, site_workspace_surface),
+                "site_dashboard": _site_dashboard_model(selected_date, period, date_from, date_to) if str(section.get("key")) == "dashboard" else None,
+                "site_charts": _site_charts_model() if str(section.get("key")) == "charts" else None,
+                "site_finance_surface": site_finance_surface,
+                "site_inventory_surface": site_inventory_surface,
+                "site_marketing_surface": site_marketing_surface,
+                "site_sales_surface": site_sales_surface,
+                "site_employees_surface": site_employees_surface,
+                "site_documents_surface": site_documents_surface,
+                "site_kpi_surface": site_kpi_surface,
+                "site_integrations_surface": site_integrations_surface,
+                "site_settings_surface": site_settings_surface,
+                "site_knowledge_surface": site_knowledge_surface,
+                "site_ai_surface": site_ai_surface,
+                "site_help_surface": site_help_surface,
+                "site_workspace_surface": site_workspace_surface,
+                "site_domain_charts": site_domain_charts,
+                "account_href": "/admin?choose=1" if is_authenticated else "/admin/login?next=/site/dashboard",
+                "account_label": "Аккаунты" if is_authenticated else "Аккаунт",
+                "login_href": "/admin?choose=1" if is_authenticated else "/admin/login?next=/site/dashboard",
+                "login_label": "Сменить аккаунт" if is_authenticated else "Вход",
+                "register_href": "/register",
+                "public_runtime": public_runtime,
+                "can_public_sync_all": bool(
+                    public_runtime is not None
+                    and ("*" in public_runtime.permissions or "integrations.manage" in public_runtime.permissions)
+                    and _feature_access_map(public_runtime.account)["integrations_setup"]["allowed"]
+                ),
+                "admin_asset_version": settings.app_version,
+                "site_csrf_token": _ensure_session_csrf_token(request),
+                "site_public_message": _pop_public_site_message(request),
+            },
+            headers=_public_html_headers(),
+        )
+
+    @app.post("/site/integrations/save")
+    async def public_site_integrations_save(
+        request: Request,
+        session: Session = Depends(get_db_session),
+    ) -> RedirectResponse:
+        form = await request.form()
+        _require_supplied_csrf(request, form.get("csrf_token"))
+        runtime = _public_site_runtime(session, request)
+        if runtime is None:
+            return RedirectResponse(url="/admin/login", status_code=status.HTTP_303_SEE_OTHER)
+        ensure_permission(runtime, "integrations.manage")
+
+        payload = {str(key): str(value) for key, value in form.multi_items() if value is not None}
+        tab = str(payload.get("tab") or "telegram").strip().lower()
+        detail = str(payload.get("detail") or "").strip().lower() or None
+        period = str(payload.get("period") or "").strip() or None
+        selected_date = str(payload.get("selected_date") or "").strip() or None
+        date_from = str(payload.get("date_from") or "").strip() or None
+        date_to = str(payload.get("date_to") or "").strip() or None
+        scope = str(payload.get("scope") or "").strip() or None
+        redirect_url = _public_site_redirect_url(
+            "integrations",
+            workspace_id="integrations-workspace",
+            tab=tab,
+            detail=detail,
+            period=period,
+            selected_date=selected_date,
+            date_from=date_from,
+            date_to=date_to,
+            scope=scope,
+        )
+
+        service = RuntimeIntegrationService(session)
+        integrations = service.list_integrations(runtime.context)
+
+        try:
+            action_name = str(payload.get("integration_action") or "").strip().lower()
+            if action_name in {"test", "sync"}:
+                provider_binding = {
+                    "moysklad": ("erp", "moysklad"),
+                    "avito": ("ads", "avito"),
+                    "bank": ("banking", "generic_bank"),
+                    "telegram": ("messaging", "telegram"),
+                }.get(tab)
+                if provider_binding is None:
+                    _push_public_site_message(request, level="warning", message="Для этого подключения действие пока не настроено.")
+                    return RedirectResponse(url=redirect_url, status_code=status.HTTP_303_SEE_OTHER)
+                integration_id_raw = str(payload.get("integration_id") or "").strip()
+                if not integration_id_raw.isdigit():
+                    _push_public_site_message(
+                        request,
+                        level="error",
+                        message="Не удалось определить подключение для действия. Выберите конкретный аккаунт и повторите.",
+                    )
+                    return RedirectResponse(url=redirect_url, status_code=status.HTTP_303_SEE_OTHER)
+                integration_id = int(integration_id_raw)
+                target = next(
+                    (
+                        item
+                        for item in integrations
+                        if item.id == integration_id
+                        and item.provider_kind == provider_binding[0]
+                        and item.provider_name == provider_binding[1]
+                        and item.status != "archived"
+                    ),
+                    None,
+                )
+                if target is None:
+                    _push_public_site_message(
+                        request,
+                        level="error",
+                        message="Выбранное подключение не найдено или больше недоступно. Обновите страницу и повторите.",
+                    )
+                    return RedirectResponse(url=redirect_url, status_code=status.HTTP_303_SEE_OTHER)
+                if action_name == "test":
+                    result = service.test_connection(runtime.context, integration_id=target.id)
+                    if result.get("connected"):
+                        _push_public_site_message(request, level="success", message=f"{target.display_name}: подключение подтверждено.")
+                    else:
+                        message = str(result.get("message") or result.get("error_code") or "Проверка не прошла.")
+                        _push_public_site_message(request, level="error", message=f"{target.display_name}: {message}")
+                    return RedirectResponse(url=redirect_url, status_code=status.HTTP_303_SEE_OTHER)
+                if not service.supports_sync(target.provider_kind, target.provider_name):
+                    _push_public_site_message(request, level="warning", message="Для этого типа интеграции синхронизация не поддерживается.")
+                    return RedirectResponse(url=redirect_url, status_code=status.HTTP_303_SEE_OTHER)
+                job, _ = service.enqueue_sync_job(
+                    runtime.context,
+                    integration_id=target.id,
+                    job_type="full_sync",
+                    trigger_mode="manual",
+                    idempotency_key=f"public-site-sync:{runtime.account.slug}:{target.id}:{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')}",
+                    scope_json={"source": "public-site"},
+                )
+                _push_public_site_message(
+                    request,
+                    level="success",
+                    message=f"{target.display_name}: синхронизация поставлена в очередь. Обновите страницу через 30-60 секунд.",
+                )
+                return RedirectResponse(url=redirect_url, status_code=status.HTTP_303_SEE_OTHER)
+
+            if tab == "moysklad":
+                if "moysklad_account_rename" in payload:
+                    _public_site_rename_integration(
+                        service,
+                        runtime,
+                        provider_kind="erp",
+                        provider_name="moysklad",
+                        current_display_name=str(payload.get("moysklad_account_rename") or "").strip(),
+                        new_display_name=str(payload.get("moysklad_account_new_name") or "").strip(),
+                    )
+                elif "moysklad_account_delete" in payload:
+                    target = _public_site_find_integration(
+                        integrations,
+                        provider_kind="erp",
+                        provider_name="moysklad",
+                        display_name=payload["moysklad_account_delete"],
+                        exact_display_name=True,
+                    )
+                    if target is not None:
+                        service.update_integration(runtime.context, integration_id=target.id, status="archived")
+                elif "moysklad_account_name" in payload:
+                    _public_site_upsert_integration(
+                        service,
+                        runtime,
+                        provider_kind="erp",
+                        provider_name="moysklad",
+                        display_name=str(payload.get("moysklad_account_name") or "МойСклад аккаунт").strip() or "МойСклад аккаунт",
+                        credentials={
+                            "login": str(payload.get("moysklad_api_key") or "").strip(),
+                            "password": str(payload.get("moysklad_api_secret") or "").strip(),
+                        },
+                    )
+                else:
+                    current = _public_site_find_integration(
+                        integrations,
+                        provider_kind="erp",
+                        provider_name="moysklad",
+                    )
+                    display_name = str(current.display_name) if current is not None else "МойСклад 1"
+                    settings_updates: dict[str, object] = {}
+                    credentials: dict[str, object] = {}
+                    if "moysklad_api_key" in payload:
+                        credentials["login"] = str(payload.get("moysklad_api_key") or "").strip()
+                    if "moysklad_api_secret" in payload:
+                        credentials["password"] = str(payload.get("moysklad_api_secret") or "").strip()
+                    _public_site_upsert_integration(
+                        service,
+                        runtime,
+                        provider_kind="erp",
+                        provider_name="moysklad",
+                        display_name=display_name,
+                        credentials=credentials or None,
+                        settings_updates=settings_updates or None,
+                    )
+            elif tab == "avito":
+                if "avito_account_rename" in payload:
+                    _public_site_rename_integration(
+                        service,
+                        runtime,
+                        provider_kind="ads",
+                        provider_name="avito",
+                        current_display_name=str(payload.get("avito_account_rename") or "").strip(),
+                        new_display_name=str(payload.get("avito_account_new_name") or "").strip(),
+                    )
+                elif "avito_account_delete" in payload:
+                    target = _public_site_find_integration(integrations, provider_kind="ads", provider_name="avito", display_name=payload["avito_account_delete"], exact_display_name=True)
+                    if target is not None:
+                        service.update_integration(runtime.context, integration_id=target.id, status="archived")
+                elif "avito_account_name" in payload:
+                    _public_site_upsert_integration(
+                        service,
+                        runtime,
+                        provider_kind="ads",
+                        provider_name="avito",
+                        display_name=str(payload.get("avito_account_name") or "Avito аккаунт").strip() or "Avito аккаунт",
+                        credentials={
+                            "access_token": str(payload.get("avito_api_key") or "").strip(),
+                            "account_external_id": str(payload.get("avito_account_external_id") or "").strip(),
+                        },
+                        settings_updates={
+                            "avito_account_external_id": str(payload.get("avito_account_external_id") or "").strip(),
+                        },
+                    )
+                else:
+                    current = _public_site_find_integration(integrations, provider_kind="ads", provider_name="avito")
+                    credentials: dict[str, object] = {}
+                    if "avito_api_key" in payload or "avito_api_secret" in payload:
+                        credentials["access_token"] = str(payload.get("avito_api_key") or payload.get("avito_api_secret") or "").strip()
+                    if "avito_account_external_id" in payload:
+                        credentials["account_external_id"] = str(payload.get("avito_account_external_id") or "").strip()
+                    settings_updates = (
+                        {"avito_account_external_id": str(payload.get("avito_account_external_id") or "").strip()}
+                        if "avito_account_external_id" in payload
+                        else None
+                    )
+                    _public_site_upsert_integration(
+                        service,
+                        runtime,
+                        provider_kind="ads",
+                        provider_name="avito",
+                        display_name=str(current.display_name) if current is not None else "Avito 1",
+                        credentials=credentials or None,
+                        settings_updates=settings_updates,
+                    )
+            elif tab == "bank":
+                if "bank_account_rename" in payload:
+                    _public_site_rename_integration(
+                        service,
+                        runtime,
+                        provider_kind="banking",
+                        provider_name="generic_bank",
+                        current_display_name=str(payload.get("bank_account_rename") or "").strip(),
+                        new_display_name=str(payload.get("bank_account_new_name") or "").strip(),
+                    )
+                elif "bank_account_delete" in payload:
+                    target = _public_site_find_integration(integrations, provider_kind="banking", provider_name="generic_bank", display_name=payload["bank_account_delete"], exact_display_name=True)
+                    if target is not None:
+                        service.update_integration(runtime.context, integration_id=target.id, status="archived")
+                elif "bank_account_name" in payload:
+                    _public_site_upsert_integration(
+                        service,
+                        runtime,
+                        provider_kind="banking",
+                        provider_name="generic_bank",
+                        display_name=str(payload.get("bank_account_name") or "Банк аккаунт").strip() or "Банк аккаунт",
+                        credentials={"access_token": str(payload.get("bank_api_key") or "").strip()},
+                    )
+                else:
+                    current = _public_site_find_integration(integrations, provider_kind="banking", provider_name="generic_bank")
+                    settings_updates = {"bank_account_label": str(payload.get("bank_account") or "").strip()} if "bank_account" in payload else None
+                    _public_site_upsert_integration(
+                        service,
+                        runtime,
+                        provider_kind="banking",
+                        provider_name="generic_bank",
+                        display_name=str(current.display_name) if current is not None else "Банк 1",
+                        credentials={"access_token": str(payload.get("bank_api_key") or payload.get("bank_api_secret") or "").strip()} if ("bank_api_key" in payload or "bank_api_secret" in payload) else None,
+                        settings_updates=settings_updates,
+                    )
+            elif tab == "telegram":
+                if "telegram_account_rename" in payload:
+                    _public_site_rename_integration(
+                        service,
+                        runtime,
+                        provider_kind="messaging",
+                        provider_name="telegram",
+                        current_display_name=str(payload.get("telegram_account_rename") or "").strip(),
+                        new_display_name=str(payload.get("telegram_account_new_name") or "").strip(),
+                    )
+                elif "telegram_account_delete" in payload:
+                    target = _public_site_find_integration(integrations, provider_kind="messaging", provider_name="telegram", display_name=payload["telegram_account_delete"], exact_display_name=True)
+                    if target is not None:
+                        service.update_integration(runtime.context, integration_id=target.id, status="archived")
+                elif "telegram_account_name" in payload:
+                    _public_site_upsert_integration(
+                        service,
+                        runtime,
+                        provider_kind="messaging",
+                        provider_name="telegram",
+                        display_name=str(payload.get("telegram_account_name") or "Telegram аккаунт").strip() or "Telegram аккаунт",
+                        settings_updates={"auth_kind": "telegram_user_account"},
+                    )
+                else:
+                    current = _public_site_find_integration(integrations, provider_kind="messaging", provider_name="telegram")
+                    _public_site_upsert_integration(
+                        service,
+                        runtime,
+                        provider_kind="messaging",
+                        provider_name="telegram",
+                        display_name=str(current.display_name) if current is not None else "Telegram 1",
+                    )
+        except (PlatformCoreError, TenantContextError, IntegrityError) as exc:
+            _push_public_site_message(request, level="error", message=str(exc))
+            return RedirectResponse(url=redirect_url, status_code=status.HTTP_303_SEE_OTHER)
+
+        _push_public_site_message(request, level="success", message="Интеграция сохранена.")
+        return RedirectResponse(url=redirect_url, status_code=status.HTTP_303_SEE_OTHER)
+
+    @app.get("/site/integrations/telegram/{integration_id}/qr")
+    async def public_site_telegram_qr_status(
+        request: Request,
+        integration_id: int,
+        refresh: bool = Query(default=False),
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        runtime = _public_site_runtime(session, request)
+        if runtime is None:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Login required.")
+        ensure_permission(runtime, "integrations.manage")
+        try:
+            payload = (
+                await _refresh_telegram_qr_login(runtime, session, integration_id)
+                if refresh
+                else await _telegram_qr_status_payload(runtime, session, integration_id)
+            )
+        except (TelegramClientUnavailableError, TelegramQrLoginError, ValueError) as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        return JSONResponse(payload, headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0", "Pragma": "no-cache"})
+
+    @app.post("/site/integrations/telegram/{integration_id}/qr/password")
+    async def public_site_telegram_qr_password(
+        request: Request,
+        integration_id: int,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        runtime = _public_site_runtime(session, request)
+        if runtime is None:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Login required.")
+        ensure_permission(runtime, "integrations.manage")
+        payload = await request.json()
+        try:
+            result = await _submit_telegram_qr_password(runtime, session, integration_id, str(payload.get("password") or ""))
+        except (TelegramClientUnavailableError, TelegramQrLoginError, ValueError) as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        return JSONResponse(result, headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0", "Pragma": "no-cache"})
+
+    @app.get("/site/integrations/avito/start")
+    def public_site_integrations_avito_start(
+        request: Request,
+        session: Session = Depends(get_db_session),
+    ) -> RedirectResponse:
+        runtime = _public_site_runtime(session, request)
+        retry_start_url = "/site/integrations/avito/start"
+        redirect_url = _public_site_redirect_url(
+            "integrations",
+            workspace_id="integrations-workspace",
+            tab="avito",
+            detail="login",
+        )
+        if runtime is None:
+            return RedirectResponse(
+                url=f"/admin/login?next={quote(retry_start_url, safe='/?=&:#')}",
+                status_code=status.HTTP_303_SEE_OTHER,
+            )
+        ensure_permission(runtime, "integrations.manage")
+        service = RuntimeIntegrationService(session)
+        integrations = service.list_integrations(runtime.context)
+        if not settings.avito_client_id or not settings.avito_client_secret:
+            _push_public_site_message(request, level="error", message="Avito OAuth не настроен на стороне платформы.")
+            return RedirectResponse(url=redirect_url, status_code=status.HTTP_303_SEE_OTHER)
+        requested_display_name = str(request.query_params.get("avito_account_name") or "").strip()
+        integration_id_raw = str(request.query_params.get("integration_id") or "").strip()
+        current = _public_site_find_integration(
+            integrations,
+            provider_kind="ads",
+            provider_name="avito",
+            display_name=requested_display_name or None,
+            exact_display_name=bool(requested_display_name),
+        )
+        if integration_id_raw.isdigit():
+            current = next((item for item in integrations if item.id == int(integration_id_raw)), current)
+        if current is None:
+            current = _public_site_upsert_integration(
+                service,
+                runtime,
+                provider_kind="ads",
+                provider_name="avito",
+                display_name=requested_display_name or "Avito 1",
+            )
+        callback_url = f"{_public_base_url()}/site/integrations/avito/callback"
+        state_value = secrets.token_urlsafe(24)
+        avito_scope_normalized = ",".join(
+            item for item in re.split(r"[\s,]+", str(settings.avito_oauth_scope or "").strip()) if item
+        )
+        request.session["avito_oauth_state"] = {
+            "state": state_value,
+            "account_slug": runtime.account.slug,
+            "integration_id": current.id,
+            "display_name": str(current.display_name or requested_display_name or "Avito 1"),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        oauth_params: dict[str, str] = {
+            "response_type": "code",
+            "client_id": settings.avito_client_id,
+            "redirect_uri": callback_url,
+            "state": state_value,
+        }
+        if avito_scope_normalized:
+            oauth_params["scope"] = avito_scope_normalized
+        oauth_url = "https://avito.ru/oauth?" + urlencode(oauth_params)
+        return RedirectResponse(url=oauth_url, status_code=status.HTTP_302_FOUND)
+
+    @app.get("/site/integrations/avito/callback")
+    def public_site_integrations_avito_callback(
+        request: Request,
+        session: Session = Depends(get_db_session),
+    ) -> RedirectResponse:
+        runtime = _public_site_runtime(session, request)
+        redirect_url = _public_site_redirect_url(
+            "integrations",
+            workspace_id="integrations-workspace",
+            tab="avito",
+            detail="accounts",
+        )
+        if runtime is None:
+            return RedirectResponse(
+                url=f"/admin/login?next={quote(redirect_url, safe='/?=&:#')}",
+                status_code=status.HTTP_303_SEE_OTHER,
+            )
+
+        state_payload = request.session.pop("avito_oauth_state", None)
+        if not isinstance(state_payload, dict):
+            _push_public_site_message(request, level="error", message="Сессия авторизации Авито не найдена. Запусти вход заново.")
+            return RedirectResponse(url=redirect_url, status_code=status.HTTP_303_SEE_OTHER)
+
+        error_code = str(request.query_params.get("error") or "").strip()
+        error_description = str(request.query_params.get("error_description") or "").strip()
+        auth_code = str(request.query_params.get("code") or "").strip()
+        state_value = str(request.query_params.get("state") or "").strip()
+        referer_value = str(request.query_params.get("referer") or "").strip()
+
+        expected_state = str(state_payload.get("state") or "").strip()
+        if not expected_state or state_value != expected_state:
+            _push_public_site_message(request, level="error", message="Состояние авторизации Авито не совпало. Запусти вход заново.")
+            return RedirectResponse(url=redirect_url, status_code=status.HTTP_303_SEE_OTHER)
+
+        if error_code:
+            details = error_description or error_code
+            _push_public_site_message(
+                request,
+                level="error",
+                message=f"Авито вернул ошибку авторизации: {details}.",
+            )
+            return RedirectResponse(url=redirect_url, status_code=status.HTTP_303_SEE_OTHER)
+
+        if auth_code:
+            service = RuntimeIntegrationService(session)
+            integration_id = int(state_payload.get("integration_id") or 0)
+            if integration_id <= 0:
+                integrations = service.list_integrations(runtime.context)
+                current = _public_site_find_integration(
+                    integrations,
+                    provider_kind="ads",
+                    provider_name="avito",
+                )
+                if current is None:
+                    current = _public_site_upsert_integration(
+                        service,
+                        runtime,
+                        provider_kind="ads",
+                        provider_name="avito",
+                        display_name="Avito 1",
+                    )
+                integration_id = current.id
+            if not settings.avito_client_id or not settings.avito_client_secret:
+                _push_public_site_message(request, level="error", message="Avito OAuth не настроен на стороне платформы.")
+                return RedirectResponse(url=redirect_url, status_code=status.HTTP_303_SEE_OTHER)
+            callback_url = f"{_public_base_url()}/site/integrations/avito/callback"
+            try:
+                token_payload = _avito_authorization_code_token(
+                    client_id=settings.avito_client_id,
+                    client_secret=settings.avito_client_secret,
+                    code=auth_code,
+                    redirect_uri=callback_url,
+                )
+                access_token = str(token_payload.get("access_token") or "").strip()
+                expires_in = int(token_payload.get("expires_in") or 0)
+                expires_at = (
+                    datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+                    if expires_in > 0
+                    else None
+                )
+                account_external_id = _avito_resolve_account_external_id(access_token)
+                settings_updates: dict[str, object] = {}
+                if referer_value:
+                    settings_updates["avito_referer"] = referer_value
+                if state_payload.get("account_slug"):
+                    request.session["admin_account_slug"] = str(state_payload.get("account_slug"))
+                secret_payload = {
+                    "access_token": access_token,
+                    "refresh_token": str(token_payload.get("refresh_token") or "").strip(),
+                    "token_type": str(token_payload.get("token_type") or "").strip(),
+                    "expires_in": expires_in,
+                    "expires_at": expires_at.isoformat() if expires_at is not None else "",
+                }
+                if account_external_id:
+                    secret_payload["account_external_id"] = account_external_id
+                service.save_credentials(
+                    runtime.context,
+                    integration_id=integration_id,
+                    secret_payload=secret_payload,
+                    replace_mode="merge",
+                )
+                if settings_updates:
+                    integration = service.list_integrations(runtime.context)
+                    target = next((item for item in integration if item.id == integration_id), None)
+                    merged_settings = dict(target.settings_json) if target is not None and isinstance(target.settings_json, dict) else {}
+                    merged_settings.update(settings_updates)
+                    service.update_integration(runtime.context, integration_id=integration_id, settings_json=merged_settings)
+            except PlatformCoreError as exc:
+                _push_public_site_message(request, level="error", message=f"Авито не отдал токен: {exc}")
+                return RedirectResponse(url=redirect_url, status_code=status.HTTP_303_SEE_OTHER)
+
+            login_redirect_url = _public_site_redirect_url(
+                "integrations",
+                workspace_id="integrations-workspace",
+                tab="avito",
+                detail="login",
+            )
+            _push_public_site_message(
+                request,
+                level="success",
+                message="Вход через Авито подтвержден. Подключение сохранено.",
+            )
+            return RedirectResponse(url=login_redirect_url, status_code=status.HTTP_303_SEE_OTHER)
+
+        _push_public_site_message(
+            request,
+            level="warning",
+            message="Авито не передал код авторизации.",
+        )
+        return RedirectResponse(url=redirect_url, status_code=status.HTTP_303_SEE_OTHER)
+
+    @app.get("/app")
+    def public_app_entry() -> RedirectResponse:
+        return RedirectResponse(url="/tgapp", status_code=status.HTTP_302_FOUND)
+
+    @app.get("/tgapp", response_class=HTMLResponse)
+    def telegram_mini_app(
+        request: Request,
+        session: Session = Depends(get_db_session),
+    ) -> HTMLResponse:
+        user = _current_session_user(session, request)
+        if user is None:
+            return templates.TemplateResponse(
+                request,
+                "public/tgapp.html",
+                {
+                    "brand_title": _public_brand_title(),
+                    "brand_subtitle": _public_brand_subtitle(),
+                    "requires_login": True,
+                    "login_href": "/admin/login?next=/tgapp",
+                    "telegram_startapp_url": _telegram_startapp_url("home"),
+                    "telegram_bot_url": _telegram_bot_url(),
+                    "telegram_hub_url": _telegram_start_url("hub"),
+                    "telegram_finance_url": _telegram_start_url("finance"),
+                    "telegram_warehouse_url": _telegram_start_url("warehouse"),
+                    "telegram_docs_url": _telegram_start_url("docs"),
+                    "public_base_url": _public_base_url() or str(request.base_url).rstrip("/"),
+                    "admin_asset_version": settings.app_version,
+                },
+                headers=_public_html_headers(),
+            )
+
+        accounts = _accessible_accounts(session, user.email)
+        if not accounts:
+            return templates.TemplateResponse(
+                request,
+                "public/tgapp.html",
+                {
+                    "brand_title": _public_brand_title(),
+                    "brand_subtitle": _public_brand_subtitle(),
+                    "requires_login": False,
+                    "membership_error": "No active account memberships found for this user.",
+                    "telegram_bot_url": _telegram_bot_url(),
+                    "telegram_hub_url": _telegram_start_url("hub"),
+                    "telegram_finance_url": _telegram_start_url("finance"),
+                    "telegram_warehouse_url": _telegram_start_url("warehouse"),
+                    "telegram_docs_url": _telegram_start_url("docs"),
+                    "public_base_url": _public_base_url() or str(request.base_url).rstrip("/"),
+                    "admin_asset_version": settings.app_version,
+                },
+                status_code=status.HTTP_403_FORBIDDEN,
+                headers=_public_html_headers(),
+            )
+
+        active_slug = _session_account_slug(request)
+        account = next((item for item in accounts if item.slug == active_slug), accounts[0])
+        runtime = resolve_admin_runtime(request, session, account_slug=account.slug, actor_email=user.email)
+        request.session["admin_account_slug"] = runtime.account.slug
+        brief = _account_brief_digest(runtime, session)
+        delivery = _account_delivery_pack(runtime, session)
+        legacy_summary = _legacy_archive_json("summary.json") or {}
+        attention_rows = brief["must_do_now"][:6]
+        quick_actions = [
+            {"label": "Сводка", "href": f"/admin/{runtime.account.slug}/brief", "hint": "Что важно сегодня и что делать прямо сейчас."},
+            {"label": "Панель", "href": f"/admin/{runtime.account.slug}/dashboard", "hint": "План-факт, проблемы и цели."},
+            {"label": "Алерты", "href": f"/admin/{runtime.account.slug}/alerts-tasks?severity=critical", "hint": "Критичные сигналы и срочные задачи."},
+            {"label": "Задачи", "href": f"/admin/{runtime.account.slug}/alerts-tasks?overdue=1", "hint": "Просроченные и срочные задачи."},
+            {"label": "Уведомления", "href": f"/admin/{runtime.account.slug}/notifications", "hint": "Рассылки, дайджесты и доставка."},
+            {"label": "Копилот", "href": f"/admin/{runtime.account.slug}/copilot", "hint": "Подсказки и разбор проблем с опорой на данные."},
+            {"label": "Старые данные", "href": f"/admin/{runtime.account.slug}/legacy", "hint": "Данные и функции из старых ботов."},
+        ]
+        if _feature_access_map(runtime.account)["ops_console"]["allowed"]:
+            quick_actions.append({"label": "Синхронизация", "href": f"/admin/{runtime.account.slug}/ops-sync", "hint": "Состояние интеграций и свежесть данных."})
+        return templates.TemplateResponse(
+            request,
+            "public/tgapp.html",
+            {
+                "brand_title": _public_brand_title(),
+                "brand_subtitle": _public_brand_subtitle(),
+                "requires_login": False,
+                "runtime": runtime,
+                "accounts": accounts,
+                "attention_rows": attention_rows,
+                "critical_alert_rows": brief["critical_alerts"][:3],
+                "overdue_task_rows": brief["overdue_tasks"][:3],
+                "quick_actions": quick_actions,
+                "brief": brief,
+                "delivery": delivery,
+                "legacy_summary": legacy_summary,
+                "public_base_url": _public_base_url() or str(request.base_url).rstrip("/"),
+                "telegram_startapp_url": _telegram_startapp_url("home"),
+                "telegram_bot_url": _telegram_bot_url(),
+                "telegram_hub_url": _telegram_start_url("hub"),
+                "telegram_finance_url": _telegram_start_url("finance"),
+                "telegram_warehouse_url": _telegram_start_url("warehouse"),
+                "telegram_docs_url": _telegram_start_url("docs"),
+                "csrf_token": _ensure_session_csrf_token(request),
+                "admin_asset_version": settings.app_version,
+            },
+            headers=_public_html_headers(),
+        )
 
     @app.get("/api/auth/context")
     def auth_context(runtime: ResolvedRuntimeContext = Depends(get_runtime_context)) -> dict[str, object]:
@@ -2442,17 +11682,20 @@ def create_app() -> FastAPI:
     ) -> dict[str, object]:
         ensure_permission(runtime, "integrations.manage")
         service = RuntimeIntegrationService(session)
-        job, created = service.enqueue_sync_job(
-            runtime.context,
-            integration_id=integration_id,
-            job_type=body.job_type,
-            trigger_mode="manual",
-            idempotency_key=body.idempotency_key,
-            scope_json=body.scope,
-        )
-        execution = None
-        if body.execute_now:
-            execution = service.execute_job(job.id, owner=settings.worker_id, ttl_seconds=settings.runtime_lease_ttl_seconds)
+        try:
+            job, created = service.enqueue_sync_job(
+                runtime.context,
+                integration_id=integration_id,
+                job_type=body.job_type,
+                trigger_mode="manual",
+                idempotency_key=body.idempotency_key,
+                scope_json=body.scope,
+            )
+            execution = None
+            if body.execute_now:
+                execution = service.execute_job(job.id, owner=settings.worker_id, ttl_seconds=settings.runtime_lease_ttl_seconds)
+        except (TenantContextError, PlatformCoreError) as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
         return {
             "created": created,
             "job": _serialize_sync_job(job),
@@ -2487,6 +11730,7 @@ def create_app() -> FastAPI:
             session,
             worker_id=settings.worker_id,
             lease_ttl_seconds=settings.runtime_lease_ttl_seconds,
+            sync_auto_interval_seconds=settings.sync_auto_interval_seconds,
         )
         result = scheduler.run_once(run_rules=body.run_rules, run_sync_jobs=body.run_sync_jobs)
         return {"requested": body.model_dump(), "result": result}
@@ -2889,14 +12133,14 @@ def create_app() -> FastAPI:
             return templates.TemplateResponse(
                 request,
                 "admin/password_claim.html",
-                {"csrf_token": csrf_token, "token": token, "user": None, "token_type": None, "error_message": "Token and password are required."},
+                {"csrf_token": csrf_token, "token": token, "user": None, "token_type": None, "error_message": "Нужны действующая ссылка и новый пароль."},
                 status_code=status.HTTP_400_BAD_REQUEST,
             )
         if password != password_confirm:
             return templates.TemplateResponse(
                 request,
                 "admin/password_claim.html",
-                {"csrf_token": csrf_token, "token": token, "user": None, "token_type": None, "error_message": "Password confirmation does not match."},
+                {"csrf_token": csrf_token, "token": token, "user": None, "token_type": None, "error_message": "Подтверждение пароля не совпадает."},
                 status_code=status.HTTP_400_BAD_REQUEST,
             )
         try:
@@ -2935,12 +12179,12 @@ def create_app() -> FastAPI:
         if not accounts:
             request.session.clear()
             return _login_redirect("/admin")
-        active_slug = _session_account_slug(request)
-        if not choose and active_slug and any(item.slug == active_slug for item in accounts):
-            return RedirectResponse(url=f"/admin/{active_slug}/dashboard", status_code=status.HTTP_302_FOUND)
-        if len(accounts) == 1:
-            request.session["admin_account_slug"] = accounts[0].slug
-            return RedirectResponse(url=f"/admin/{accounts[0].slug}/dashboard", status_code=status.HTTP_302_FOUND)
+        if not choose:
+            current_account_slug = _session_account_slug(request)
+            allowed_slugs = {item.slug for item in accounts}
+            target_slug = current_account_slug if current_account_slug in allowed_slugs else accounts[0].slug
+            request.session["admin_account_slug"] = target_slug
+            return RedirectResponse(url="/site/dashboard", status_code=status.HTTP_302_FOUND)
         return templates.TemplateResponse(
             request,
             "admin/account_select.html",
@@ -2963,7 +12207,8 @@ def create_app() -> FastAPI:
         if account_slug not in allowed:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cross-account switch denied.")
         request.session["admin_account_slug"] = account_slug
-        return RedirectResponse(url=next or f"/admin/{account_slug}/dashboard", status_code=status.HTTP_302_FOUND)
+        target_url = next or "/site/dashboard"
+        return RedirectResponse(url=target_url, status_code=status.HTTP_302_FOUND)
 
     @app.get("/admin/portfolio", response_class=HTMLResponse)
     def admin_portfolio(
@@ -3394,6 +12639,8 @@ def create_app() -> FastAPI:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found in accessible accounts.")
         accounts = _accessible_accounts(session, actor_email)
         roles = session.execute(select(Role).order_by(Role.id.asc())).scalars().all()
+        visible_emails = [row["user"].email for row in user_rows if row.get("user") and row["user"].email]
+        telegram_links_by_email = _telegram_links_by_email(visible_emails)
         return templates.TemplateResponse(
             request,
             "admin/users.html",
@@ -3412,6 +12659,7 @@ def create_app() -> FastAPI:
                 "shell_brand_subtitle": "Global user lifecycle and access management",
                 "user_rows": user_rows,
                 "selected_user": selected_user,
+                "telegram_links_by_email": telegram_links_by_email,
                 "accounts": accounts,
                 "roles": roles,
             },
@@ -3527,6 +12775,44 @@ def create_app() -> FastAPI:
         except PlatformCoreError as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
         return JSONResponse({"user": _serialize_user(user)})
+
+    @app.post("/admin/users/{user_id}/telegram-link")
+    async def admin_link_user_telegram(
+        request: Request,
+        user_id: int,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        actor_email = _require_admin_user(request, session).email
+        if not _actor_can_manage_accounts(session, actor_email):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Owner or admin access is required.")
+        user = _assert_user_visible_to_actor(session, actor_email, user_id)
+        payload = await request.json()
+        telegram_user_id_raw = str(payload.get("telegram_user_id") or "").strip()
+        if not telegram_user_id_raw:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="telegram_user_id is required.")
+        try:
+            telegram_user_id = int(telegram_user_id_raw)
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="telegram_user_id must be an integer.") from exc
+        telegram_username = str(payload.get("telegram_username") or "").strip().lstrip("@")
+        bot_storage.link_platform_user(telegram_user_id, telegram_username or None, user.email)
+        return JSONResponse({"user": _serialize_user(user), "telegram_links": bot_storage.list_platform_links(user.email)})
+
+    @app.post("/admin/users/{user_id}/telegram-link/{telegram_user_id}/delete")
+    async def admin_unlink_user_telegram(
+        request: Request,
+        user_id: int,
+        telegram_user_id: int,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        actor_email = _require_admin_user(request, session).email
+        if not _actor_can_manage_accounts(session, actor_email):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Owner or admin access is required.")
+        user = _assert_user_visible_to_actor(session, actor_email, user_id)
+        bot_storage.unlink_platform_user(telegram_user_id)
+        return JSONResponse({"user": _serialize_user(user), "telegram_links": bot_storage.list_platform_links(user.email)})
 
     @app.get("/admin/{account_slug}/brief", response_class=HTMLResponse)
     def admin_brief(
@@ -3902,6 +13188,7 @@ def create_app() -> FastAPI:
         account_slug: str,
         integration_id: int | None = Query(default=None),
         provider: str | None = Query(default=None),
+        telegram_refresh_id: int | None = Query(default=None),
         session: Session = Depends(get_db_session),
     ) -> HTMLResponse:
         user = _current_session_user(session, request)
@@ -3928,6 +13215,28 @@ def create_app() -> FastAPI:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
             selected_provider_key = f"{selected_setup['integration'].provider_kind}:{selected_setup['integration'].provider_name}"
         provider_catalog = _provider_catalog()
+        selected_provider_spec = next((item for item in provider_catalog if item["key"] == selected_provider_key), provider_catalog[0])
+        selected_telegram_connection = None
+        if selected_setup and selected_setup["integration"].provider_kind == "messaging" and selected_setup["integration"].provider_name == "telegram":
+            if telegram_refresh_id == selected_setup["integration"].id:
+                try:
+                    selected_telegram_connection = asyncio.run(
+                        _refresh_telegram_qr_login(runtime, session, selected_setup["integration"].id)
+                    )
+                except Exception:
+                    selected_telegram_connection = _telegram_connection_payload(
+                        selected_setup["integration"],
+                        manager_snapshot=telegram_qr_login_manager.snapshot(selected_setup["integration"].id),
+                        setup=selected_setup,
+                    )
+            else:
+                selected_telegram_connection = _telegram_connection_payload(
+                    selected_setup["integration"],
+                    manager_snapshot=telegram_qr_login_manager.snapshot(selected_setup["integration"].id),
+                    setup=selected_setup,
+                )
+            if isinstance(selected_telegram_connection, dict):
+                selected_telegram_connection["page_refresh_href"] = f"/admin/{runtime.account.slug}/integrations?integration_id={selected_setup['integration'].id}&telegram_refresh_id={selected_setup['integration'].id}"
         return templates.TemplateResponse(
             request,
             "admin/integrations.html",
@@ -3939,9 +13248,56 @@ def create_app() -> FastAPI:
                 "provider_catalog": provider_catalog,
                 "selected_provider_key": selected_provider_key,
                 "selected_setup": selected_setup,
-                "selected_provider_spec": next((item for item in provider_catalog if item["key"] == selected_provider_key), provider_catalog[0]),
+                "selected_provider_spec": selected_provider_spec,
+                "selected_credential_health": _integration_credential_health(selected_provider_spec, selected_setup),
+                "selected_security_posture": _integration_security_posture(selected_provider_spec, selected_setup),
+                "selected_telegram_connection": selected_telegram_connection,
+                "selected_webhook_url": _integration_webhook_url(selected_setup["integration"]) if selected_setup else None,
+                "selected_webhook_qr_data_uri": _qr_data_uri(_integration_webhook_url(selected_setup["integration"])) if selected_setup else None,
+                "public_base_url": settings.public_base_url,
             },
         )
+
+    @app.get("/admin/{account_slug}/integrations/{integration_id}/telegram-qr")
+    async def admin_telegram_qr_status(
+        request: Request,
+        account_slug: str,
+        integration_id: int,
+        refresh: bool = Query(default=False),
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        user = _require_admin_user(request, session)
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=user.email)
+        ensure_permission(runtime, "integrations.manage")
+        _ensure_account_feature(runtime, "integrations_setup", "Integrations setup")
+        try:
+            payload = (
+                await _refresh_telegram_qr_login(runtime, session, integration_id)
+                if refresh
+                else await _telegram_qr_status_payload(runtime, session, integration_id)
+            )
+        except (TelegramClientUnavailableError, TelegramQrLoginError, ValueError) as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        return JSONResponse(payload, headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0", "Pragma": "no-cache"})
+
+    @app.post("/admin/{account_slug}/integrations/{integration_id}/telegram-qr/password")
+    async def admin_telegram_qr_password(
+        request: Request,
+        account_slug: str,
+        integration_id: int,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        user = _require_admin_user(request, session)
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=user.email)
+        ensure_permission(runtime, "integrations.manage")
+        _ensure_account_feature(runtime, "integrations_setup", "Integrations setup")
+        payload = await request.json()
+        try:
+            result = await _submit_telegram_qr_password(runtime, session, integration_id, str(payload.get("password") or ""))
+        except (TelegramClientUnavailableError, TelegramQrLoginError, ValueError) as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        return JSONResponse(result, headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0", "Pragma": "no-cache"})
 
     @app.get("/admin/{account_slug}/members", response_class=HTMLResponse)
     def admin_members(
@@ -3997,6 +13353,8 @@ def create_app() -> FastAPI:
         account_settings = _account_product_config(runtime.account)
         feature_rows = _account_feature_rows(runtime.account)
         plan_profiles = _plan_profiles()
+        membership_emails = [item.user.email for item in active_memberships if item.user and item.user.email]
+        telegram_links_by_email = _telegram_links_by_email(membership_emails)
         return templates.TemplateResponse(
             request,
             "admin/settings.html",
@@ -4010,6 +13368,7 @@ def create_app() -> FastAPI:
                 "soft_limit_definitions": _soft_limit_definitions(),
                 "readiness": _account_product_readiness(runtime, session),
                 "active_memberships": active_memberships,
+                "telegram_links_by_email": telegram_links_by_email,
                 "account_status_options": _account_status_options(),
                 "account_plan_options": _account_plan_options(),
                 "current_plan_profile": plan_profiles.get(runtime.account.plan_type, plan_profiles["internal"]),
@@ -4052,7 +13411,8 @@ def create_app() -> FastAPI:
             "default_owner_user_id": int(_value("default_owner_user_id")) if _value("default_owner_user_id") else None,
             "default_operator_user_id": int(_value("default_operator_user_id")) if _value("default_operator_user_id") else None,
             "notification_email_recipients": [item.strip() for item in _value("notification_email_recipients").split(",") if item.strip()],
-            "notification_telegram_chat_ids": [item.strip() for item in _value("notification_telegram_chat_ids").split(",") if item.strip()],
+            "notification_telegram_integration_ids": existing_settings.get("notification_telegram_integration_ids") or [],
+            "notification_telegram_chat_ids": [],
             "notification_webhook_url": _value("notification_webhook_url"),
             "export_notifications_to_obsidian": bool(payload.get("export_notifications_to_obsidian")),
             "copilot_focus_areas": _value("copilot_focus_areas"),
@@ -4074,6 +13434,190 @@ def create_app() -> FastAPI:
         except (PlatformCoreError, IntegrityError, ValueError) as exc:
             _push_flash(request, "error", f"Account settings update failed: {exc}")
         return RedirectResponse(url=f"/admin/{runtime.account.slug}/settings", status_code=status.HTTP_302_FOUND)
+
+    @app.get("/admin/{account_slug}/legacy", response_class=HTMLResponse)
+    def admin_legacy(
+        request: Request,
+        account_slug: str,
+        session: Session = Depends(get_db_session),
+    ) -> HTMLResponse:
+        user = _current_session_user(session, request)
+        if user is None:
+            request.session.clear()
+            return _login_redirect(f"/admin/{account_slug}/legacy")
+        actor_email = user.email
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
+        request.session["admin_account_slug"] = runtime.account.slug
+        ensure_permission(runtime, "business.read")
+        _ensure_account_feature(runtime, "knowledge_base", "Legacy bridge")
+
+        legacy_summary = _legacy_archive_json("summary.json") or {}
+        goal_payload = _legacy_archive_json("extracted/goal_bot.json") or {}
+        finance_payload = _legacy_archive_json("extracted/finance.json") or {}
+        warehouse_payload = _legacy_archive_json("extracted/warehouse.json") or {}
+
+        profiles = goal_payload.get("profiles", []) if isinstance(goal_payload.get("profiles"), list) else []
+        goal_profile = profiles[0] if profiles and isinstance(profiles[0], dict) else None
+        goal_journal = [item for item in goal_payload.get("mentor_journal", []) if isinstance(item, dict)][:8]
+        goal_checkins = [item for item in goal_payload.get("daily_checkins", []) if isinstance(item, dict)][:7]
+
+        finance_daily_rows = [item for item in finance_payload.get("daily_summary_latest", []) if isinstance(item, dict)]
+        finance_latest_day = finance_daily_rows[-1] if finance_daily_rows else None
+        finance_ceo_rows = [item for item in finance_payload.get("ceo_summary_latest", []) if isinstance(item, dict)][:12]
+        finance_top_rows = [
+            item
+            for item in finance_payload.get("management_monthly_top20_latest", [])
+            if isinstance(item, dict) and item.get("секция") != "Сводка"
+        ][:12]
+        capital_weekly_rows = [item for item in finance_payload.get("capital_weekly_latest", []) if isinstance(item, dict)]
+        finance_ai_reports = finance_payload.get("ai_reports", {}) if isinstance(finance_payload.get("ai_reports"), dict) else {}
+
+        invoice_rows: list[dict[str, object]] = []
+        for row in warehouse_payload.get("invoice_history", []):
+            if not isinstance(row, dict):
+                continue
+            enriched = dict(row)
+            archive_rel_path = _legacy_archive_relative_path(str(row.get("pdf_path") or ""))
+            enriched["archive_rel_path"] = archive_rel_path
+            invoice_rows.append(enriched)
+        warehouse_audit_rows = [item for item in warehouse_payload.get("audit_log", []) if isinstance(item, dict)][:12]
+        warehouse_purchase_rules = warehouse_payload.get("purchase_rules", {}) if isinstance(warehouse_payload.get("purchase_rules"), dict) else {}
+        warehouse_seller_cards = []
+        seller_cards_payload = warehouse_payload.get("seller_cards", {})
+        if isinstance(seller_cards_payload, dict):
+            for key, item in seller_cards_payload.items():
+                if isinstance(item, dict):
+                    warehouse_seller_cards.append({"key": key, **item})
+
+        legacy_live_counts = {
+            "knowledge_items": session.execute(
+                select(func.count()).select_from(KnowledgeItem).where(
+                    KnowledgeItem.account_id == runtime.account.id,
+                    KnowledgeItem.source_kind == "legacy_bot_import",
+                )
+            ).scalar_one(),
+            "documents": session.execute(
+                select(func.count()).select_from(Document).where(
+                    Document.account_id == runtime.account.id,
+                    Document.storage_kind == "legacy-local",
+                )
+            ).scalar_one(),
+            "expenses": session.execute(
+                select(func.count()).select_from(Expense).where(
+                    Expense.account_id == runtime.account.id,
+                    Expense.reference_type == "legacy.telegram_expense",
+                )
+            ).scalar_one(),
+            "daily_kpis": session.execute(
+                select(func.count()).select_from(DailyKPI).where(
+                    DailyKPI.account_id == runtime.account.id,
+                )
+            ).scalar_one(),
+        }
+
+        return templates.TemplateResponse(
+            request,
+            "admin/legacy.html",
+            {
+                **_admin_context(request, session, runtime, page="legacy"),
+                "legacy_summary": legacy_summary,
+                "legacy_archive_exists": bool(legacy_summary),
+                "goal_profile": goal_profile,
+                "goal_journal": goal_journal,
+                "goal_checkins": goal_checkins,
+                "finance_latest_day": finance_latest_day,
+                "finance_daily_rows": finance_daily_rows,
+                "finance_ceo_rows": finance_ceo_rows,
+                "finance_top_rows": finance_top_rows,
+                "capital_weekly_rows": capital_weekly_rows,
+                "finance_ai_reports": finance_ai_reports,
+                "warehouse_invoice_rows": invoice_rows[:12],
+                "warehouse_audit_rows": warehouse_audit_rows,
+                "warehouse_purchase_rules": warehouse_purchase_rules,
+                "warehouse_seller_cards": warehouse_seller_cards,
+                "legacy_live_counts": legacy_live_counts,
+            },
+        )
+
+    @app.post("/admin/{account_slug}/legacy/refresh")
+    async def admin_refresh_legacy(
+        request: Request,
+        account_slug: str,
+        session: Session = Depends(get_db_session),
+    ) -> RedirectResponse:
+        await _require_csrf(request)
+        actor = _require_admin_user(request, session)
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor.email)
+        request.session["admin_account_slug"] = runtime.account.slug
+        ensure_permission(runtime, "documents.manage")
+        _ensure_account_feature(runtime, "knowledge_base", "Legacy bridge")
+        _require_account_manager(runtime)
+        try:
+            summary = _refresh_legacy_archive()
+            _push_flash(
+                request,
+                "success",
+                f"Legacy archive refreshed. Mirrored {summary.get('inventory_copied_files', 0)} files into the product workspace.",
+            )
+        except Exception as exc:
+            _push_flash(request, "error", f"Legacy archive refresh failed: {exc}")
+        return RedirectResponse(url=f"/admin/{runtime.account.slug}/legacy", status_code=status.HTTP_302_FOUND)
+
+    @app.post("/admin/{account_slug}/legacy/import-structured")
+    async def admin_import_legacy_structured(
+        request: Request,
+        account_slug: str,
+        session: Session = Depends(get_db_session),
+    ) -> RedirectResponse:
+        await _require_csrf(request)
+        actor = _require_admin_user(request, session)
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor.email)
+        request.session["admin_account_slug"] = runtime.account.slug
+        ensure_permission(runtime, "documents.manage")
+        _ensure_account_feature(runtime, "knowledge_base", "Legacy bridge")
+        _require_account_manager(runtime)
+        try:
+            summary = _refresh_legacy_archive(import_account_slug=runtime.account.slug, actor_email=actor.email)
+            imported = summary.get("platform_import") if isinstance(summary, dict) else None
+            if isinstance(imported, dict):
+                _push_flash(
+                    request,
+                    "success",
+                    "Legacy structured import completed: "
+                    f"expenses {imported.get('expenses_imported', 0)}, "
+                    f"daily_kpis {imported.get('daily_kpis_imported', 0)}, "
+                    f"documents {imported.get('documents_imported', 0)}, "
+                    f"knowledge_items {imported.get('knowledge_items_imported', 0)}.",
+                )
+            else:
+                _push_flash(request, "error", "Legacy structured import did not return import counters.")
+        except Exception as exc:
+            _push_flash(request, "error", f"Legacy structured import failed: {exc}")
+        return RedirectResponse(url=f"/admin/{runtime.account.slug}/legacy", status_code=status.HTTP_302_FOUND)
+
+    @app.get("/admin/{account_slug}/legacy/file")
+    def admin_legacy_file(
+        request: Request,
+        account_slug: str,
+        path: str = Query(...),
+        session: Session = Depends(get_db_session),
+    ) -> FileResponse:
+        user = _current_session_user(session, request)
+        if user is None:
+            request.session.clear()
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Admin session is required.")
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=user.email)
+        request.session["admin_account_slug"] = runtime.account.slug
+        ensure_permission(runtime, "business.read")
+        _ensure_account_feature(runtime, "knowledge_base", "Legacy bridge")
+        target = (legacy_archive_files_root / path).resolve()
+        if not str(target).startswith(str(legacy_archive_files_root)) or not target.is_file():
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Legacy file not found.")
+        return FileResponse(
+            target,
+            media_type=mimetypes.guess_type(target.name)[0] or "application/octet-stream",
+            filename=target.name,
+        )
 
     @app.get("/admin/{account_slug}/knowledge", response_class=HTMLResponse)
     def admin_knowledge(
@@ -4889,6 +14433,83 @@ def create_app() -> FastAPI:
             return Response(content=pdf_bytes, media_type="application/pdf")
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unsupported preview format.")
 
+    @app.get("/admin/{account_slug}/documents", response_class=HTMLResponse)
+    def admin_documents(
+        request: Request,
+        account_slug: str,
+        document_id: int | None = Query(default=None),
+        document_type: str | None = Query(default=None),
+        session: Session = Depends(get_db_session),
+    ) -> HTMLResponse:
+        user = _current_session_user(session, request)
+        if user is None:
+            request.session.clear()
+            return _login_redirect(f"/admin/{account_slug}/documents")
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=user.email)
+        request.session["admin_account_slug"] = runtime.account.slug
+        ensure_permission(runtime, "business.read")
+        feature_access = _feature_access_map(runtime.account)
+        if not (feature_access["operations_workflows"]["allowed"] or feature_access["business_os"]["allowed"]):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Documents are unavailable for this account.")
+
+        operations_service = OperationsService(session)
+        business_os = BusinessOSService(session)
+        billing_service = BillingService(session)
+
+        customer_map = {item.id: item for item in business_os.list_customers(runtime)}
+        all_documents_map: dict[int, Document] = {}
+        for item in operations_service.list_documents(runtime.context):
+            all_documents_map[item.id] = item
+        for item in billing_service.list_documents(runtime.context, document_types=["invoice", "claim"]):
+            all_documents_map[item.id] = item
+
+        documents = sorted(
+            all_documents_map.values(),
+            key=lambda item: item.issued_at or item.created_at or datetime.min.replace(tzinfo=timezone.utc),
+            reverse=True,
+        )
+        normalized_type = str(document_type or "").strip().lower()
+        if normalized_type:
+            documents = [item for item in documents if str(item.document_type or "").strip().lower() == normalized_type]
+
+        selected_document = None
+        if document_id is not None:
+            selected_document = next((item for item in documents if item.id == document_id), None)
+            if selected_document is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found.")
+        elif documents:
+            selected_document = documents[0]
+
+        preview_text = business_os.render_document_preview(runtime, selected_document.id) if selected_document is not None else None
+        type_counts: dict[str, int] = defaultdict(int)
+        for item in documents:
+            type_counts[str(item.document_type or "unknown")] += 1
+
+        billing_types = {"invoice", "claim"}
+        billing_documents = [item for item in documents if item.document_type in billing_types]
+        operational_documents = [item for item in documents if item.document_type not in billing_types]
+
+        return templates.TemplateResponse(
+            request,
+            "admin/documents.html",
+            {
+                **_admin_context(request, session, runtime, page="documents"),
+                "documents": documents,
+                "selected_document": selected_document,
+                "preview_text": preview_text,
+                "document_type_filter": normalized_type,
+                "document_type_counts": dict(sorted(type_counts.items())),
+                "customer_map": customer_map,
+                "documents_metrics": {
+                    "total": len(documents),
+                    "billing": len(billing_documents),
+                    "operational": len(operational_documents),
+                    "drafts": sum(1 for item in documents if item.status == "draft"),
+                },
+                "can_manage_documents": _is_manager_role(runtime.role_code) or "*" in runtime.permissions or "documents.manage" in runtime.permissions,
+            },
+        )
+
     @app.get("/admin/{account_slug}/crm", response_class=HTMLResponse)
     def admin_crm(
         request: Request,
@@ -4919,10 +14540,477 @@ def create_app() -> FastAPI:
             },
         )
 
+    def _parse_inventory_date(value: str | None) -> date | None:
+        cleaned = (value or "").strip()
+        if not cleaned:
+            return None
+        try:
+            return date.fromisoformat(cleaned)
+        except ValueError:
+            return None
+
+    def _inventory_period_dates(period: str, custom_from: date | None, custom_to: date | None) -> tuple[date | None, date | None]:
+        today = datetime.now(timezone.utc).date()
+        normalized = (period or "month").strip().lower()
+        if normalized == "today":
+            return today, today
+        if normalized == "yesterday":
+            target = today - timedelta(days=1)
+            return target, target
+        if normalized == "week":
+            return today - timedelta(days=6), today
+        if normalized == "month":
+            month_start = today.replace(day=1)
+            if today.month == 12:
+                next_month_start = date(today.year + 1, 1, 1)
+            else:
+                next_month_start = date(today.year, today.month + 1, 1)
+            month_end = next_month_start - timedelta(days=1)
+            return month_start, month_end
+        if normalized == "custom":
+            return custom_from, custom_to
+        return None, None
+
+    def _inventory_workspace_data(
+        runtime: ResolvedRuntimeContext,
+        session: Session,
+        *,
+        section: str,
+        period: str,
+        query: str | None = None,
+        date_from: date | None = None,
+        date_to: date | None = None,
+    ) -> dict[str, object]:
+        today = datetime.now(timezone.utc).date()
+        query_text = (query or "").strip().lower()
+        effective_from, effective_to = _inventory_period_dates(period, date_from, date_to)
+        operations_service = OperationsService(session)
+        business_os = BusinessOSService(session)
+        products = operations_service.list_products(runtime.context)
+        warehouses = operations_service.list_warehouses(runtime.context)
+        customers = operations_service.list_customers(runtime.context)
+        purchases = operations_service.list_purchases(runtime.context)
+        documents = operations_service.list_documents(runtime.context)
+        stock_items = session.execute(
+            select(StockItem).where(StockItem.account_id == runtime.account.id).order_by(StockItem.id.asc())
+        ).scalars().all()
+        movements = session.execute(
+            select(StockMovement)
+            .where(StockMovement.account_id == runtime.account.id)
+            .order_by(StockMovement.occurred_at.desc(), StockMovement.id.desc())
+        ).scalars().all()
+        kpis = session.execute(
+            select(DailyKPI)
+            .where(DailyKPI.account_id == runtime.account.id)
+            .order_by(DailyKPI.kpi_date.desc(), DailyKPI.id.desc())
+        ).scalars().all()
+        alerts = session.execute(
+            select(Alert)
+            .where(Alert.account_id == runtime.account.id, Alert.code.like("inventory.%"))
+            .order_by(Alert.last_detected_at.desc(), Alert.id.desc())
+        ).scalars().all()
+        integrations = session.execute(
+            select(Integration)
+            .where(
+                Integration.account_id == runtime.account.id,
+                Integration.provider_kind == "erp",
+                Integration.provider_name == "moysklad",
+                Integration.status == "active",
+            )
+            .order_by(Integration.id.desc())
+        ).scalars().all()
+        product_map = {item.id: item for item in products}
+        warehouse_map = {item.id: item for item in warehouses}
+        customer_map = {item.id: item for item in customers}
+        reorder_rows = operations_service.reorder_suggestions(runtime.context)
+        stagnant_rows = operations_service.stagnant_stock(runtime.context, threshold_days=30)
+        inventory_insights = business_os.inventory_insights(runtime, stagnant_days=30)
+
+        def _in_period(value: datetime | date | None) -> bool:
+            if value is None:
+                return False
+            current = value.date() if isinstance(value, datetime) else value
+            if effective_from is not None and current < effective_from:
+                return False
+            if effective_to is not None and current > effective_to:
+                return False
+            return True
+
+        def _matches(text_bits: list[str]) -> bool:
+            if not query_text:
+                return True
+            haystack = " ".join(bit.strip().lower() for bit in text_bits if bit).strip()
+            return query_text in haystack
+
+        movement_rows: list[dict[str, object]] = []
+        top_products_map: dict[int, dict[str, object]] = {}
+        top_warehouses_map: dict[int, dict[str, object]] = {}
+        top_counterparties_map: dict[str, dict[str, object]] = {}
+        top_sales_products_map: dict[int, dict[str, object]] = {}
+        top_sales_warehouses_map: dict[int, dict[str, object]] = {}
+        shipment_revenue_total = Decimal("0")
+        shipment_cost_total = Decimal("0")
+        shipment_count = 0
+        provider_sync_movement_count = 0
+        provider_sync_shipment_count = 0
+        chart_start = (effective_from or (today - timedelta(days=29)))
+        chart_end = effective_to or today
+        total_days = max(1, min(62, (chart_end - chart_start).days + 1))
+        chart_days = [chart_start + timedelta(days=offset) for offset in range(total_days)]
+        chart_map = {
+            day: {
+                "date": day,
+                "movements_count": 0,
+                "movement_quantity": Decimal("0"),
+                "purchase_amount": Decimal("0"),
+            }
+            for day in chart_days
+        }
+        movement_type_labels = {
+            "shipment_dispatch": "Отгрузка",
+            "purchase_receipt": "Приемка",
+            "transfer": "Перемещение",
+        }
+        for movement in movements:
+            occurred_on = movement.occurred_at.date() if movement.occurred_at else None
+            if not _in_period(occurred_on):
+                continue
+            product = product_map.get(movement.product_id)
+            warehouse = warehouse_map.get(movement.warehouse_id)
+            notes = movement.notes_json or {}
+            counterparty_name = str(
+                notes.get("customer_name")
+                or notes.get("counterparty_name")
+                or notes.get("supplier_name")
+                or ""
+            ).strip()
+            label = movement_type_labels.get(movement.movement_type, movement.movement_type)
+            text_bits = [
+                label,
+                product.name if product else "",
+                warehouse.name if warehouse else "",
+                counterparty_name,
+                str(notes.get("product_name") or ""),
+                str(notes.get("warehouse_name") or ""),
+                str(notes.get("move_name") or ""),
+            ]
+            if not _matches(text_bits):
+                continue
+            quantity_abs = abs(Decimal(movement.quantity_delta))
+            cost_amount = (quantity_abs * Decimal(movement.unit_cost or 0)).quantize(Decimal("0.01"))
+            revenue_amount = Decimal("0.00")
+            if movement.movement_type == "shipment_dispatch":
+                revenue_amount = _finance_parse_decimal_or_zero(notes.get("total_amount"))
+                if revenue_amount == Decimal("0"):
+                    revenue_amount = (quantity_abs * _finance_parse_decimal_or_zero(notes.get("unit_price"))).quantize(Decimal("0.01"))
+            display_amount = revenue_amount if movement.movement_type == "shipment_dispatch" and revenue_amount > Decimal("0") else cost_amount
+            source_label = "МойСклад" if str(movement.reference_type or "").strip() == "provider_sync" else "Вручную"
+            row = {
+                "movement": movement,
+                "label": label,
+                "product": product,
+                "warehouse": warehouse,
+                "counterparty_name": counterparty_name or "—",
+                "quantity_abs": quantity_abs,
+                "amount": display_amount,
+                "revenue_amount": revenue_amount,
+                "cost_amount": cost_amount,
+                "source_label": source_label,
+                "notes": notes,
+            }
+            movement_rows.append(row)
+            if str(movement.reference_type or "").strip() == "provider_sync":
+                provider_sync_movement_count += 1
+            if occurred_on in chart_map:
+                chart_map[occurred_on]["movements_count"] = int(chart_map[occurred_on]["movements_count"]) + 1
+                chart_map[occurred_on]["movement_quantity"] = Decimal(chart_map[occurred_on]["movement_quantity"]) + quantity_abs
+            if product is not None:
+                item = top_products_map.setdefault(
+                    product.id,
+                    {"product": product, "quantity": Decimal("0"), "amount": Decimal("0"), "moves": 0},
+                )
+                item["quantity"] = Decimal(item["quantity"]) + quantity_abs
+                item["amount"] = Decimal(item["amount"]) + display_amount
+                item["moves"] = int(item["moves"]) + 1
+            if warehouse is not None:
+                item = top_warehouses_map.setdefault(
+                    warehouse.id,
+                    {"warehouse": warehouse, "quantity": Decimal("0"), "amount": Decimal("0"), "moves": 0},
+                )
+                item["quantity"] = Decimal(item["quantity"]) + quantity_abs
+                item["amount"] = Decimal(item["amount"]) + display_amount
+                item["moves"] = int(item["moves"]) + 1
+            if counterparty_name:
+                item = top_counterparties_map.setdefault(
+                    counterparty_name,
+                    {"name": counterparty_name, "amount": Decimal("0"), "quantity": Decimal("0"), "events": 0, "kind": "movement"},
+                )
+                item["amount"] = Decimal(item["amount"]) + display_amount
+                item["quantity"] = Decimal(item["quantity"]) + quantity_abs
+                item["events"] = int(item["events"]) + 1
+            if movement.movement_type == "shipment_dispatch":
+                shipment_count += 1
+                shipment_revenue_total += revenue_amount
+                shipment_cost_total += cost_amount
+                if str(movement.reference_type or "").strip() == "provider_sync":
+                    provider_sync_shipment_count += 1
+                if product is not None:
+                    item = top_sales_products_map.setdefault(
+                        product.id,
+                        {"product": product, "quantity": Decimal("0"), "revenue": Decimal("0"), "shipments": 0},
+                    )
+                    item["quantity"] = Decimal(item["quantity"]) + quantity_abs
+                    item["revenue"] = Decimal(item["revenue"]) + revenue_amount
+                    item["shipments"] = int(item["shipments"]) + 1
+                if warehouse is not None:
+                    item = top_sales_warehouses_map.setdefault(
+                        warehouse.id,
+                        {"warehouse": warehouse, "quantity": Decimal("0"), "revenue": Decimal("0"), "shipments": 0},
+                    )
+                    item["quantity"] = Decimal(item["quantity"]) + quantity_abs
+                    item["revenue"] = Decimal(item["revenue"]) + revenue_amount
+                    item["shipments"] = int(item["shipments"]) + 1
+
+        purchase_rows: list[dict[str, object]] = []
+        for purchase in purchases:
+            activity_at = purchase.received_at or purchase.ordered_at
+            if not _in_period(activity_at):
+                continue
+            supplier = customer_map.get(purchase.supplier_customer_id) if purchase.supplier_customer_id else None
+            warehouse = warehouse_map.get(purchase.warehouse_id) if purchase.warehouse_id else None
+            notes = purchase.notes_json or {}
+            supplier_name = supplier.name if supplier is not None else str(notes.get("supplier_name") or "—")
+            warehouse_name = warehouse.name if warehouse is not None else str(notes.get("warehouse_name") or "—")
+            if not _matches([purchase.purchase_number or "", supplier_name, warehouse_name, purchase.status]):
+                continue
+            purchase_rows.append(
+                {
+                    "purchase": purchase,
+                    "supplier_name": supplier_name,
+                    "warehouse_name": warehouse_name,
+                }
+            )
+            activity_day = activity_at.date() if activity_at else None
+            if activity_day in chart_map:
+                chart_map[activity_day]["purchase_amount"] = Decimal(chart_map[activity_day]["purchase_amount"]) + Decimal(purchase.total_amount)
+            if supplier_name and supplier_name != "—":
+                item = top_counterparties_map.setdefault(
+                    supplier_name,
+                    {"name": supplier_name, "amount": Decimal("0"), "quantity": Decimal("0"), "events": 0, "kind": "purchase"},
+                )
+                item["amount"] = Decimal(item["amount"]) + Decimal(purchase.total_amount)
+                item["events"] = int(item["events"]) + 1
+
+        stock_rows: list[dict[str, object]] = []
+        for stock_item in stock_items:
+            product = product_map.get(stock_item.product_id)
+            warehouse = warehouse_map.get(stock_item.warehouse_id)
+            if product is None or warehouse is None:
+                continue
+            if not _matches([product.name, product.sku or "", warehouse.name]):
+                continue
+            min_level = max(Decimal(stock_item.min_quantity), Decimal(product.min_stock_level))
+            stock_rows.append(
+                {
+                    "stock_item": stock_item,
+                    "product": product,
+                    "warehouse": warehouse,
+                    "available": Decimal(stock_item.quantity_on_hand) - Decimal(stock_item.quantity_reserved),
+                    "min_level": min_level,
+                    "stock_value": (Decimal(stock_item.quantity_on_hand) * Decimal(product.cost_price or 0)).quantize(Decimal("0.01")),
+                    "needs_reorder": Decimal(stock_item.quantity_on_hand) <= min_level,
+                }
+            )
+        stock_rows.sort(key=lambda item: (not item["needs_reorder"], item["warehouse"].name.lower(), item["product"].name.lower()))
+
+        search_results: list[dict[str, object]] = []
+        for row in movement_rows[:80]:
+            search_results.append(
+                {
+                    "kind": row["label"],
+                    "title": row["product"].name if row["product"] is not None else f"Товар #{row['movement'].product_id}",
+                    "subtitle": f"{row['warehouse'].name if row['warehouse'] is not None else '—'} • {row['counterparty_name']}",
+                    "date": row["movement"].occurred_at,
+                    "amount": row["amount"],
+                }
+            )
+        for row in purchase_rows[:40]:
+            search_results.append(
+                {
+                    "kind": "Закупка",
+                    "title": row["purchase"].purchase_number or f"Закупка #{row['purchase'].id}",
+                    "subtitle": f"{row['supplier_name']} • {row['warehouse_name']}",
+                    "date": row["purchase"].received_at or row["purchase"].ordered_at,
+                    "amount": Decimal(row["purchase"].total_amount),
+                }
+            )
+        search_results.sort(key=lambda item: item["date"] or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+
+        top_products = sorted(top_products_map.values(), key=lambda item: (Decimal(item["amount"]), Decimal(item["quantity"])), reverse=True)[:20]
+        top_warehouses = sorted(top_warehouses_map.values(), key=lambda item: (Decimal(item["amount"]), Decimal(item["quantity"])), reverse=True)[:20]
+        top_counterparties = sorted(top_counterparties_map.values(), key=lambda item: (Decimal(item["amount"]), Decimal(item["quantity"]), int(item["events"])), reverse=True)[:20]
+        top_sales_products = sorted(top_sales_products_map.values(), key=lambda item: (Decimal(item["revenue"]), Decimal(item["quantity"])), reverse=True)[:20]
+        top_sales_warehouses = sorted(top_sales_warehouses_map.values(), key=lambda item: (Decimal(item["revenue"]), Decimal(item["quantity"])), reverse=True)[:20]
+        chart_rows = list(chart_map.values())
+        max_moves = max((int(item["movements_count"]) for item in chart_rows), default=0)
+        max_qty = max((Decimal(item["movement_quantity"]) for item in chart_rows), default=Decimal("0"))
+        max_purchase = max((Decimal(item["purchase_amount"]) for item in chart_rows), default=Decimal("0"))
+
+        latest_moysklad_sync = max((item.last_sync_at for item in integrations if item.last_sync_at is not None), default=None)
+        inventory_kpi_map: dict[str, Decimal] = defaultdict(lambda: Decimal("0"))
+        for item in kpis:
+            metric_code = str(item.metric_code or "")
+            if metric_code.startswith("inventory.") and _in_period(item.kpi_date):
+                inventory_kpi_map[metric_code] += Decimal(item.value_numeric)
+
+        procurement_rows = []
+        for row in reorder_rows:
+            if not _matches([row.product.name, row.product.sku or "", row.warehouse.name]):
+                continue
+            procurement_rows.append(row)
+
+        section_items = [
+            {"key": "overview", "label": "Обзор"},
+            {"key": "products", "label": "Товары"},
+            {"key": "warehouses", "label": "Склады"},
+            {"key": "purchase", "label": "Закупка"},
+            {"key": "receiving", "label": "Приемка"},
+            {"key": "shipments", "label": "Отгрузки"},
+            {"key": "replenishment", "label": "Пополнение"},
+            {"key": "movement", "label": "Движение"},
+        ]
+        current_section = next((item for item in section_items if item["key"] == section), section_items[0])
+        return {
+            "inventory_section": current_section["key"],
+            "inventory_section_label": current_section["label"],
+            "inventory_sections": section_items,
+            "inventory_filters": {
+                "period": period,
+                "query": query or "",
+                "date_from": effective_from.isoformat() if effective_from else "",
+                "date_to": effective_to.isoformat() if effective_to else "",
+            },
+            "inventory_period_label": (
+                f"{effective_from.strftime('%d.%m.%Y')} - {effective_to.strftime('%d.%m.%Y')}"
+                if effective_from is not None and effective_to is not None
+                else "весь период"
+            ),
+            "inventory_data_health": {
+                "has_moysklad": bool(integrations),
+                "latest_moysklad_sync": latest_moysklad_sync,
+                "stock_items_count": len(stock_items),
+                "movements_count": len(movement_rows),
+                "purchases_count": len(purchase_rows),
+                "provider_sync_movement_count": provider_sync_movement_count,
+                "provider_sync_shipment_count": provider_sync_shipment_count,
+            },
+            "inventory_metrics": {
+                "stock_rows": len(stock_rows),
+                "movement_rows": len(movement_rows),
+                "purchase_rows": len(purchase_rows),
+                "reorder_rows": len(procurement_rows),
+                "stagnant_rows": len(stagnant_rows),
+                "alerts_count": len(alerts),
+                "shipment_rows": shipment_count,
+            },
+            "inventory_fact": {
+                "shipments_count": shipment_count,
+                "provider_shipments_count": provider_sync_shipment_count,
+                "shipment_revenue": _finance_format_decimal(shipment_revenue_total),
+                "shipment_cost": _finance_format_decimal(shipment_cost_total),
+                "shipment_gross_profit": _finance_format_decimal(shipment_revenue_total - shipment_cost_total),
+            },
+            "inventory_movements": movement_rows[:200],
+            "inventory_chart_rows": [
+                {
+                    **row,
+                    "moves_height": 0 if max_moves <= 0 else int((Decimal(int(row["movements_count"])) / Decimal(max_moves)) * Decimal("100")),
+                    "qty_height": 0 if max_qty <= 0 else int((Decimal(row["movement_quantity"]) / max_qty) * Decimal("100")),
+                    "purchase_height": 0 if max_purchase <= 0 else int((Decimal(row["purchase_amount"]) / max_purchase) * Decimal("100")),
+                }
+                for row in chart_rows
+            ],
+            "inventory_stock_rows": stock_rows[:300],
+            "inventory_top_products": top_products,
+            "inventory_top_warehouses": top_warehouses,
+            "inventory_top_counterparties": top_counterparties,
+            "inventory_top_sales_products": top_sales_products,
+            "inventory_top_sales_warehouses": top_sales_warehouses,
+            "inventory_search_rows": search_results[:120],
+            "inventory_procurement_rows": procurement_rows[:200],
+            "inventory_stagnant_rows": stagnant_rows[:100],
+            "inventory_alerts": alerts[:50],
+            "inventory_products": products[:200],
+            "inventory_warehouses": warehouses,
+            "inventory_customers": customers[:100],
+            "inventory_purchases": purchase_rows[:12],
+            "inventory_documents": documents[:10],
+            "document_type_options": _document_type_options(),
+            "document_status_options": _document_status_options(),
+            "can_manage_operations": _is_manager_role(runtime.role_code) or "*" in runtime.permissions or "business.write" in runtime.permissions,
+            "inventory_kpi_rows": [
+                {"label": "Остатки в строках", "value": Decimal(len(stock_rows)), "code": "inventory.stock_rows"},
+                {"label": "Движения за период", "value": Decimal(len(movement_rows)), "code": "inventory.movements"},
+                {"label": "Закупки за период", "value": Decimal(len(purchase_rows)), "code": "inventory.purchases"},
+                {"label": "Нужен перезаказ", "value": Decimal(len(procurement_rows)), "code": "inventory.reorder_needed"},
+                {"label": "Залежалый товар", "value": Decimal(len(stagnant_rows)), "code": "inventory.stagnant"},
+                *[
+                    {"label": code, "value": value, "code": code}
+                    for code, value in sorted(inventory_kpi_map.items())
+                ],
+            ],
+        }
+
+    @app.get("/admin/{account_slug}/inventory/procurement.csv")
+    def admin_inventory_procurement_export(
+        request: Request,
+        account_slug: str,
+        q: str | None = Query(default=None),
+        session: Session = Depends(get_db_session),
+    ) -> Response:
+        user = _current_session_user(session, request)
+        if user is None:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=user.email)
+        request.session["admin_account_slug"] = runtime.account.slug
+        ensure_permission(runtime, "business.read")
+        _ensure_account_feature(runtime, "business_os", "Inventory")
+        suggestions = OperationsService(session).reorder_suggestions(runtime.context)
+        query_text = (q or "").strip().lower()
+        output = StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["warehouse", "product", "sku", "current_quantity", "threshold_quantity", "recommended_quantity"])
+        for row in suggestions:
+            if query_text and query_text not in " ".join(
+                [row.warehouse.name.lower(), row.product.name.lower(), str(row.product.sku or "").lower()]
+            ):
+                continue
+            writer.writerow(
+                [
+                    row.warehouse.name,
+                    row.product.name,
+                    row.product.sku or "",
+                    str(row.current_quantity),
+                    str(row.threshold_quantity),
+                    str(row.recommended_quantity),
+                ]
+            )
+        csv_bytes = output.getvalue().encode("utf-8")
+        return Response(
+            content=csv_bytes,
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="procurement-{runtime.account.slug}.csv"'},
+        )
+
     @app.get("/admin/{account_slug}/inventory", response_class=HTMLResponse)
     def admin_inventory(
         request: Request,
         account_slug: str,
+        section: str = Query(default="overview"),
+        period: str = Query(default="month"),
+        q: str | None = Query(default=None),
+        date_from: str | None = Query(default=None),
+        date_to: str | None = Query(default=None),
         session: Session = Depends(get_db_session),
     ) -> HTMLResponse:
         user = _current_session_user(session, request)
@@ -4933,13 +15021,1021 @@ def create_app() -> FastAPI:
         request.session["admin_account_slug"] = runtime.account.slug
         ensure_permission(runtime, "business.read")
         _ensure_account_feature(runtime, "business_os", "Inventory")
-        insights = BusinessOSService(session).inventory_insights(runtime, stagnant_days=30)
+        workspace = _inventory_workspace_data(
+            runtime,
+            session,
+            section=section,
+            period=period,
+            query=q,
+            date_from=_parse_inventory_date(date_from),
+            date_to=_parse_inventory_date(date_to),
+        )
         return templates.TemplateResponse(
             request,
             "admin/inventory.html",
             {
                 **_admin_context(request, session, runtime, page="inventory"),
-                "inventory_insights": insights,
+                **workspace,
+                "today": datetime.now(timezone.utc).date(),
+                "yesterday": (datetime.now(timezone.utc).date() - timedelta(days=1)),
+                "week_ago": (datetime.now(timezone.utc).date() - timedelta(days=6)),
+                "month_ago": (datetime.now(timezone.utc).date() - timedelta(days=29)),
+            },
+        )
+
+    @app.post("/admin/{account_slug}/inventory/purchases/save")
+    async def admin_inventory_save_purchase(
+        request: Request,
+        account_slug: str,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        payload = await request.json()
+        actor_email = _require_admin_user(request, session).email
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
+        ensure_permission(runtime, "business.write")
+        _ensure_account_feature(runtime, "business_os", "Inventory")
+        body = payload.get("purchase") or {}
+        try:
+            purchase = OperationsService(session).create_purchase_request(
+                runtime.context,
+                supplier_customer_id=int(body["supplier_customer_id"]) if body.get("supplier_customer_id") else None,
+                warehouse_id=int(body["warehouse_id"]) if body.get("warehouse_id") else None,
+                product_id=int(body["product_id"]),
+                quantity=Decimal(str(body.get("quantity") or "0")),
+                unit_cost=Decimal(str(body.get("unit_cost") or "0")),
+                notes=str(body.get("notes") or "").strip() or None,
+            )
+            AuditLogService(session).log(
+                runtime.context,
+                "inventory.purchase.created",
+                "purchase",
+                str(purchase.id),
+                details={"purchase_number": purchase.purchase_number, "status": purchase.status},
+            )
+        except (PlatformCoreError, TenantContextError, ValueError, IntegrityError, ArithmeticError, KeyError) as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        return JSONResponse({"purchase": _serialize_purchase(purchase)})
+
+    @app.post("/admin/{account_slug}/inventory/shipments/save")
+    async def admin_inventory_save_shipment(
+        request: Request,
+        account_slug: str,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        payload = await request.json()
+        actor_email = _require_admin_user(request, session).email
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
+        ensure_permission(runtime, "business.write")
+        _ensure_account_feature(runtime, "business_os", "Inventory")
+        body = payload.get("shipment") or {}
+        try:
+            occurred_at = None
+            occurred_text = str(body.get("occurred_at") or "").strip()
+            if occurred_text:
+                occurred_at = datetime.fromisoformat(occurred_text)
+                if occurred_at.tzinfo is None:
+                    occurred_at = occurred_at.replace(tzinfo=timezone.utc)
+            shipment = OperationsService(session).create_shipment(
+                runtime.context,
+                warehouse_id=int(body["warehouse_id"]),
+                product_id=int(body["product_id"]),
+                customer_id=int(body["customer_id"]) if body.get("customer_id") else None,
+                quantity=Decimal(str(body.get("quantity") or "0")),
+                unit_price=Decimal(str(body.get("unit_price") or "0")),
+                occurred_at=occurred_at,
+                notes=str(body.get("notes") or "").strip() or None,
+            )
+            AuditLogService(session).log(
+                runtime.context,
+                "inventory.shipment.created",
+                "stock_movement",
+                str(shipment.id),
+                details={"movement_type": shipment.movement_type, "reference_id": shipment.reference_id},
+            )
+        except (PlatformCoreError, TenantContextError, ValueError, IntegrityError, ArithmeticError) as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        return JSONResponse({"shipment": _serialize_stock_movement(shipment)})
+
+    @app.post("/admin/{account_slug}/inventory/purchases/{purchase_id}/receive")
+    async def admin_inventory_receive_purchase(
+        request: Request,
+        account_slug: str,
+        purchase_id: int,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        actor_email = _require_admin_user(request, session).email
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
+        ensure_permission(runtime, "business.write")
+        _ensure_account_feature(runtime, "business_os", "Inventory")
+        try:
+            purchase = OperationsService(session).receive_purchase(runtime.context, purchase_id)
+            AuditLogService(session).log(
+                runtime.context,
+                "inventory.purchase.received",
+                "purchase",
+                str(purchase.id),
+                details={"purchase_number": purchase.purchase_number, "status": purchase.status},
+            )
+        except (PlatformCoreError, TenantContextError) as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        return JSONResponse({"purchase": _serialize_purchase(purchase)})
+
+    @app.post("/admin/{account_slug}/inventory/purchases/reorder")
+    async def admin_inventory_create_reorder_purchase(
+        request: Request,
+        account_slug: str,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        payload = await request.json()
+        actor_email = _require_admin_user(request, session).email
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
+        ensure_permission(runtime, "business.write")
+        _ensure_account_feature(runtime, "business_os", "Inventory")
+        body = _parse_admin_payload(payload, "reorder")
+        try:
+            purchase = OperationsService(session).create_reorder_purchase(
+                runtime.context,
+                stock_item_id=int(body["stock_item_id"]),
+                supplier_customer_id=int(body["supplier_customer_id"]) if body.get("supplier_customer_id") else None,
+                unit_cost=Decimal(str(body.get("unit_cost") or "0")),
+                notes=str(body.get("notes") or "").strip() or None,
+            )
+            AuditLogService(session).log(
+                runtime.context,
+                "inventory.purchase.reorder_created",
+                "purchase",
+                str(purchase.id),
+                details={"purchase_number": purchase.purchase_number, "status": purchase.status},
+            )
+        except (PlatformCoreError, TenantContextError, ValueError, ArithmeticError, KeyError) as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        return JSONResponse({"purchase": _serialize_purchase(purchase)})
+
+    def _parse_finance_date(value: str | None) -> date | None:
+        cleaned = (value or "").strip()
+        if not cleaned:
+            return None
+        try:
+            return date.fromisoformat(cleaned)
+        except ValueError:
+            return None
+
+    def _display_customer_name(customer: Customer | None, notes_json: dict[str, object] | None = None) -> str:
+        if customer is not None and str(customer.name or "").strip():
+            return str(customer.name).strip()
+        raw_name = str((notes_json or {}).get("customer_name") or "").strip()
+        if raw_name:
+            return f"Не сопоставлен: {raw_name}"
+        return "Не сопоставлен"
+
+    def _display_warehouse_name(warehouse: Warehouse | None, notes_json: dict[str, object] | None = None) -> str:
+        if warehouse is not None and str(warehouse.name or "").strip():
+            return str(warehouse.name).strip()
+        raw_name = str((notes_json or {}).get("warehouse_name") or "").strip()
+        if raw_name:
+            return f"Не сопоставлен: {raw_name}"
+        return "Не сопоставлен"
+
+    def _ads_customer_ids(session: Session, account_id: int) -> set[int]:
+        return {
+            int(item.canonical_entity_id)
+            for item in session.execute(
+                select(IntegrationEntityMapping)
+                .join(Integration, Integration.id == IntegrationEntityMapping.integration_id)
+                .where(
+                    IntegrationEntityMapping.account_id == account_id,
+                    IntegrationEntityMapping.provider_entity_type == "customer",
+                    Integration.provider_kind == "ads",
+                )
+            ).scalars().all()
+            if str(item.canonical_entity_id).isdigit()
+        }
+
+    def _erp_warehouse_ids(session: Session, account_id: int) -> set[int]:
+        return {
+            int(item.canonical_entity_id)
+            for item in session.execute(
+                select(IntegrationEntityMapping)
+                .join(Integration, Integration.id == IntegrationEntityMapping.integration_id)
+                .where(
+                    IntegrationEntityMapping.account_id == account_id,
+                    IntegrationEntityMapping.provider_entity_type == "warehouse",
+                    Integration.provider_kind == "erp",
+                )
+            ).scalars().all()
+            if str(item.canonical_entity_id).isdigit()
+        }
+
+    def _is_seed_finance_document(document: Document, ads_customer_ids: set[int]) -> bool:
+        if document.customer_id is not None and document.customer_id in ads_customer_ids:
+            return True
+        snapshot = document.snapshot_json or {}
+        text_bits = [
+            str(document.document_number or ""),
+            str(snapshot.get("summary") or ""),
+            str(snapshot.get("template_code") or ""),
+        ]
+        haystack = " ".join(bit.strip().lower() for bit in text_bits if bit).strip()
+        if not haystack:
+            return False
+        return "stage " in haystack or "acceptance" in haystack
+
+    def _finance_workspace_data(
+        runtime: ResolvedRuntimeContext,
+        session: Session,
+        *,
+        query: str | None = None,
+        customer_id: int | None = None,
+        product_id: int | None = None,
+        date_from: date | None = None,
+        date_to: date | None = None,
+        debt_only: bool = False,
+        overdue_only: bool = False,
+        profitable_only: bool = False,
+    ) -> dict[str, object]:
+        operations_service = OperationsService(session)
+        billing_service = BillingService(session)
+        customers = operations_service.list_customers(runtime.context)
+        shipments = operations_service.list_shipments(runtime.context)
+        products = operations_service.list_products(runtime.context)
+        warehouses = operations_service.list_warehouses(runtime.context)
+        documents = operations_service.list_documents(runtime.context)
+        purchases = operations_service.list_purchases(runtime.context)
+        billing_documents = billing_service.list_documents(runtime.context, document_types=["invoice", "claim"])
+        settlements = billing_service.list_settlements(runtime.context)
+        ads_customer_ids = _ads_customer_ids(session, runtime.account.id)
+        erp_warehouse_ids = _erp_warehouse_ids(session, runtime.account.id)
+        hidden_seed_documents_count = sum(1 for item in billing_documents if _is_seed_finance_document(item, ads_customer_ids))
+        billing_documents = [item for item in billing_documents if not _is_seed_finance_document(item, ads_customer_ids)]
+        finance_customers = [
+            item
+            for item in customers
+            if item.id not in ads_customer_ids
+        ]
+        finance_customer_map = {item.id: item for item in finance_customers}
+        finance_warehouses = [
+            item
+            for item in warehouses
+            if item.id in erp_warehouse_ids
+        ]
+        product_map = {item.id: item for item in products}
+        warehouse_map = {item.id: item for item in warehouses}
+        customer_map = {item.id: item for item in customers}
+        shipment_rows: list[dict[str, object]] = []
+        top_counterparty_map: dict[str, dict[str, object]] = {}
+        customer_finance_map: dict[str, dict[str, object]] = {}
+        product_analytics_map: dict[int, dict[str, object]] = {}
+        total_revenue = Decimal("0")
+        total_quantity = Decimal("0")
+        total_cost = Decimal("0")
+        total_profit = Decimal("0")
+        query_text = (query or "").strip().lower()
+        today = datetime.now(timezone.utc).date()
+        period_ranges = [
+            {"key": "day", "label": "День", "date_from": today, "date_to": today},
+            {"key": "week", "label": "Неделя", "date_from": today - timedelta(days=6), "date_to": today},
+            {"key": "month", "label": "Месяц", "date_from": today - timedelta(days=29), "date_to": today},
+        ]
+        period_analytics_map = {
+            item["key"]: {
+                "key": item["key"],
+                "label": item["label"],
+                "shipments_count": 0,
+                "revenue": Decimal("0"),
+                "cost": Decimal("0"),
+                "profit": Decimal("0"),
+                "paid": Decimal("0"),
+                "invoiced": Decimal("0"),
+                "outstanding": Decimal("0"),
+                "overdue": Decimal("0"),
+            }
+            for item in period_ranges
+        }
+        chart_start = today - timedelta(days=29)
+        chart_days = [chart_start + timedelta(days=offset) for offset in range(30)]
+        chart_map = {
+            day: {"date": day, "revenue": Decimal("0"), "profit": Decimal("0"), "paid": Decimal("0"), "shipments_count": 0}
+            for day in chart_days
+        }
+        for shipment in shipments:
+            notes_json = shipment.notes_json or {}
+            linked_customer_id = notes_json.get("customer_id")
+            customer = customer_map.get(int(linked_customer_id)) if str(linked_customer_id or "").isdigit() else None
+            customer_name = _display_customer_name(customer, notes_json)
+            total_amount = Decimal(str(notes_json.get("total_amount") or "0"))
+            quantity = abs(Decimal(shipment.quantity_delta))
+            product = product_map.get(shipment.product_id)
+            warehouse = warehouse_map.get(shipment.warehouse_id)
+            warehouse_name = _display_warehouse_name(warehouse, notes_json)
+            occurred_on = shipment.occurred_at.date() if shipment.occurred_at else None
+            shipment_search_blob = " ".join(
+                part
+                for part in [
+                    customer_name,
+                    customer.email if customer and customer.email else "",
+                    customer.phone if customer and customer.phone else "",
+                    product.name if product else "",
+                    warehouse_name,
+                    str(notes_json.get("notes") or ""),
+                ]
+                if part
+            ).lower()
+            if customer_id is not None and (customer is None or customer.id != customer_id):
+                continue
+            if product_id is not None and shipment.product_id != product_id:
+                continue
+            if date_from is not None and (occurred_on is None or occurred_on < date_from):
+                continue
+            if date_to is not None and (occurred_on is None or occurred_on > date_to):
+                continue
+            if query_text and query_text not in shipment_search_blob:
+                continue
+            cost_total = (Decimal(shipment.unit_cost) * quantity).quantize(Decimal("0.01"))
+            gross_profit = (total_amount - cost_total).quantize(Decimal("0.01"))
+            for period in period_ranges:
+                if occurred_on is not None and period["date_from"] <= occurred_on <= period["date_to"]:
+                    period_row = period_analytics_map[period["key"]]
+                    period_row["shipments_count"] = int(period_row["shipments_count"]) + 1
+                    period_row["revenue"] = Decimal(period_row["revenue"]) + total_amount
+                    period_row["cost"] = Decimal(period_row["cost"]) + cost_total
+                    period_row["profit"] = Decimal(period_row["profit"]) + gross_profit
+            if profitable_only and gross_profit <= 0:
+                continue
+            total_revenue += total_amount
+            total_quantity += quantity
+            total_cost += cost_total
+            total_profit += gross_profit
+            if occurred_on in chart_map:
+                chart_map[occurred_on]["revenue"] = Decimal(chart_map[occurred_on]["revenue"]) + total_amount
+                chart_map[occurred_on]["profit"] = Decimal(chart_map[occurred_on]["profit"]) + gross_profit
+                chart_map[occurred_on]["shipments_count"] = int(chart_map[occurred_on]["shipments_count"]) + 1
+            shipment_rows.append(
+                {
+                    "shipment": shipment,
+                    "customer_name": customer_name,
+                    "customer": customer,
+                    "product": product,
+                    "warehouse": warehouse,
+                    "warehouse_name": warehouse_name,
+                    "quantity": quantity,
+                    "total_amount": total_amount,
+                    "unit_price": Decimal(str(notes_json.get("unit_price") or "0")),
+                    "cost_total": cost_total,
+                    "gross_profit": gross_profit,
+                    "margin_percent": Decimal("0") if total_amount <= 0 else ((gross_profit / total_amount) * Decimal("100")).quantize(Decimal("0.1")),
+                }
+            )
+            counterparty = top_counterparty_map.setdefault(
+                customer_name,
+                {"name": customer_name, "shipments_count": 0, "quantity": Decimal("0"), "revenue": Decimal("0")},
+            )
+            counterparty["shipments_count"] = int(counterparty["shipments_count"]) + 1
+            counterparty["quantity"] = Decimal(counterparty["quantity"]) + quantity
+            counterparty["revenue"] = Decimal(counterparty["revenue"]) + total_amount
+            customer_entry = customer_finance_map.setdefault(
+                customer_name,
+                {
+                    "name": customer_name,
+                    "customer_id": customer.id if customer is not None else None,
+                    "shipments_count": 0,
+                    "shipment_revenue": Decimal("0"),
+                    "shipment_profit": Decimal("0"),
+                    "invoices_total": Decimal("0"),
+                    "paid_total": Decimal("0"),
+                    "outstanding_total": Decimal("0"),
+                    "overdue_total": Decimal("0"),
+                },
+            )
+            customer_entry["shipments_count"] = int(customer_entry["shipments_count"]) + 1
+            customer_entry["shipment_revenue"] = Decimal(customer_entry["shipment_revenue"]) + total_amount
+            customer_entry["shipment_profit"] = Decimal(customer_entry["shipment_profit"]) + gross_profit
+            product_entry = product_analytics_map.setdefault(
+                shipment.product_id,
+                {
+                    "product_id": shipment.product_id,
+                    "product_name": product.name if product is not None else f"Товар #{shipment.product_id}",
+                    "quantity": Decimal("0"),
+                    "revenue": Decimal("0"),
+                    "profit": Decimal("0"),
+                    "shipments_count": 0,
+                },
+            )
+            product_entry["quantity"] = Decimal(product_entry["quantity"]) + quantity
+            product_entry["revenue"] = Decimal(product_entry["revenue"]) + total_amount
+            product_entry["profit"] = Decimal(product_entry["profit"]) + gross_profit
+            product_entry["shipments_count"] = int(product_entry["shipments_count"]) + 1
+        shipment_rows.sort(
+            key=lambda item: (item["shipment"].occurred_at or datetime.min.replace(tzinfo=timezone.utc), item["shipment"].id),
+            reverse=True,
+        )
+        settlements_by_document: dict[int, Decimal] = {}
+        for settlement in settlements:
+            if settlement.status not in {"recorded", "confirmed"}:
+                continue
+            settlements_by_document[settlement.document_id] = settlements_by_document.get(settlement.document_id, Decimal("0")) + Decimal(settlement.amount)
+        total_invoiced = Decimal("0")
+        total_paid = Decimal("0")
+        total_outstanding = Decimal("0")
+        total_overdue = Decimal("0")
+        for document in billing_documents:
+            issued_on = document.issued_at.date() if document.issued_at else None
+            due_raw = (document.snapshot_json or {}).get("due_date")
+            due_on = _parse_finance_date(str(due_raw) if due_raw else None)
+            customer = customer_map.get(document.customer_id) if document.customer_id is not None else None
+            customer_name = _display_customer_name(customer)
+            search_blob = " ".join(
+                part
+                for part in [
+                    customer_name,
+                    document.document_number or "",
+                    str((document.snapshot_json or {}).get("summary") or ""),
+                ]
+                if part
+            ).lower()
+            if customer_id is not None and (customer is None or customer.id != customer_id):
+                continue
+            if date_from is not None and (issued_on is None or issued_on < date_from):
+                continue
+            if date_to is not None and (issued_on is None or issued_on > date_to):
+                continue
+            if query_text and query_text not in search_blob:
+                continue
+            document_total = Decimal(document.total_amount)
+            paid_amount = settlements_by_document.get(document.id, Decimal("0"))
+            outstanding_amount = max((document_total - paid_amount).quantize(Decimal("0.01")), Decimal("0"))
+            overdue_amount = outstanding_amount if due_on is not None and due_on < today and outstanding_amount > 0 else Decimal("0")
+            for period in period_ranges:
+                if issued_on is not None and period["date_from"] <= issued_on <= period["date_to"]:
+                    period_row = period_analytics_map[period["key"]]
+                    period_row["invoiced"] = Decimal(period_row["invoiced"]) + document_total
+                    period_row["outstanding"] = Decimal(period_row["outstanding"]) + outstanding_amount
+                    period_row["overdue"] = Decimal(period_row["overdue"]) + overdue_amount
+            total_invoiced += document_total
+            total_paid += paid_amount
+            total_outstanding += outstanding_amount
+            total_overdue += overdue_amount
+            customer_entry = customer_finance_map.setdefault(
+                customer_name,
+                {
+                    "name": customer_name,
+                    "customer_id": customer.id if customer is not None else None,
+                    "shipments_count": 0,
+                    "shipment_revenue": Decimal("0"),
+                    "shipment_profit": Decimal("0"),
+                    "invoices_total": Decimal("0"),
+                    "paid_total": Decimal("0"),
+                    "outstanding_total": Decimal("0"),
+                    "overdue_total": Decimal("0"),
+                },
+            )
+            customer_entry["invoices_total"] = Decimal(customer_entry["invoices_total"]) + document_total
+            customer_entry["paid_total"] = Decimal(customer_entry["paid_total"]) + paid_amount
+            customer_entry["outstanding_total"] = Decimal(customer_entry["outstanding_total"]) + outstanding_amount
+            customer_entry["overdue_total"] = Decimal(customer_entry["overdue_total"]) + overdue_amount
+        filtered_document_ids = {
+            document.id
+            for document in billing_documents
+            if (
+                (customer_id is None or (document.customer_id is not None and document.customer_id == customer_id))
+                and (
+                    not query_text
+                    or query_text in " ".join(
+                        part
+                        for part in [
+                            _display_customer_name(customer_map.get(document.customer_id) if document.customer_id else None),
+                            document.document_number or "",
+                            str((document.snapshot_json or {}).get("summary") or ""),
+                        ]
+                        if part
+                    ).lower()
+                )
+            )
+        }
+        for settlement in settlements:
+            if settlement.status not in {"recorded", "confirmed"}:
+                continue
+            if settlement.document_id not in filtered_document_ids:
+                continue
+            if settlement.settlement_date in chart_map:
+                chart_map[settlement.settlement_date]["paid"] = Decimal(chart_map[settlement.settlement_date]["paid"]) + Decimal(settlement.amount)
+            for period in period_ranges:
+                if period["date_from"] <= settlement.settlement_date <= period["date_to"]:
+                    period_row = period_analytics_map[period["key"]]
+                    period_row["paid"] = Decimal(period_row["paid"]) + Decimal(settlement.amount)
+        kpi_rows = session.execute(
+            select(DailyKPI).where(
+                DailyKPI.account_id == runtime.account.id,
+                DailyKPI.kpi_date >= chart_start,
+                DailyKPI.kpi_date <= today,
+            )
+        ).scalars().all()
+        plan_fact_map: dict[str, dict[str, object]] = {
+            "revenue": {"label": "Выручка", "fact": Decimal("0"), "plan": None},
+            "gross_profit": {"label": "Валовая прибыль", "fact": Decimal("0"), "plan": None},
+            "net_profit": {"label": "Чистая прибыль", "fact": Decimal("0"), "plan": None},
+        }
+        for row in kpi_rows:
+            if row.metric_code not in plan_fact_map:
+                continue
+            payload = row.payload_json or {}
+            plan_value = payload.get("plan_value")
+            plan_fact_map[row.metric_code]["fact"] = Decimal(plan_fact_map[row.metric_code]["fact"]) + Decimal(row.value_numeric)
+            if plan_value is not None:
+                existing = plan_fact_map[row.metric_code]["plan"]
+                plan_fact_map[row.metric_code]["plan"] = (Decimal(existing) if existing is not None else Decimal("0")) + Decimal(str(plan_value))
+        if plan_fact_map["revenue"]["fact"] == Decimal("0"):
+            plan_fact_map["revenue"]["fact"] = total_revenue
+        if plan_fact_map["gross_profit"]["fact"] == Decimal("0"):
+            plan_fact_map["gross_profit"]["fact"] = total_profit
+        top_products = sorted(
+            product_analytics_map.values(),
+            key=lambda item: (Decimal(item["revenue"]), Decimal(item["profit"]), Decimal(item["quantity"])),
+            reverse=True,
+        )[:10]
+        bank_accounts = session.execute(
+            select(BankAccount).where(BankAccount.account_id == runtime.account.id, BankAccount.status == "active")
+        ).scalars().all()
+        balance_snapshots = session.execute(
+            select(BalanceSnapshot)
+            .where(BalanceSnapshot.account_id == runtime.account.id)
+            .order_by(BalanceSnapshot.bank_account_id.asc(), BalanceSnapshot.snapshot_at.desc())
+        ).scalars().all()
+        latest_balance_by_account: dict[int, BalanceSnapshot] = {}
+        for snapshot in balance_snapshots:
+            latest_balance_by_account.setdefault(snapshot.bank_account_id, snapshot)
+        available_cash = Decimal("0")
+        for account in bank_accounts:
+            latest = latest_balance_by_account.get(account.id)
+            if latest is None:
+                continue
+            available_cash += Decimal(latest.available_balance if latest.available_balance is not None else latest.balance)
+        open_purchase_commitments = sum(
+            (Decimal(item.total_amount) for item in purchases if item.status in {"draft", "requested", "approved", "ordered"}),
+            Decimal("0"),
+        )
+        cash_gap_total = max(Decimal("0"), open_purchase_commitments - available_cash)
+        chart_rows = list(chart_map.values())
+        max_chart_revenue = max((Decimal(item["revenue"]) for item in chart_rows), default=Decimal("0"))
+        max_chart_paid = max((Decimal(item["paid"]) for item in chart_rows), default=Decimal("0"))
+        max_chart_profit = max((Decimal(item["profit"]) for item in chart_rows), default=Decimal("0"))
+        active_chart_rows = [item for item in chart_rows if Decimal(item["revenue"]) > 0]
+        best_day = max(active_chart_rows, key=lambda item: (Decimal(item["revenue"]), Decimal(item["profit"])), default=None)
+        worst_day = min(active_chart_rows, key=lambda item: (Decimal(item["revenue"]), Decimal(item["profit"])), default=None)
+        average_check = Decimal("0") if len(shipment_rows) == 0 else (total_revenue / Decimal(len(shipment_rows))).quantize(Decimal("0.01"))
+        top_counterparties = sorted(
+            top_counterparty_map.values(),
+            key=lambda item: (Decimal(item["revenue"]), Decimal(item["quantity"])),
+            reverse=True,
+        )[:20]
+        customer_finance_rows = sorted(
+            (
+                row
+                for row in customer_finance_map.values()
+                if (not debt_only or Decimal(row["outstanding_total"]) > 0)
+                and (not overdue_only or Decimal(row["overdue_total"]) > 0)
+                and (not profitable_only or Decimal(row["shipment_profit"]) > 0)
+            ),
+            key=lambda item: (
+                Decimal(item["outstanding_total"]),
+                Decimal(item["shipment_revenue"]),
+                Decimal(item["invoices_total"]),
+            ),
+            reverse=True,
+        )[:30]
+        return {
+            "customers": customers,
+            "finance_customers": finance_customers,
+            "shipments": shipment_rows,
+            "top_counterparties": top_counterparties,
+            "customer_finance_rows": customer_finance_rows,
+            "products": products,
+            "warehouses": finance_warehouses,
+            "documents": documents,
+            "purchases": purchases,
+            "customer_map": customer_map,
+            "finance_data_health": {
+                "ads_customers_hidden": len(ads_customer_ids),
+                "seed_documents_hidden": hidden_seed_documents_count,
+                "erp_warehouses_count": len(finance_warehouses),
+                "erp_sync_ready": len(finance_warehouses) > 0,
+                "has_real_finance_data": bool(shipment_rows or billing_documents),
+            },
+            "top_products": top_products,
+            "plan_fact_rows": [
+                {
+                    "metric_code": key,
+                    "label": value["label"],
+                    "fact": value["fact"],
+                    "plan": value["plan"],
+                    "delta": (Decimal(value["fact"]) - Decimal(value["plan"])) if value["plan"] is not None else None,
+                }
+                for key, value in plan_fact_map.items()
+            ],
+            "daily_chart_rows": [
+                {
+                    **row,
+                    "revenue_height": 0 if max_chart_revenue <= 0 else int((Decimal(row["revenue"]) / max_chart_revenue) * Decimal("100")),
+                    "paid_height": 0 if max_chart_paid <= 0 else int((Decimal(row["paid"]) / max_chart_paid) * Decimal("100")),
+                    "profit_height": 0 if max_chart_profit <= 0 else int((Decimal(row["profit"]) / max_chart_profit) * Decimal("100")),
+                }
+                for row in chart_rows
+            ],
+            "period_analytics": [
+                {
+                    **row,
+                    "margin_percent": Decimal("0") if Decimal(row["revenue"]) <= 0 else ((Decimal(row["profit"]) / Decimal(row["revenue"])) * Decimal("100")).quantize(Decimal("0.1")),
+                }
+                for row in period_analytics_map.values()
+            ],
+            "metrics": {
+                "customers_count": len(customers),
+                "finance_customers_count": len(finance_customers),
+                "shipments_count": len(shipment_rows),
+                "revenue_total": total_revenue,
+                "quantity_total": total_quantity,
+                "cost_total": total_cost,
+                "gross_profit_total": total_profit,
+                "margin_percent": Decimal("0") if total_revenue <= 0 else ((total_profit / total_revenue) * Decimal("100")).quantize(Decimal("0.1")),
+                "invoiced_total": total_invoiced,
+                "paid_total": total_paid,
+                "outstanding_total": total_outstanding,
+                "overdue_total": total_overdue,
+                "available_cash": available_cash,
+                "open_purchase_commitments": open_purchase_commitments,
+                "cash_gap_total": cash_gap_total,
+                "average_check": average_check,
+                "documents_count": len(documents),
+                "billing_documents_count": len(billing_documents),
+                "purchases_count": len(purchases),
+            },
+            "highlights": {
+                "best_day": best_day,
+                "worst_day": worst_day,
+            },
+            "filters": {
+                "query": query or "",
+                "customer_id": customer_id,
+                "product_id": product_id,
+                "date_from": date_from.isoformat() if date_from else "",
+                "date_to": date_to.isoformat() if date_to else "",
+                "debt_only": debt_only,
+                "overdue_only": overdue_only,
+                "profitable_only": profitable_only,
+                "is_active": bool(query_text or customer_id is not None or product_id is not None or date_from or date_to or debt_only or overdue_only or profitable_only),
+            },
+        }
+
+    def _ads_workspace_data(
+        runtime: ResolvedRuntimeContext,
+        session: Session,
+        *,
+        period: str = "month",
+        date_from: date | None = None,
+        date_to: date | None = None,
+    ) -> dict[str, object]:
+        effective_from, effective_to = _inventory_period_dates(period, date_from, date_to)
+        campaigns = session.execute(
+            select(Campaign)
+            .where(Campaign.account_id == runtime.account.id)
+            .order_by(Campaign.status.asc(), Campaign.name.asc(), Campaign.id.asc())
+        ).scalars().all()
+        metrics_query = select(AdMetric).where(AdMetric.account_id == runtime.account.id)
+        if effective_from is not None:
+            metrics_query = metrics_query.where(AdMetric.metric_date >= effective_from)
+        if effective_to is not None:
+            metrics_query = metrics_query.where(AdMetric.metric_date <= effective_to)
+        metrics = session.execute(
+            metrics_query.order_by(AdMetric.metric_date.desc(), AdMetric.id.desc())
+        ).scalars().all()
+        campaign_map = {campaign.id: campaign for campaign in campaigns}
+        spend_total = sum((Decimal(item.spend) for item in metrics), Decimal("0"))
+        leads_total = sum(int(item.leads_count or 0) for item in metrics)
+        conversions_total = sum(int(item.conversions_count or 0) for item in metrics)
+        cpl_total = (spend_total / Decimal(leads_total)).quantize(Decimal("0.01")) if leads_total > 0 else None
+        deals = session.execute(
+            select(Deal).where(Deal.account_id == runtime.account.id, Deal.status.in_(("won", "closed")))
+        ).scalars().all()
+
+        def _deal_activity_day(item: Deal) -> date | None:
+            if item.closed_at is not None:
+                return item.closed_at.date()
+            if item.created_at is not None:
+                return item.created_at.date()
+            return None
+
+        acquired_customers_count = len(
+            [
+                item
+                for item in deals
+                if (activity_day := _deal_activity_day(item)) is not None
+                and (effective_from is None or activity_day >= effective_from)
+                and (effective_to is None or activity_day <= effective_to)
+            ]
+        )
+        cac_value = (spend_total / Decimal(acquired_customers_count)).quantize(Decimal("0.01")) if acquired_customers_count > 0 else None
+
+        campaign_rollups: dict[int, dict[str, object]] = {}
+        for metric in metrics:
+            row = campaign_rollups.setdefault(
+                metric.campaign_id,
+                {
+                    "campaign": campaign_map.get(metric.campaign_id),
+                    "spend": Decimal("0"),
+                    "leads_count": 0,
+                    "conversions_count": 0,
+                    "rows_count": 0,
+                    "last_metric_date": metric.metric_date,
+                },
+            )
+            row["spend"] = Decimal(row["spend"]) + Decimal(metric.spend)
+            row["leads_count"] = int(row["leads_count"]) + int(metric.leads_count or 0)
+            row["conversions_count"] = int(row["conversions_count"]) + int(metric.conversions_count or 0)
+            row["rows_count"] = int(row["rows_count"]) + 1
+            if metric.metric_date and metric.metric_date > row["last_metric_date"]:
+                row["last_metric_date"] = metric.metric_date
+
+        ads_campaign_rows: list[dict[str, object]] = []
+        for row in campaign_rollups.values():
+            spend = Decimal(row["spend"])
+            leads_count = int(row["leads_count"])
+            conversions_count = int(row["conversions_count"])
+            ads_campaign_rows.append(
+                {
+                    **row,
+                    "cpl": (spend / Decimal(leads_count)).quantize(Decimal("0.01")) if leads_count > 0 else None,
+                    "conversion_rate": ((Decimal(conversions_count) / Decimal(leads_count)) * Decimal("100")).quantize(Decimal("0.1")) if leads_count > 0 else None,
+                }
+            )
+        ads_campaign_rows.sort(
+            key=lambda item: (
+                Decimal(item["spend"]),
+                int(item["leads_count"]),
+                str(item["campaign"].name if item["campaign"] is not None else ""),
+            ),
+            reverse=True,
+        )
+        dashboard_period = period if period in {"today", "yesterday", "week", "month"} else "month"
+        dashboard = ExecutiveDashboardService(session).get_dashboard(runtime.context, dashboard_period)
+        advertising_widget = dashboard.get("widgets", {}).get("advertising", {}) if isinstance(dashboard, dict) else {}
+        active_campaigns_count = sum(1 for item in campaigns if str(item.status or "").strip().lower() == "active")
+        return {
+            "ads_filters": {
+                "period": period,
+                "date_from": effective_from.isoformat() if effective_from else "",
+                "date_to": effective_to.isoformat() if effective_to else "",
+            },
+            "ads_data_health": {
+                "has_campaigns": bool(campaigns),
+                "has_metrics": bool(metrics),
+                "period_label": f"{effective_from.isoformat() if effective_from else '—'} — {effective_to.isoformat() if effective_to else '—'}",
+            },
+            "ads_summary": {
+                "campaigns_count": len(campaigns),
+                "active_campaigns_count": active_campaigns_count,
+                "metrics_rows_count": len(metrics),
+                "spend_total": spend_total,
+                "leads_total": leads_total,
+                "conversions_total": conversions_total,
+                "cpl_total": cpl_total,
+                "acquired_customers_count": acquired_customers_count,
+                "cac_value": cac_value,
+            },
+            "ads_campaign_rows": ads_campaign_rows[:20],
+            "ads_recent_metrics": [
+                {
+                    "metric": item,
+                    "campaign": campaign_map.get(item.campaign_id),
+                    "cpl": (Decimal(item.spend) / Decimal(item.leads_count)).quantize(Decimal("0.01")) if int(item.leads_count or 0) > 0 else None,
+                }
+                for item in metrics[:50]
+            ],
+            "ads_campaign_deviations": advertising_widget.get("campaign_deviations", []) if isinstance(advertising_widget, dict) else [],
+        }
+
+    @app.get("/admin/{account_slug}/finance", response_class=HTMLResponse)
+    def admin_finance(
+        request: Request,
+        account_slug: str,
+        selected_date: str | None = Query(default=None),
+        period: str = Query(default="day"),
+        session: Session = Depends(get_db_session),
+    ) -> HTMLResponse:
+        user = _current_session_user(session, request)
+        if user is None:
+            request.session.clear()
+            return _login_redirect(f"/admin/{account_slug}/finance")
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=user.email)
+        request.session["admin_account_slug"] = runtime.account.slug
+        ensure_permission(runtime, "business.read")
+        _ensure_account_feature(runtime, "operations_workflows", "Finance")
+        requested_date = _parse_finance_date(selected_date)
+        focus_date = requested_date or _finance_latest_available_daily_date(runtime.account.slug) or datetime.now(timezone.utc).date()
+        normalized_period = (period or "day").strip().lower()
+        if normalized_period not in {"day", "week", "month"}:
+            normalized_period = "day"
+        finance_console = _finance_console_snapshot(
+            runtime.account.slug,
+            focus_date,
+            normalized_period,
+            session=session,
+            account_id=runtime.account.id,
+        )
+        bank_accounts = _finance_bank_accounts(session, runtime.account.id)
+        recent_bank = _finance_recent_bank_transactions(session, runtime.account.id)
+        return templates.TemplateResponse(
+            request,
+            "admin/finance.html",
+            {
+                **_admin_context(request, session, runtime, page="finance"),
+                "finance_console": finance_console,
+                "finance_bank_accounts": bank_accounts,
+                "finance_recent_bank": recent_bank,
+                "can_manage_finance": _is_manager_role(runtime.role_code) or "*" in runtime.permissions or "business.write" in runtime.permissions,
+                "finance_filters": {
+                    "selected_date": focus_date.isoformat(),
+                    "period": normalized_period,
+                    "today": datetime.now(timezone.utc).date().isoformat(),
+                    "yesterday": (datetime.now(timezone.utc).date() - timedelta(days=1)).isoformat(),
+                },
+            },
+        )
+
+    @app.post("/admin/{account_slug}/finance/expenses/save")
+    async def admin_save_finance_expense(
+        request: Request,
+        account_slug: str,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        payload = await request.json()
+        actor = _require_admin_user(request, session)
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor.email)
+        ensure_permission(runtime, "business.write")
+        _ensure_account_feature(runtime, "operations_workflows", "Finance")
+        body = payload.get("expense") or {}
+        category = str(body.get("category") or "").strip()
+        if not category:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Укажи категорию расхода.")
+        amount = _finance_parse_decimal_or_zero(body.get("amount"))
+        if amount <= 0:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Сумма расхода должна быть больше нуля.")
+        expense_date = _finance_parse_date_flexible(body.get("expense_date")) or datetime.now().astimezone().date()
+        city = str(body.get("city") or "").strip()
+        comment = str(body.get("comment") or "").strip()
+        now = datetime.now(timezone.utc)
+        path = _finance_preferred_file(runtime.account.slug, "inbox/finance_expense_log.csv")
+        _append_finance_csv_row(
+            path,
+            ["date", "amount", "category", "city", "comment", "source", "chat_id", "username", "created_at"],
+            {
+                "date": expense_date.strftime("%d.%m.%Y"),
+                "amount": _finance_format_decimal(amount),
+                "category": category,
+                "city": city,
+                "comment": comment,
+                "source": "document_bot_web",
+                "chat_id": "",
+                "username": actor.email,
+                "created_at": now.isoformat(),
+            },
+        )
+        expense = Expense(
+            account_id=runtime.account.id,
+            supplier_customer_id=None,
+            bank_account_id=None,
+            category=category,
+            status="posted",
+            expense_date=expense_date,
+            currency="RUB",
+            amount=amount,
+            reference_type="legacy.web_expense",
+            reference_id=None,
+            description=" | ".join(part for part in [city, comment] if part).strip() or None,
+        )
+        session.add(expense)
+        session.flush()
+        AuditLogService(session).log(
+            runtime.context,
+            "finance.expense.created",
+            "expense",
+            str(expense.id),
+            details={"amount": _finance_format_decimal(amount), "category": category, "csv_path": str(path)},
+        )
+        return JSONResponse(
+            {
+                "expense": {
+                    "id": expense.id,
+                    "amount": _finance_format_decimal(amount),
+                    "category": category,
+                    "date": expense_date.strftime("%d.%m.%Y"),
+                    "city": city,
+                    "comment": comment,
+                }
+            }
+        )
+
+    @app.post("/admin/{account_slug}/finance/income/save")
+    async def admin_save_finance_income(
+        request: Request,
+        account_slug: str,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        payload = await request.json()
+        actor = _require_admin_user(request, session)
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor.email)
+        ensure_permission(runtime, "business.write")
+        _ensure_account_feature(runtime, "operations_workflows", "Finance")
+        body = payload.get("income") or {}
+        bank_account_id = int(body.get("bank_account_id") or 0)
+        bank_account = session.get(BankAccount, bank_account_id)
+        if bank_account is None or bank_account.account_id != runtime.account.id:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Выбери счет для прихода.")
+        amount = _finance_parse_decimal_or_zero(body.get("amount"))
+        if amount <= 0:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Сумма прихода должна быть больше нуля.")
+        posted_date = _finance_parse_date_flexible(body.get("posted_date")) or datetime.now().astimezone().date()
+        counterparty_name = str(body.get("counterparty_name") or "").strip()
+        description = str(body.get("description") or "").strip()
+        posted_at = datetime.combine(posted_date, datetime.now().astimezone().timetz()).astimezone(timezone.utc)
+        provider_transaction_id = f"manual-web-{runtime.account.id}-{secrets.token_hex(6)}"
+        transaction = BankTransaction(
+            account_id=runtime.account.id,
+            bank_account_id=bank_account.id,
+            provider_transaction_id=provider_transaction_id,
+            direction="incoming",
+            posted_at=posted_at,
+            amount=amount,
+            currency="RUB",
+            description=description or None,
+            counterparty_name=counterparty_name or None,
+            balance_after=None,
+            payload_json={
+                "source": "document_bot_web",
+                "actor": actor.email,
+                "manual": True,
+            },
+        )
+        session.add(transaction)
+        session.flush()
+        AuditLogService(session).log(
+            runtime.context,
+            "finance.income.created",
+            "bank_transaction",
+            str(transaction.id),
+            details={
+                "amount": _finance_format_decimal(amount),
+                "bank_account_id": bank_account.id,
+                "counterparty_name": counterparty_name,
+            },
+        )
+        return JSONResponse(
+            {
+                "income": {
+                    "id": transaction.id,
+                    "amount": _finance_format_decimal(amount),
+                    "date": posted_date.strftime("%d.%m.%Y"),
+                    "bank_account": bank_account.name,
+                    "counterparty_name": counterparty_name,
+                    "description": description,
+                }
+            }
+        )
+
+    @app.get("/admin/{account_slug}/ads", response_class=HTMLResponse)
+    def admin_ads(
+        request: Request,
+        account_slug: str,
+        period: str = Query(default="month"),
+        date_from: str | None = Query(default=None),
+        date_to: str | None = Query(default=None),
+        session: Session = Depends(get_db_session),
+    ) -> HTMLResponse:
+        user = _current_session_user(session, request)
+        if user is None:
+            request.session.clear()
+            return _login_redirect(f"/admin/{account_slug}/ads")
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=user.email)
+        request.session["admin_account_slug"] = runtime.account.slug
+        ensure_permission(runtime, "business.read")
+        _ensure_account_feature(runtime, "operations_workflows", "Advertising")
+        workspace = _ads_workspace_data(
+            runtime,
+            session,
+            period=(period or "month").strip().lower(),
+            date_from=_parse_finance_date(date_from),
+            date_to=_parse_finance_date(date_to),
+        )
+        return templates.TemplateResponse(
+            request,
+            "admin/ads.html",
+            {
+                **_admin_context(request, session, runtime, page="ads"),
+                **workspace,
             },
         )
 
@@ -4979,6 +16075,7 @@ def create_app() -> FastAPI:
                 "document_previews": document_previews,
                 "account_settings": _account_product_config(runtime.account),
                 "notification_channel_options": _notification_channel_options(),
+                "telegram_target_options": _telegram_notification_targets(runtime.account, session),
                 "can_manage_business_os": _is_manager_role(runtime.role_code) or "*" in runtime.permissions or "business.write" in runtime.permissions,
             },
         )
@@ -5210,6 +16307,82 @@ def create_app() -> FastAPI:
             },
         )
 
+    @app.get("/admin/{account_slug}/ai-workspace", response_class=HTMLResponse)
+    def admin_ai_workspace(
+        request: Request,
+        account_slug: str,
+        session: Session = Depends(get_db_session),
+    ) -> HTMLResponse:
+        user = _current_session_user(session, request)
+        if user is None:
+            request.session.clear()
+            return _login_redirect(f"/admin/{account_slug}/ai-workspace")
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=user.email)
+        request.session["admin_account_slug"] = runtime.account.slug
+        ensure_permission(runtime, "dashboard.read")
+        active_memberships = [item for item in _membership_rows(runtime.account, session) if item.status == "active"]
+        account_settings = _account_product_config(runtime.account)
+        obsidian_settings = load_platform_settings()
+        return templates.TemplateResponse(
+            request,
+            "admin/ai_workspace.html",
+            {
+                **_admin_context(request, session, runtime, page="ai_workspace"),
+                "active_memberships": active_memberships,
+                "account_settings": account_settings,
+                "scenarios": _ai_workspace_scenarios(runtime, session),
+                "option_lists": _ai_workspace_option_lists(runtime, session),
+                "role_rows": _ai_workspace_role_rows(runtime, session),
+                "openai_enabled": bool(settings.openai_api_key),
+                "obsidian_enabled": True,
+                "obsidian_info": {
+                    "vault_root": obsidian_settings.obsidian_vault_path,
+                    "export_subdir": obsidian_settings.obsidian_export_subdir,
+                },
+                "telegram_bot_url": _telegram_bot_url(),
+            },
+        )
+
+    @app.post("/admin/{account_slug}/ai-workspace/intake-plan")
+    async def admin_ai_workspace_plan(
+        request: Request,
+        account_slug: str,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        actor = _require_admin_user(request, session)
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor.email)
+        request.session["admin_account_slug"] = runtime.account.slug
+        ensure_permission(runtime, "dashboard.read")
+        payload = await request.json()
+        plan = _ai_workspace_plan(
+            runtime,
+            str(payload.get("scenario_key") or "").strip(),
+            str(payload.get("note_text") or ""),
+            session,
+        )
+        return JSONResponse({"plan": plan})
+
+    @app.post("/admin/{account_slug}/ai-workspace/intake-create")
+    async def admin_ai_workspace_create(
+        request: Request,
+        account_slug: str,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        actor = _require_admin_user(request, session)
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor.email)
+        request.session["admin_account_slug"] = runtime.account.slug
+        payload = await request.json()
+        result = _ai_workspace_create_record(
+            runtime,
+            actor,
+            str(payload.get("scenario_key") or "").strip(),
+            dict(payload.get("values") or {}),
+            session,
+        )
+        return JSONResponse({"result": result})
+
     @app.post("/admin/{account_slug}/copilot/generate")
     async def admin_generate_copilot_report(
         request: Request,
@@ -5335,31 +16508,21 @@ def create_app() -> FastAPI:
         ensure_permission(runtime, "business.read")
         _ensure_account_feature(runtime, "operations_workflows", "Operations")
         operations_service = OperationsService(session)
-        products = operations_service.list_products(runtime.context)
-        warehouses = operations_service.list_warehouses(runtime.context)
+        people_service = PeopleService(session)
+        query_service = AdminQueryService(session)
+        all_warehouses = operations_service.list_warehouses(runtime.context)
         purchases = operations_service.list_purchases(runtime.context)
         documents = operations_service.list_documents(runtime.context)
         installation_requests = operations_service.list_installation_requests(runtime.context)
+        shipments = operations_service.list_shipments(runtime.context)
         stagnant_threshold = threshold_days
         stagnant_stock = operations_service.stagnant_stock(runtime.context, threshold_days=stagnant_threshold)
         reorder_suggestions = operations_service.reorder_suggestions(runtime.context)
-        recent_customers = session.execute(
-            select(Customer)
-            .where(Customer.account_id == runtime.account.id)
-            .order_by(Customer.updated_at.desc(), Customer.id.desc())
-            .limit(50)
-        ).scalars().all()
-        recent_deals = session.execute(
-            select(Deal)
-            .where(Deal.account_id == runtime.account.id)
-            .order_by(Deal.updated_at.desc(), Deal.id.desc())
-            .limit(50)
-        ).scalars().all()
-        active_employees = session.execute(
-            select(Employee)
-            .where(Employee.account_id == runtime.account.id, Employee.status == "active")
-            .order_by(Employee.full_name.asc(), Employee.id.asc())
-        ).scalars().all()
+        ops_summary = query_service.ops_summary(runtime.account.id)
+        employee_snapshots = people_service.employee_snapshots(runtime.context)
+        ads_customer_ids = _ads_customer_ids(session, runtime.account.id)
+        erp_warehouse_ids = _erp_warehouse_ids(session, runtime.account.id)
+        warehouses = [item for item in all_warehouses if item.id in erp_warehouse_ids]
         customer_ids = {
             item
             for item in (
@@ -5396,28 +16559,122 @@ def create_app() -> FastAPI:
                 select(Employee).where(Employee.account_id == runtime.account.id, Employee.id.in_(employee_ids))
             ).scalars().all()
         } if employee_ids else {}
+        pending_purchases = [item for item in purchases if item.status in {"draft", "requested", "approved", "ordered"}]
+        pending_installations = [item for item in installation_requests if item.status in {"open", "scheduled", "en_route", "on_site"}]
+        pending_documents = [item for item in documents if item.status in {"draft", "issued", "sent", "accepted"}]
+        warning_employees = [item for item in employee_snapshots if item.status in {"critical", "warning"}][:12]
+        integration_rows = ops_summary["integration_sync_status"]
+        unhealthy_integrations = [
+            row
+            for row in integration_rows
+            if row["latest_failure"] is not None
+            or (row["integration"].status == "active" and row["latest_success"] is None)
+        ]
         return templates.TemplateResponse(
             request,
             "admin/operations.html",
             {
                 **_admin_context(request, session, runtime, page="operations"),
-                "products": products,
                 "warehouses": warehouses,
-                "purchases": purchases,
-                "documents": documents,
-                "installation_requests": installation_requests,
+                "operations_data_health": {
+                    "ads_customers_hidden": len(ads_customer_ids),
+                    "erp_warehouses_count": len(warehouses),
+                    "erp_sync_ready": len(warehouses) > 0,
+                },
+                "ops_metrics": {
+                    "pending_purchases": len(pending_purchases),
+                    "pending_installations": len(pending_installations),
+                    "overdue_tasks": len(ops_summary["overdue_tasks"]),
+                    "critical_alerts": len(ops_summary["active_critical_alerts"]),
+                    "unhealthy_integrations": len(unhealthy_integrations),
+                    "documents_in_progress": len(pending_documents),
+                },
+                "pending_purchases": pending_purchases[:15],
+                "pending_installations": pending_installations[:15],
+                "pending_documents": pending_documents[:15],
+                "operations_overdue_tasks": ops_summary["overdue_tasks"],
+                "operations_alerts": ops_summary["active_critical_alerts"],
+                "operations_failed_sync_jobs": ops_summary["recent_failed_sync_jobs"],
+                "operations_failed_rule_runs": ops_summary["recent_failed_rule_runs"],
+                "operations_integrations": integration_rows,
+                "warning_employees": warning_employees,
                 "stagnant_stock": stagnant_stock,
                 "reorder_suggestions": reorder_suggestions,
                 "stagnant_threshold_days": stagnant_threshold,
-                "recent_customers": recent_customers,
-                "recent_deals": recent_deals,
-                "active_employees": active_employees,
                 "customer_lookup": customer_lookup,
                 "deal_lookup": deal_lookup,
                 "employee_lookup": employee_lookup,
-                "document_type_options": _document_type_options(),
-                "document_status_options": _document_status_options(),
-                "can_manage_operations": _is_manager_role(runtime.role_code) or "*" in runtime.permissions or "business.write" in runtime.permissions,
+            },
+        )
+
+    @app.get("/admin/{account_slug}/v2", response_class=HTMLResponse)
+    def admin_rebuild_home(
+        request: Request,
+        account_slug: str,
+        session: Session = Depends(get_db_session),
+    ) -> HTMLResponse:
+        user = _current_session_user(session, request)
+        if user is None:
+            request.session.clear()
+            return _login_redirect(f"/admin/{account_slug}/v2")
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=user.email)
+        request.session["admin_account_slug"] = runtime.account.slug
+        ensure_permission(runtime, "business.read")
+        module_cards = [
+            {
+                "key": "finance",
+                "title": "Финансы",
+                "status": "active",
+                "description": "Денежный контур. Только деньги: приход, расход, баланс, долги, банк и оплаты.",
+                "href": f"/admin/{runtime.account.slug}/finance",
+            },
+            {
+                "key": "inventory",
+                "title": "Склад",
+                "status": "active",
+                "description": "Полный складской контур. Закупка, приемка, отгрузка, пополнение, движение и инвентаризация.",
+                "href": f"/admin/{runtime.account.slug}/inventory",
+            },
+            {
+                "key": "documents",
+                "title": "Документы",
+                "status": "active",
+                "description": "КП, счета, договоры, акты, гарантия и история документов в отдельном домене.",
+                "href": f"/admin/{runtime.account.slug}/documents",
+            },
+            {
+                "key": "ads",
+                "title": "Реклама",
+                "status": "active",
+                "description": "Авито и рекламная аналитика: расходы, лиды, продажи, CPL, CAC, конверсия.",
+                "href": f"/admin/{runtime.account.slug}/ads",
+            },
+            {
+                "key": "sales",
+                "title": "Продажи",
+                "status": "next",
+                "description": "CRM-контур: лиды, клиенты, сделки и связь с деньгами, документами и рекламой.",
+                "href": f"/admin/{runtime.account.slug}/crm",
+            },
+            {
+                "key": "tasks",
+                "title": "Задачи и контроль",
+                "status": "next",
+                "description": "Постановка, дедлайны, проверка выполнения, просрочки и контроль узких мест.",
+                "href": f"/admin/{runtime.account.slug}/alerts-tasks",
+            },
+        ]
+        return templates.TemplateResponse(
+            request,
+            "admin/v2_home.html",
+            {
+                "runtime": runtime,
+                "csrf_token": _ensure_session_csrf_token(request),
+                "admin_asset_version": settings.app_version,
+                "accessible_accounts": _accessible_accounts(session, runtime.actor_user.email),
+                "v2_nav_items": _rebuild_nav_items(runtime.account.slug),
+                "module_cards": module_cards,
+                "legacy_href": f"/admin/{runtime.account.slug}/dashboard",
             },
         )
 
@@ -5488,6 +16745,39 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
         return JSONResponse({"product": _serialize_product(product)})
 
+    @app.post("/admin/{account_slug}/operations/customers/save")
+    async def admin_save_operations_customer(
+        request: Request,
+        account_slug: str,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        payload = await request.json()
+        actor_email = _require_admin_user(request, session).email
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
+        ensure_permission(runtime, "business.write")
+        _ensure_account_feature(runtime, "operations_workflows", "Operations")
+        body = payload.get("customer") or {}
+        try:
+            customer = OperationsService(session).create_customer(
+                runtime.context,
+                name=str(body.get("name") or "").strip(),
+                inn=str(body.get("inn") or "").strip() or None,
+                phone=str(body.get("phone") or "").strip() or None,
+                email=str(body.get("email") or "").strip() or None,
+                notes=str(body.get("notes") or "").strip() or None,
+            )
+            AuditLogService(session).log(
+                runtime.context,
+                "operations.customer.created",
+                "customer",
+                str(customer.id),
+                details={"name": customer.name, "inn": customer.inn},
+            )
+        except (PlatformCoreError, TenantContextError, ValueError, IntegrityError) as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        return JSONResponse({"customer": _serialize_customer(customer)})
+
     @app.post("/admin/{account_slug}/operations/purchases/save")
     async def admin_save_purchase(
         request: Request,
@@ -5521,6 +16811,112 @@ def create_app() -> FastAPI:
         except (PlatformCoreError, TenantContextError, ValueError, IntegrityError, ArithmeticError, KeyError) as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
         return JSONResponse({"purchase": _serialize_purchase(purchase)})
+
+    @app.post("/admin/{account_slug}/operations/shipments/save")
+    async def admin_save_shipment(
+        request: Request,
+        account_slug: str,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        payload = await request.json()
+        actor_email = _require_admin_user(request, session).email
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
+        ensure_permission(runtime, "business.write")
+        _ensure_account_feature(runtime, "operations_workflows", "Operations")
+        body = payload.get("shipment") or {}
+        try:
+            occurred_at = None
+            occurred_text = str(body.get("occurred_at") or "").strip()
+            if occurred_text:
+                occurred_at = datetime.fromisoformat(occurred_text)
+                if occurred_at.tzinfo is None:
+                    occurred_at = occurred_at.replace(tzinfo=timezone.utc)
+            shipment = OperationsService(session).create_shipment(
+                runtime.context,
+                warehouse_id=int(body["warehouse_id"]),
+                product_id=int(body["product_id"]),
+                customer_id=int(body["customer_id"]) if body.get("customer_id") else None,
+                quantity=Decimal(str(body.get("quantity") or "0")),
+                unit_price=Decimal(str(body.get("unit_price") or "0")),
+                occurred_at=occurred_at,
+                notes=str(body.get("notes") or "").strip() or None,
+            )
+            AuditLogService(session).log(
+                runtime.context,
+                "operations.shipment.created",
+                "stock_movement",
+                str(shipment.id),
+                details={"movement_type": shipment.movement_type, "reference_id": shipment.reference_id},
+            )
+        except (PlatformCoreError, TenantContextError, ValueError, IntegrityError, ArithmeticError) as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        return JSONResponse({"shipment": _serialize_stock_movement(shipment)})
+
+    @app.post("/admin/{account_slug}/finance/shipments/{shipment_id}/invoice")
+    async def admin_create_invoice_from_shipment(
+        request: Request,
+        account_slug: str,
+        shipment_id: int,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        actor = _require_admin_user(request, session)
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor.email)
+        _require_account_manager(runtime)
+        ensure_permission(runtime, "documents.manage")
+        _ensure_account_feature(runtime, "operations_workflows", "Finance")
+        shipment = session.execute(
+            select(StockMovement).where(
+                StockMovement.account_id == runtime.account.id,
+                StockMovement.id == shipment_id,
+                StockMovement.movement_type == "shipment_dispatch",
+            )
+        ).scalar_one_or_none()
+        if shipment is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Shipment not found.")
+        notes_json = shipment.notes_json or {}
+        customer_id_raw = notes_json.get("customer_id")
+        customer_id = int(customer_id_raw) if str(customer_id_raw or "").isdigit() else None
+        if customer_id is None:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Shipment has no linked customer.")
+        total_amount = Decimal(str(notes_json.get("total_amount") or "0"))
+        quantity = abs(Decimal(shipment.quantity_delta))
+        product = session.execute(
+            select(Product).where(Product.account_id == runtime.account.id, Product.id == shipment.product_id)
+        ).scalar_one_or_none()
+        summary = "Отгрузка"
+        if product is not None:
+            summary = f"Отгрузка {product.name}, {quantity} ед."
+        if notes_json.get("document_number"):
+            summary = f"{summary}. Основание: {notes_json['document_number']}"
+        document = BillingService(session).create_billing_document(
+            runtime.context,
+            document_type="invoice",
+            document_number=None,
+            customer_id=customer_id,
+            total_amount=total_amount,
+            issued_at=(shipment.occurred_at.date() if shipment.occurred_at else datetime.now(timezone.utc).date()),
+            due_date=(shipment.occurred_at.date() if shipment.occurred_at else datetime.now(timezone.utc).date()),
+            summary=summary,
+            template_code="shipment_invoice",
+        )
+        snapshot = dict(document.snapshot_json or {})
+        snapshot["source_shipment_id"] = shipment.id
+        snapshot["source_shipment_document_id"] = notes_json.get("document_id")
+        snapshot["source_shipment_document_number"] = notes_json.get("document_number")
+        snapshot["product_id"] = shipment.product_id
+        snapshot["quantity"] = str(quantity)
+        document.snapshot_json = snapshot
+        session.flush()
+        AuditLogService(session).log(
+            runtime.context,
+            "billing.document.created_from_shipment",
+            "document",
+            str(document.id),
+            details={"shipment_id": shipment.id, "customer_id": customer_id, "amount": str(document.total_amount)},
+        )
+        return JSONResponse({"document": _serialize_document(document)})
 
     @app.post("/admin/{account_slug}/operations/purchases/{purchase_id}/receive")
     async def admin_receive_purchase(
@@ -5957,6 +17353,50 @@ def create_app() -> FastAPI:
                 created_tasks += 1
         return JSONResponse({"batch": _serialize_communication_import_batch(batch), "reviews_count": len(reviews), "tasks_count": created_tasks})
 
+    @app.get("/webhooks/messaging/{integration_id}")
+    async def messaging_webhook_verify(
+        request: Request,
+        integration_id: int,
+        session: Session = Depends(get_db_session),
+    ) -> PlainTextResponse:
+        integration = session.execute(select(Integration).where(Integration.id == integration_id)).scalar_one_or_none()
+        if integration is None or integration.status != "active":
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Messaging integration not found.")
+        if integration.provider_kind != "messaging" or integration.provider_name != "whatsapp":
+            raise HTTPException(status_code=status.HTTP_405_METHOD_NOT_ALLOWED, detail="GET webhook verification is only available for WhatsApp.")
+        mode = str(request.query_params.get("hub.mode") or "").strip()
+        verify_token = str(request.query_params.get("hub.verify_token") or "").strip()
+        challenge = str(request.query_params.get("hub.challenge") or "").strip()
+        credentials = _load_integration_credentials(session, integration)
+        expected_token = str(credentials.get("verify_token") or "").strip()
+        if mode != "subscribe" or not challenge:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid webhook verification payload.")
+        if not expected_token or not secrets.compare_digest(verify_token, expected_token):
+            _log_integration_event(
+                session,
+                integration,
+                level="error",
+                event_type="webhook.verify_failed",
+                status_code="forbidden",
+                message="WhatsApp webhook verify token mismatch.",
+                payload={"mode": mode},
+                request_id=request.headers.get("x-request-id"),
+            )
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Webhook verify token mismatch.")
+        integration.webhook_url = str(request.url.replace(query=""))
+        integration.last_webhook_at = datetime.now(timezone.utc)
+        _log_integration_event(
+            session,
+            integration,
+            level="info",
+            event_type="webhook.verified",
+            status_code="ok",
+            message="WhatsApp webhook verification completed.",
+            payload={"mode": mode},
+            request_id=request.headers.get("x-request-id"),
+        )
+        return PlainTextResponse(challenge)
+
     @app.post("/webhooks/messaging/{integration_id}")
     async def messaging_webhook_ingest(
         request: Request,
@@ -5973,9 +17413,38 @@ def create_app() -> FastAPI:
         if adapter is None:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Messaging provider adapter is not available.")
         body = await request.body()
+        credentials = _load_integration_credentials(session, integration)
+        allowed, auth_message, auth_payload = _verify_messaging_webhook(
+            integration=integration,
+            credentials=credentials,
+            headers=dict(request.headers),
+            body=body,
+        )
+        if not allowed:
+            _log_integration_event(
+                session,
+                integration,
+                level="error",
+                event_type="webhook.auth_failed",
+                status_code="forbidden",
+                message=auth_message,
+                payload=auth_payload,
+                request_id=request.headers.get("x-request-id"),
+            )
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=auth_message)
         try:
             records = adapter.receive_webhook(dict(request.headers), body)  # type: ignore[attr-defined]
         except Exception as exc:
+            _log_integration_event(
+                session,
+                integration,
+                level="error",
+                event_type="webhook.parse_failed",
+                status_code="bad_request",
+                message=f"Webhook parsing failed: {exc}",
+                payload=auth_payload,
+                request_id=request.headers.get("x-request-id"),
+            )
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Webhook parsing failed: {exc}") from exc
         context = TenantContext(
             account_id=integration.account_id,
@@ -6014,6 +17483,21 @@ def create_app() -> FastAPI:
                     due_at=None,
                 )
                 created_tasks += 1
+        _log_integration_event(
+            session,
+            integration,
+            level="info",
+            event_type="webhook.ingested",
+            status_code="ok",
+            message=f"Ingested {len(records)} inbound messages from webhook.",
+            payload={
+                **auth_payload,
+                "records_count": len(records),
+                "reviews_count": len(reviews),
+                "tasks_count": created_tasks,
+            },
+            request_id=request.headers.get("x-request-id"),
+        )
         AuditLogService(session).log(
             context,
             "communications.webhook.ingested",
@@ -6465,15 +17949,18 @@ def create_app() -> FastAPI:
         _ensure_account_feature(runtime, "integrations_setup", "Integrations setup")
         service = RuntimeIntegrationService(session)
         idempotency_key = f"admin-ui-sync:{integration_id}:{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')}"
-        job, _ = service.enqueue_sync_job(
-            runtime.context,
-            integration_id=integration_id,
-            job_type="full_sync",
-            trigger_mode="manual",
-            idempotency_key=idempotency_key,
-            scope_json={"source": "admin-ui"},
-        )
-        execution = service.execute_job(job.id, owner=settings.worker_id, ttl_seconds=settings.runtime_lease_ttl_seconds)
+        try:
+            job, _ = service.enqueue_sync_job(
+                runtime.context,
+                integration_id=integration_id,
+                job_type="full_sync",
+                trigger_mode="manual",
+                idempotency_key=idempotency_key,
+                scope_json={"source": "admin-ui"},
+            )
+            execution = service.execute_job(job.id, owner=settings.worker_id, ttl_seconds=settings.runtime_lease_ttl_seconds)
+        except (PlatformCoreError, TenantContextError) as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
         session.flush()
         return JSONResponse(
             {
@@ -6481,6 +17968,61 @@ def create_app() -> FastAPI:
                 "execution": _serialize_job_execution(execution),
             }
         )
+
+    @app.post("/admin/{account_slug}/sync-all")
+    async def admin_sync_all_integrations(
+        request: Request,
+        account_slug: str,
+        session: Session = Depends(get_db_session),
+    ) -> JSONResponse:
+        await _require_csrf(request)
+        actor_email = _require_admin_user(request, session).email
+        runtime = resolve_admin_runtime(request, session, account_slug=account_slug, actor_email=actor_email)
+        ensure_permission(runtime, "integrations.manage")
+        _ensure_account_feature(runtime, "integrations_setup", "Integrations setup")
+        service = RuntimeIntegrationService(session)
+        integrations = [
+            item
+            for item in service.list_integrations(runtime.context)
+            if item.status == "active" and service.supports_sync(item.provider_kind, item.provider_name)
+        ]
+        if not integrations:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Нет активных интеграций для синхронизации.")
+        results: list[dict[str, object]] = []
+        failures = 0
+        for integration in integrations:
+            try:
+                idempotency_key = f"admin-sync-all:{runtime.account.slug}:{integration.id}:{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')}"
+                job, created = service.enqueue_sync_job(
+                    runtime.context,
+                    integration_id=integration.id,
+                    job_type="full_sync",
+                    trigger_mode="manual",
+                    idempotency_key=idempotency_key,
+                    scope_json={"source": "admin-sync-all"},
+                )
+                execution = service.execute_job(job.id, owner=settings.worker_id, ttl_seconds=settings.runtime_lease_ttl_seconds)
+                results.append(
+                    {
+                        "integration_id": integration.id,
+                        "integration_ref": integration.external_ref or integration.display_name,
+                        "created": created,
+                        "job": _serialize_sync_job(job),
+                        "execution": _serialize_job_execution(execution),
+                    }
+                )
+            except (PlatformCoreError, TenantContextError) as exc:
+                failures += 1
+                results.append(
+                    {
+                        "integration_id": integration.id,
+                        "integration_ref": integration.external_ref or integration.display_name,
+                        "created": False,
+                        "error": str(exc),
+                    }
+                )
+        session.flush()
+        return JSONResponse({"account_slug": runtime.account.slug, "count": len(results), "failed_count": failures, "results": results})
 
     @app.post("/admin/portfolio/accounts/{account_slug}/sync")
     async def admin_portfolio_sync_account(
@@ -6495,32 +18037,39 @@ def create_app() -> FastAPI:
         integration_id = payload.get("integration_id")
         execute_now = bool(payload.get("execute_now", True))
         service = RuntimeIntegrationService(session)
-        integrations = [item for item in service.list_integrations(runtime.context) if item.status == "active"]
+        integrations = [
+            item
+            for item in service.list_integrations(runtime.context)
+            if item.status == "active" and service.supports_sync(item.provider_kind, item.provider_name)
+        ]
         if integration_id is not None:
             integrations = [item for item in integrations if item.id == int(integration_id)]
         if not integrations:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No active integrations available for sync.")
         results: list[dict[str, object]] = []
-        for integration in integrations:
-            idempotency_key = f"portfolio-sync:{runtime.account.slug}:{integration.id}:{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')}"
-            job, created = service.enqueue_sync_job(
-                runtime.context,
-                integration_id=integration.id,
-                job_type="full_sync",
-                trigger_mode="manual",
-                idempotency_key=idempotency_key,
-                scope_json={"source": "portfolio"},
-            )
-            execution = service.execute_job(job.id, owner=settings.worker_id, ttl_seconds=settings.runtime_lease_ttl_seconds) if execute_now else None
-            results.append(
-                {
-                    "integration_id": integration.id,
-                    "integration_ref": integration.external_ref or integration.display_name,
-                    "created": created,
-                    "job": _serialize_sync_job(job),
-                    "execution": _serialize_job_execution(execution) if execution is not None else None,
-                }
-            )
+        try:
+            for integration in integrations:
+                idempotency_key = f"portfolio-sync:{runtime.account.slug}:{integration.id}:{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')}"
+                job, created = service.enqueue_sync_job(
+                    runtime.context,
+                    integration_id=integration.id,
+                    job_type="full_sync",
+                    trigger_mode="manual",
+                    idempotency_key=idempotency_key,
+                    scope_json={"source": "portfolio"},
+                )
+                execution = service.execute_job(job.id, owner=settings.worker_id, ttl_seconds=settings.runtime_lease_ttl_seconds) if execute_now else None
+                results.append(
+                    {
+                        "integration_id": integration.id,
+                        "integration_ref": integration.external_ref or integration.display_name,
+                        "created": created,
+                        "job": _serialize_sync_job(job),
+                        "execution": _serialize_job_execution(execution) if execution is not None else None,
+                    }
+                )
+        except (TenantContextError, PlatformCoreError) as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
         return JSONResponse({"account_slug": runtime.account.slug, "count": len(results), "results": results})
 
     @app.post("/admin/portfolio/accounts/{account_slug}/alerts/{alert_id}/status")
@@ -7150,6 +18699,23 @@ def _serialize_product(product: Product) -> dict[str, object]:
     }
 
 
+def _serialize_customer(customer: Customer) -> dict[str, object]:
+    return {
+        "id": customer.id,
+        "account_id": customer.account_id,
+        "external_id": customer.external_id,
+        "name": customer.name,
+        "customer_type": customer.customer_type,
+        "status": customer.status,
+        "inn": customer.inn,
+        "phone": customer.phone,
+        "email": customer.email,
+        "notes_json": customer.notes_json or {},
+        "created_at": _serialize_datetime(customer.created_at),
+        "updated_at": _serialize_datetime(customer.updated_at),
+    }
+
+
 def _serialize_purchase(purchase: Purchase) -> dict[str, object]:
     return {
         "id": purchase.id,
@@ -7201,6 +18767,23 @@ def _serialize_document_settlement(settlement: DocumentSettlement) -> dict[str, 
         "notes_json": settlement.notes_json or {},
         "created_at": _serialize_datetime(settlement.created_at),
         "updated_at": _serialize_datetime(settlement.updated_at),
+    }
+
+
+def _serialize_stock_movement(movement: StockMovement) -> dict[str, object]:
+    return {
+        "id": movement.id,
+        "account_id": movement.account_id,
+        "warehouse_id": movement.warehouse_id,
+        "product_id": movement.product_id,
+        "purchase_id": movement.purchase_id,
+        "movement_type": movement.movement_type,
+        "reference_type": movement.reference_type,
+        "reference_id": movement.reference_id,
+        "quantity_delta": str(movement.quantity_delta),
+        "unit_cost": str(movement.unit_cost),
+        "occurred_at": _serialize_datetime(movement.occurred_at),
+        "notes_json": movement.notes_json or {},
     }
 
 
@@ -7374,6 +18957,8 @@ def _serialize_integration(integration) -> dict[str, object]:
         "sync_mode": integration.sync_mode,
         "connection_mode": integration.connection_mode,
         "last_sync_at": _serialize_datetime(integration.last_sync_at),
+        "last_webhook_at": _serialize_datetime(integration.last_webhook_at),
+        "webhook_url": integration.webhook_url,
         "settings": integration.settings_json,
     }
 

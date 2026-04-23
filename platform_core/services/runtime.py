@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timezone, timedelta
+import logging
+from time import perf_counter
 from typing import Any
 
 from sqlalchemy import select
@@ -34,12 +36,17 @@ from platform_core.providers.adapters import (
     WhatsAppMessagingProviderAdapter,
 )
 from platform_core.providers.contracts import AdsLeadRecord, ProviderRegistry, SyncCursor
+from platform_core.telegram_accounts import TelegramClientUnavailableError, TelegramQrLoginError, describe_session_sync
 from platform_core.services.audit import AuditLogService
 from platform_core.services.authz import AuthorizationService
 from platform_core.services.automation import RuleEngineService
 from platform_core.services.credentials import CredentialCrypto
 from platform_core.services.provider_sync import AdsSyncService, BankSyncService, ERPSyncService
+from platform_core.settings import load_platform_settings
 from platform_core.tenancy import TenantContext, require_account_id
+
+
+logger = logging.getLogger(__name__)
 
 
 def build_provider_registry() -> ProviderRegistry:
@@ -260,6 +267,10 @@ class RuntimeIntegrationService:
             select(Integration).where(Integration.account_id == context.account_id).order_by(Integration.id.asc())
         ).scalars().all()
 
+    def supports_sync(self, provider_kind: str, provider_name: str) -> bool:
+        del provider_name
+        return provider_kind in {"banking", "ads", "erp"}
+
     def create_integration(
         self,
         context: TenantContext,
@@ -458,6 +469,48 @@ class RuntimeIntegrationService:
                     "provider": integration.provider_name,
                     "details": {"products_sampled": len(products)},
                 }
+            if integration.provider_kind == "messaging":
+                if integration.provider_name == "telegram":
+                    settings = load_platform_settings()
+                    session_string = str(credentials.get("session_string") or "").strip()
+                    if not settings.telegram_api_id or not settings.telegram_api_hash:
+                        raise ValueError("PLATFORM_TELEGRAM_API_ID and PLATFORM_TELEGRAM_API_HASH are required.")
+                    if not session_string:
+                        raise ValueError("Telegram account is not connected yet. Scan the QR code first.")
+                    identity = describe_session_sync(
+                        api_id=settings.telegram_api_id,
+                        api_hash=settings.telegram_api_hash,
+                        session_string=session_string,
+                    )
+                    return {
+                        "connected": True,
+                        "provider": integration.provider_name,
+                        "details": {
+                            "mode": "user_session",
+                            "send_path": "saved_messages",
+                            "telegram_user_id": identity.user_id,
+                            "telegram_username": identity.username,
+                            "telegram_display_name": identity.display_name,
+                            "telegram_phone": identity.phone,
+                        },
+                    }
+                if integration.provider_name == "whatsapp":
+                    api_token = str(credentials.get("api_token") or "").strip()
+                    phone_number_id = str(credentials.get("phone_number_id") or "").strip()
+                    if not api_token or not phone_number_id:
+                        raise ValueError("WhatsApp credentials require api_token and phone_number_id.")
+                    return {
+                        "connected": True,
+                        "provider": integration.provider_name,
+                        "details": {"mode": "webhook_only", "send_path": "graph_api"},
+                    }
+                return {
+                    "connected": True,
+                    "provider": integration.provider_name,
+                    "details": {"mode": "webhook_only"},
+                }
+            if integration.provider_kind == "spreadsheet":
+                raise NotImplementedError("Spreadsheet connection test is not implemented yet.")
         except Exception as exc:
             return {
                 "connected": False,
@@ -477,13 +530,24 @@ class RuntimeIntegrationService:
             .order_by(SyncJob.id.desc())
             .limit(10)
         ).scalars().all()
+        latest_logs = self.session.execute(
+            select(IntegrationLog)
+            .where(IntegrationLog.account_id == context.account_id, IntegrationLog.integration_id == integration.id)
+            .order_by(IntegrationLog.id.desc())
+            .limit(10)
+        ).scalars().all()
         return {
             "integration": integration,
             "masked_credentials": masked_credentials,
             "credential_version": credential.version if credential is not None else None,
             "credential_last_rotated_at": credential.last_rotated_at if credential is not None else None,
             "latest_jobs": latest_jobs,
+            "latest_logs": latest_logs,
         }
+
+    def credentials_payload(self, context: TenantContext, *, integration_id: int) -> dict[str, object]:
+        integration = self._get_integration(context.account_id, integration_id)
+        return self._load_credentials(integration)
 
     def enqueue_sync_job(
         self,
@@ -497,6 +561,12 @@ class RuntimeIntegrationService:
         scheduled_at: datetime | None = None,
     ) -> tuple[SyncJob, bool]:
         integration = self._get_integration(context.account_id, integration_id)
+        if not self.supports_sync(integration.provider_kind, integration.provider_name):
+            if integration.provider_kind == "messaging":
+                raise PlatformCoreError("Messaging integrations are webhook-driven and do not support manual sync jobs.")
+            raise PlatformCoreError(
+                f"Manual sync jobs are not supported for provider {integration.provider_kind}:{integration.provider_name}."
+            )
         existing = self.session.execute(
             select(SyncJob).where(SyncJob.account_id == context.account_id, SyncJob.idempotency_key == idempotency_key)
         ).scalar_one_or_none()
@@ -515,6 +585,21 @@ class RuntimeIntegrationService:
             scheduled_at=scheduled_at or datetime.now(timezone.utc),
             scope_json=scope_json or {},
         )
+        if integration.provider_kind == "erp" and job.job_type == "full_sync":
+            previous_cursors = self.session.execute(
+                select(SyncJob.cursor_json)
+                .where(
+                    SyncJob.account_id == context.account_id,
+                    SyncJob.integration_id == integration.id,
+                    SyncJob.cursor_json.is_not(None),
+                )
+                .order_by(SyncJob.id.desc())
+                .limit(10)
+            ).scalars().all()
+            for previous_cursor in previous_cursors:
+                if isinstance(previous_cursor, dict) and previous_cursor:
+                    job.cursor_json = previous_cursor
+                    break
         self.session.add(job)
         self.session.flush()
         self._log(
@@ -552,11 +637,16 @@ class RuntimeIntegrationService:
     def claim_due_jobs(self, *, owner: str, ttl_seconds: int, limit: int = 10) -> list[SyncJob]:
         now = datetime.now(timezone.utc)
         pending_jobs = self.session.execute(
-            select(SyncJob).where(
+            select(SyncJob)
+            .join(Integration, Integration.id == SyncJob.integration_id)
+            .where(
                 SyncJob.status.in_(("pending", "retry")),
                 SyncJob.scheduled_at <= now,
                 SyncJob.attempts_count < SyncJob.max_attempts,
-            ).order_by(SyncJob.scheduled_at.asc(), SyncJob.id.asc()).limit(limit)
+                Integration.status == "active",
+            )
+            .order_by(SyncJob.scheduled_at.asc(), SyncJob.id.asc())
+            .limit(limit)
         ).scalars().all()
         lease_service = RuntimeLeaseService(self.session)
         claimed: list[SyncJob] = []
@@ -584,22 +674,96 @@ class RuntimeIntegrationService:
         return claimed
 
     def execute_job(self, job_id: int, *, owner: str, ttl_seconds: int) -> JobExecutionResult:
-        job = self.session.execute(select(SyncJob).where(SyncJob.id == job_id)).scalar_one()
         lease_service = RuntimeLeaseService(self.session)
-        lease_key = f"sync_job:{job.id}"
-        acquired = lease_service.acquire(
-            account_id=job.account_id,
-            lease_key=lease_key,
-            owner=owner,
-            ttl_seconds=ttl_seconds,
-            metadata={"job_id": job.id},
-        )
-        if not acquired:
-            return JobExecutionResult(job_id=job.id, status=job.status, lease_acquired=False, message="Lease not acquired.")
-
-        integration = self.session.execute(select(Integration).where(Integration.id == job.integration_id)).scalar_one()
-        context = TenantContext(account_id=job.account_id, actor_user_id=None, source="worker", is_system=True)
+        job_account_id: int | None = None
+        integration_id: int | None = None
+        lease_key: str | None = None
+        acquired = False
+        attempt_after_start = 0
         try:
+            job = self.session.execute(select(SyncJob).where(SyncJob.id == job_id)).scalar_one_or_none()
+            if job is None:
+                logger.error(
+                    "runtime_sync_job_result tenant_id=%s integration_id=%s provider=%s sync_job_id=%s stage=%s result=%s error_code=%s error_message=%s",
+                    "unknown",
+                    "unknown",
+                    "unknown",
+                    job_id,
+                    "load_job",
+                    "failed",
+                    "SyncJobNotFound",
+                    "Sync job row was not found.",
+                )
+                return JobExecutionResult(
+                    job_id=job_id,
+                    status="failed",
+                    lease_acquired=False,
+                    message="Sync job row was not found.",
+                )
+
+            job_account_id = job.account_id
+            integration_id = job.integration_id
+            attempt_after_start = job.attempts_count
+            lease_key = f"sync_job:{job.id}"
+            acquired = lease_service.acquire(
+                account_id=job_account_id,
+                lease_key=lease_key,
+                owner=owner,
+                ttl_seconds=ttl_seconds,
+                metadata={"job_id": job.id},
+            )
+            if not acquired:
+                logger.info(
+                    "runtime_sync_job_result tenant_id=%s integration_id=%s provider=%s sync_job_id=%s stage=%s result=%s error_code=%s error_message=%s",
+                    job.account_id,
+                    job.integration_id,
+                    f"{job.provider_kind}:{job.provider_name}",
+                    job.id,
+                    "acquire_lease",
+                    "skipped",
+                    "",
+                    "Lease not acquired.",
+                )
+                return JobExecutionResult(job_id=job.id, status=job.status, lease_acquired=False, message="Lease not acquired.")
+
+            integration = self.session.execute(select(Integration).where(Integration.id == job.integration_id)).scalar_one_or_none()
+            context = TenantContext(account_id=job.account_id, actor_user_id=None, source="worker", is_system=True)
+            if integration is None:
+                job.status = "failed"
+                job.finished_at = datetime.now(timezone.utc)
+                job.locked_by = owner
+                job.error_code = "IntegrationNotFound"
+                job.error_message = "Integration row was not found for sync job."
+                logger.error(
+                    "runtime_sync_job_result tenant_id=%s integration_id=%s provider=%s sync_job_id=%s stage=%s result=%s error_code=%s error_message=%s",
+                    job.account_id,
+                    job.integration_id,
+                    f"{job.provider_kind}:{job.provider_name}",
+                    job.id,
+                    "load_integration",
+                    "failed",
+                    job.error_code,
+                    job.error_message,
+                )
+                self.session.flush()
+                return JobExecutionResult(
+                    job_id=job.id,
+                    status="failed",
+                    lease_acquired=True,
+                    message=job.error_message,
+                )
+
+            logger.info(
+                "runtime_sync_job_result tenant_id=%s integration_id=%s provider=%s sync_job_id=%s stage=%s result=%s error_code=%s error_message=%s",
+                context.account_id,
+                integration.id,
+                f"{integration.provider_kind}:{integration.provider_name}",
+                job.id,
+                "load_integration",
+                "ok",
+                "",
+                "",
+            )
             if job.status not in {"running", "pending", "retry"}:
                 return JobExecutionResult(job_id=job.id, status=job.status, lease_acquired=True, message="Job already terminal.")
 
@@ -609,6 +773,7 @@ class RuntimeIntegrationService:
             job.started_at = job.started_at or datetime.now(timezone.utc)
             if job.attempts_count <= 0 or previous_status in {"pending", "retry"}:
                 job.attempts_count += 1
+            attempt_after_start = job.attempts_count
             self._log(
                 context.account_id,
                 integration.id,
@@ -621,6 +786,17 @@ class RuntimeIntegrationService:
                 request_id=context.request_id,
                 provider_kind=integration.provider_kind,
                 provider_name=integration.provider_name,
+            )
+            logger.info(
+                "runtime_sync_job_result tenant_id=%s integration_id=%s provider=%s sync_job_id=%s stage=%s result=%s error_code=%s error_message=%s",
+                context.account_id,
+                integration.id,
+                f"{integration.provider_kind}:{integration.provider_name}",
+                job.id,
+                "provider_sync",
+                "running",
+                "",
+                "",
             )
 
             result_payload = self._run_provider(integration, job)
@@ -641,32 +817,89 @@ class RuntimeIntegrationService:
                 provider_kind=integration.provider_kind,
                 provider_name=integration.provider_name,
             )
+            logger.info(
+                "runtime_sync_job_result tenant_id=%s integration_id=%s provider=%s sync_job_id=%s stage=%s result=%s error_code=%s error_message=%s",
+                context.account_id,
+                integration.id,
+                f"{integration.provider_kind}:{integration.provider_name}",
+                job.id,
+                "provider_sync",
+                "completed",
+                "",
+                "",
+            )
             self.session.flush()
             return JobExecutionResult(job_id=job.id, status="completed", lease_acquired=True, message="Job completed.")
         except Exception as exc:
+            self.session.rollback()
+            job = self.session.execute(select(SyncJob).where(SyncJob.id == job_id)).scalar_one_or_none()
+            integration = (
+                self.session.execute(select(Integration).where(Integration.id == integration_id)).scalar_one_or_none()
+                if integration_id is not None
+                else None
+            )
+            if job is None:
+                logger.error(
+                    "runtime_sync_job_result tenant_id=%s integration_id=%s provider=%s sync_job_id=%s stage=%s result=%s error_code=%s error_message=%s",
+                    job_account_id if job_account_id is not None else "unknown",
+                    integration_id if integration_id is not None else "unknown",
+                    (
+                        f"{integration.provider_kind}:{integration.provider_name}"
+                        if integration is not None
+                        else "unknown"
+                    ),
+                    job_id,
+                    "exception_recovery",
+                    "failed",
+                    exc.__class__.__name__,
+                    str(exc),
+                )
+                return JobExecutionResult(job_id=job_id, status="failed", lease_acquired=acquired, message=str(exc))
+            job.attempts_count = max(job.attempts_count, attempt_after_start)
             job.status = "retry" if job.attempts_count < job.max_attempts else "failed"
             job.finished_at = datetime.now(timezone.utc)
+            job.locked_by = owner
             if job.status == "retry":
                 job.scheduled_at = datetime.now(timezone.utc) + timedelta(seconds=min(300, 15 * max(1, job.attempts_count)))
             job.error_code = exc.__class__.__name__
             job.error_message = str(exc)
-            self._log(
-                context.account_id,
-                integration.id,
+            provider_value = (
+                f"{integration.provider_kind}:{integration.provider_name}"
+                if integration is not None
+                else f"{job.provider_kind}:{job.provider_name}"
+            )
+            tenant_value = job.account_id
+            if integration is not None:
+                failure_context = TenantContext(account_id=job.account_id, actor_user_id=None, source="worker", is_system=True)
+                self._log(
+                    failure_context.account_id,
+                    integration.id,
+                    job.id,
+                    level="error",
+                    event_type="sync.failed",
+                    status=job.status,
+                    message=f"Sync job {job.id} failed: {exc}",
+                    payload_json={"error": str(exc), "job_type": job.job_type},
+                    request_id=failure_context.request_id,
+                    provider_kind=integration.provider_kind,
+                    provider_name=integration.provider_name,
+                )
+            logger.error(
+                "runtime_sync_job_result tenant_id=%s integration_id=%s provider=%s sync_job_id=%s stage=%s result=%s error_code=%s error_message=%s",
+                tenant_value,
+                job.integration_id,
+                provider_value,
                 job.id,
-                level="error",
-                event_type="sync.failed",
-                status=job.status,
-                message=f"Sync job {job.id} failed: {exc}",
-                payload_json={"error": str(exc), "job_type": job.job_type},
-                request_id=context.request_id,
-                provider_kind=integration.provider_kind,
-                provider_name=integration.provider_name,
+                "provider_sync",
+                job.status,
+                job.error_code,
+                job.error_message,
             )
             self.session.flush()
             return JobExecutionResult(job_id=job.id, status=job.status, lease_acquired=True, message=str(exc))
         finally:
-            lease_service.release(account_id=job.account_id, lease_key=lease_key, owner=owner)
+            if acquired and job_account_id is not None and lease_key is not None:
+                lease_service.release(account_id=job_account_id, lease_key=lease_key, owner=owner)
 
     def _run_provider(self, integration: Integration, job: SyncJob) -> dict[str, object]:
         settings = integration.settings_json or {}
@@ -826,14 +1059,122 @@ class RuntimeIntegrationService:
             }
         if integration.provider_kind == "erp":
             erp_service = ERPSyncService(self.session)
-            product_records, product_cursor = adapter.fetch_products(provider_input)  # type: ignore[arg-type]
-            product_stats = erp_service.sync_products(integration, product_records)
-            stock_records, stock_cursor = adapter.fetch_stock(provider_input)  # type: ignore[arg-type]
-            stock_stats = erp_service.sync_stock(integration, stock_records)
-            movement_records, movement_cursor = adapter.fetch_movements(provider_input)  # type: ignore[arg-type]
-            movement_stats = erp_service.sync_movements(integration, movement_records)
-            purchase_records, purchase_cursor = adapter.fetch_purchases(provider_input)  # type: ignore[arg-type]
-            purchase_stats = erp_service.sync_purchases(integration, purchase_records)
+            provider_value = f"{integration.provider_kind}:{integration.provider_name}"
+            movement_cursor_state = (job.cursor_json or {}).get("movements")
+            movement_cursor = SyncCursor(value=dict(movement_cursor_state)) if isinstance(movement_cursor_state, dict) else None
+
+            def _erp_stage_log(
+                stage: str,
+                *,
+                result: str,
+                duration_ms: int | None = None,
+                records_count: int | None = None,
+                error_code: str | None = None,
+                error_message: str | None = None,
+            ) -> None:
+                logger.info(
+                    "runtime_erp_sync_stage tenant_id=%s integration_id=%s provider=%s sync_job_id=%s stage=%s result=%s duration_ms=%s records_count=%s error_code=%s error_message=%s",
+                    integration.account_id,
+                    integration.id,
+                    provider_value,
+                    job.id,
+                    stage,
+                    result,
+                    duration_ms if duration_ms is not None else "",
+                    records_count if records_count is not None else "",
+                    error_code or "",
+                    error_message or "",
+                )
+
+            def _run_erp_stage(stage_name: str, operation):
+                started = perf_counter()
+                _erp_stage_log(stage_name, result="start")
+                try:
+                    result = operation()
+                except Exception as exc:
+                    _erp_stage_log(
+                        stage_name,
+                        result="failed",
+                        duration_ms=int((perf_counter() - started) * 1000),
+                        error_code=exc.__class__.__name__,
+                        error_message=str(exc),
+                    )
+                    raise
+                records_count = None
+                if isinstance(result, tuple) and result:
+                    first = result[0]
+                    if isinstance(first, list):
+                        records_count = len(first)
+                elif hasattr(result, "as_dict"):
+                    stats_payload = result.as_dict()
+                    records_count = int(stats_payload.get("created", 0)) + int(stats_payload.get("updated", 0)) + int(stats_payload.get("skipped", 0))
+                _erp_stage_log(
+                    stage_name,
+                    result="done",
+                    duration_ms=int((perf_counter() - started) * 1000),
+                    records_count=records_count,
+                )
+                return result
+
+            product_records, product_cursor = _run_erp_stage(
+                "fetch_products",
+                lambda: adapter.fetch_products(provider_input),  # type: ignore[arg-type]
+            )
+            product_stats = _run_erp_stage(
+                "sync_products",
+                lambda: erp_service.sync_products(integration, product_records),
+            )
+            stock_records, stock_cursor = _run_erp_stage(
+                "fetch_stock",
+                lambda: adapter.fetch_stock(provider_input),  # type: ignore[arg-type]
+            )
+            stock_stats = _run_erp_stage(
+                "sync_stock",
+                lambda: erp_service.sync_stock(integration, stock_records),
+            )
+            if movement_cursor is not None:
+                logger.info(
+                    "runtime_erp_movement_cursor tenant_id=%s integration_id=%s provider=%s sync_job_id=%s stage=%s result=%s cursor=%s",
+                    integration.account_id,
+                    integration.id,
+                    provider_value,
+                    job.id,
+                    "fetch_movements",
+                    "start",
+                    movement_cursor.value,
+                )
+            movement_records, movement_cursor = _run_erp_stage(
+                "fetch_movements",
+                lambda: adapter.fetch_movements(provider_input, cursor=movement_cursor),  # type: ignore[arg-type]
+            )
+            movement_stats = _run_erp_stage(
+                "sync_movements",
+                lambda: erp_service.sync_movements(integration, movement_records),
+            )
+            cursor_json = dict(job.cursor_json or {})
+            cursor_json["movements"] = movement_cursor.value
+            job.cursor_json = cursor_json
+            logger.info(
+                "runtime_erp_movement_cursor tenant_id=%s integration_id=%s provider=%s sync_job_id=%s stage=%s result=%s fetched_count=%s next_cursor=%s completed_window=%s",
+                integration.account_id,
+                integration.id,
+                provider_value,
+                job.id,
+                "sync_movements",
+                "done",
+                movement_cursor.value.get("demand_documents_fetched", ""),
+                movement_cursor.value.get("next_cursor", ""),
+                movement_cursor.value.get("completed_window", ""),
+            )
+            self.session.flush()
+            purchase_records, purchase_cursor = _run_erp_stage(
+                "fetch_purchases",
+                lambda: adapter.fetch_purchases(provider_input),  # type: ignore[arg-type]
+            )
+            purchase_stats = _run_erp_stage(
+                "sync_purchases",
+                lambda: erp_service.sync_purchases(integration, purchase_records),
+            )
             return {
                 "mode": "provider",
                 "provider_name": integration.provider_name,
@@ -1107,7 +1448,7 @@ class RuntimeIntegrationService:
                 summary[key] = "configured"
                 continue
             text = str(value)
-            if key.endswith("token") or "password" in key or "secret" in key:
+            if key.endswith("token") or "password" in key or "secret" in key or "session" in key or key.endswith("_string"):
                 suffix = text[-4:] if len(text) >= 4 else "****"
                 summary[key] = f"••••{suffix}"
             elif key == "fixture_payload":
@@ -1184,18 +1525,24 @@ class RuntimeIntegrationService:
 
 
 class SchedulerService:
-    def __init__(self, session: Session, *, worker_id: str, lease_ttl_seconds: int) -> None:
+    def __init__(self, session: Session, *, worker_id: str, lease_ttl_seconds: int, sync_auto_interval_seconds: int = 600) -> None:
         self.session = session
         self.worker_id = worker_id
         self.lease_ttl_seconds = lease_ttl_seconds
+        self.sync_auto_interval_seconds = max(60, int(sync_auto_interval_seconds))
         self._lease_service = RuntimeLeaseService(session)
         self._audit = AuditLogService(session)
 
     def run_once(self, *, run_rules: bool = True, run_sync_jobs: bool = True) -> dict[str, object]:
         rule_runs = self._run_rules_once() if run_rules else 0
+        enqueued_sync_jobs = self._enqueue_periodic_sync_jobs_once() if run_sync_jobs else 0
         sync_runs = self._run_sync_jobs_once() if run_sync_jobs else 0
         self.session.flush()
-        return {"rule_accounts_processed": rule_runs, "sync_jobs_processed": sync_runs}
+        return {
+            "rule_accounts_processed": rule_runs,
+            "sync_jobs_enqueued": enqueued_sync_jobs,
+            "sync_jobs_processed": sync_runs,
+        }
 
     def _run_rules_once(self) -> int:
         processed = 0
@@ -1234,6 +1581,72 @@ class SchedulerService:
             runtime.execute_job(job.id, owner=self.worker_id, ttl_seconds=self.lease_ttl_seconds)
             processed += 1
         return processed
+
+    def _enqueue_periodic_sync_jobs_once(self) -> int:
+        runtime = RuntimeIntegrationService(self.session)
+        now = datetime.now(timezone.utc)
+        integrations = self.session.execute(
+            select(Integration).where(
+                Integration.status == "active",
+            ).order_by(Integration.account_id.asc(), Integration.id.asc())
+        ).scalars().all()
+        enqueued = 0
+        for integration in integrations:
+            if not runtime.supports_sync(integration.provider_kind, integration.provider_name):
+                continue
+            if not self._should_enqueue_periodic_sync(runtime, integration, now):
+                continue
+            bucket = int(now.timestamp()) // self.sync_auto_interval_seconds
+            context = TenantContext(account_id=integration.account_id, actor_user_id=None, source="scheduler", is_system=True)
+            runtime.enqueue_sync_job(
+                context,
+                integration_id=integration.id,
+                job_type="full_sync",
+                trigger_mode="scheduled",
+                idempotency_key=f"scheduled-sync:{integration.id}:{bucket}",
+                scope_json={"source": "scheduler", "interval_seconds": self.sync_auto_interval_seconds},
+                scheduled_at=now,
+            )
+            enqueued += 1
+        return enqueued
+
+    def _should_enqueue_periodic_sync(
+        self,
+        runtime: RuntimeIntegrationService,
+        integration: Integration,
+        now: datetime,
+    ) -> bool:
+        del runtime
+        pending_job = self.session.execute(
+            select(SyncJob).where(
+                SyncJob.account_id == integration.account_id,
+                SyncJob.integration_id == integration.id,
+                SyncJob.status.in_(("pending", "running", "retry")),
+            )
+        ).scalars().first()
+        if pending_job is not None:
+            return False
+        latest_job = self.session.execute(
+            select(SyncJob)
+            .where(
+                SyncJob.account_id == integration.account_id,
+                SyncJob.integration_id == integration.id,
+            )
+            .order_by(SyncJob.id.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+        last_activity = integration.last_sync_at
+        if latest_job is not None:
+            latest_job_at = latest_job.finished_at or latest_job.started_at or latest_job.scheduled_at
+            if latest_job_at is not None and (last_activity is None or latest_job_at > last_activity):
+                last_activity = latest_job_at
+        if last_activity is None:
+            return True
+        if last_activity.tzinfo is None:
+            last_activity = last_activity.replace(tzinfo=timezone.utc)
+        else:
+            last_activity = last_activity.astimezone(timezone.utc)
+        return (now - last_activity) >= timedelta(seconds=self.sync_auto_interval_seconds)
 
 
 class AdminQueryService:

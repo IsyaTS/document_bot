@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Any
@@ -29,6 +30,10 @@ from platform_core.providers.contracts import (
 )
 from platform_core.providers.avito_client import AvitoAPIClient
 from platform_core.providers.moysklad_client import MoySkladAPIClient
+from platform_core.settings import load_platform_settings
+from platform_core.telegram_accounts import send_saved_message_sync
+
+logger = logging.getLogger(__name__)
 
 
 def _dt(value: str | None) -> datetime | None:
@@ -162,13 +167,19 @@ class AvitoAdsProviderAdapter(AdsProvider):
                 "connected": True,
                 "account_ref": self._account_ref(credentials) if credentials.get("account_external_id") else None,
             }
-        campaigns, _ = self.fetch_campaigns(credentials)
+        account_ref = self._account_ref(credentials)
+        profile: dict[str, Any] = {}
+        try:
+            profile = self._client(credentials).fetch_json("/core/v1/accounts/self")
+        except requests.RequestException:
+            profile = {}
         return {
             "provider_name": self.provider_name,
             "mode": "live",
             "connected": True,
-            "account_ref": self._account_ref(credentials),
-            "campaigns_sampled": len(campaigns),
+            "account_ref": account_ref,
+            "profile_name": self._string_field(profile, "name"),
+            "profile_url": self._string_field(profile, "profile_url"),
         }
 
     def _cursor_token(self, cursor: SyncCursor | None, key: str) -> str | None:
@@ -233,13 +244,19 @@ class AvitoAdsProviderAdapter(AdsProvider):
         if not rows:
             client = self._client(credentials)
             account_ref = self._account_ref(credentials)
-            rows, next_cursor = client.fetch_paginated(
-                self.campaigns_path_template.format(account_ref=account_ref),
-                params=self._query_params(credentials, "campaigns"),
-                items_key="campaigns",
-                cursor=self._cursor_token(cursor, "campaigns"),
-                cursor_param="cursor",
-            )
+            try:
+                rows, next_cursor = client.fetch_paginated(
+                    self.campaigns_path_template.format(account_ref=account_ref),
+                    params=self._query_params(credentials, "campaigns"),
+                    items_key="campaigns",
+                    cursor=self._cursor_token(cursor, "campaigns"),
+                    cursor_param="cursor",
+                )
+            except requests.HTTPError as exc:
+                if self._is_nonfatal_avito_section_error(exc):
+                    rows, next_cursor = [], None
+                else:
+                    raise
         records = [
             AdsCampaignRecord(
                 external_id=str(self._field(row, "external_id", "campaign_id", "campaignId", "id", "itemId")),
@@ -306,17 +323,23 @@ class AvitoAdsProviderAdapter(AdsProvider):
         if not rows:
             client = self._client(credentials)
             account_ref = self._account_ref(credentials)
-            rows, next_cursor = client.fetch_paginated(
-                self.metrics_path_template.format(account_ref=account_ref),
-                params={
-                    **self._query_params(credentials, "metrics"),
-                    "dateFrom": date_from.isoformat(),
-                    "dateTo": date_to.isoformat(),
-                },
-                items_key="metrics",
-                cursor=self._cursor_token(cursor, "metrics"),
-                cursor_param="cursor",
-            )
+            try:
+                rows, next_cursor = client.fetch_paginated(
+                    self.metrics_path_template.format(account_ref=account_ref),
+                    params={
+                        **self._query_params(credentials, "metrics"),
+                        "dateFrom": date_from.isoformat(),
+                        "dateTo": date_to.isoformat(),
+                    },
+                    items_key="metrics",
+                    cursor=self._cursor_token(cursor, "metrics"),
+                    cursor_param="cursor",
+                )
+            except requests.HTTPError as exc:
+                if self._is_nonfatal_avito_section_error(exc):
+                    rows, next_cursor = [], None
+                else:
+                    raise
         records = []
         for row in rows:
             metric_date = self._date_field(row, "metric_date", "date", "stats_date", "day")
@@ -386,17 +409,23 @@ class AvitoAdsProviderAdapter(AdsProvider):
         if not rows and path:
             client = self._client(credentials)
             account_ref = self._account_ref(credentials)
-            rows, next_cursor = client.fetch_paginated(
-                path.format(account_ref=account_ref),
-                params={
-                    **self._query_params(credentials, "lead_source_feed"),
-                    "dateFrom": date_from.isoformat(),
-                    "dateTo": date_to.isoformat(),
-                },
-                items_key=str(credentials.get("lead_source_feed_items_key") or "items"),
-                cursor=self._cursor_token(cursor, "lead_source_feed"),
-                cursor_param=str(credentials.get("lead_source_feed_cursor_param") or "cursor"),
-            )
+            try:
+                rows, next_cursor = client.fetch_paginated(
+                    path.format(account_ref=account_ref),
+                    params={
+                        **self._query_params(credentials, "lead_source_feed"),
+                        "dateFrom": date_from.isoformat(),
+                        "dateTo": date_to.isoformat(),
+                    },
+                    items_key=str(credentials.get("lead_source_feed_items_key") or "items"),
+                    cursor=self._cursor_token(cursor, "lead_source_feed"),
+                    cursor_param=str(credentials.get("lead_source_feed_cursor_param") or "cursor"),
+                )
+            except requests.HTTPError as exc:
+                if self._is_nonfatal_avito_section_error(exc):
+                    rows, next_cursor = [], None
+                else:
+                    raise
         feed: dict[str, dict[str, object]] = {}
         for row in rows:
             normalized = self._normalize_source_feed_row(row)
@@ -411,17 +440,23 @@ class AvitoAdsProviderAdapter(AdsProvider):
         if not rows:
             client = self._client(credentials)
             account_ref = self._account_ref(credentials)
-            rows, next_cursor = client.fetch_paginated(
-                self.leads_path_template.format(account_ref=account_ref),
-                params={
-                    **self._query_params(credentials, "leads"),
-                    "dateFrom": date_from.isoformat(),
-                    "dateTo": date_to.isoformat(),
-                },
-                items_key="leads",
-                cursor=self._cursor_token(cursor, "leads"),
-                cursor_param="cursor",
-            )
+            try:
+                rows, next_cursor = client.fetch_paginated(
+                    self.leads_path_template.format(account_ref=account_ref),
+                    params={
+                        **self._query_params(credentials, "leads"),
+                        "dateFrom": date_from.isoformat(),
+                        "dateTo": date_to.isoformat(),
+                    },
+                    items_key="leads",
+                    cursor=self._cursor_token(cursor, "leads"),
+                    cursor_param="cursor",
+                )
+            except requests.HTTPError as exc:
+                if self._is_nonfatal_avito_section_error(exc):
+                    rows, next_cursor = [], None
+                else:
+                    raise
         records: list[AdsLeadRecord] = []
         for row in rows:
             created_at = self._datetime_field(
@@ -574,13 +609,56 @@ class AvitoAdsProviderAdapter(AdsProvider):
 
     def _account_ref(self, credentials: dict[str, object]) -> str:
         account_ref = credentials.get("account_external_id") or credentials.get("account_id") or credentials.get("user_id")
+        if not account_ref and not credentials.get("fixture_payload"):
+            account_ref = self._resolve_account_ref_from_api(credentials)
+            if account_ref:
+                credentials["account_external_id"] = str(account_ref)
         if not account_ref:
             raise ValueError("Avito credentials require account_external_id for live API mode.")
         return str(account_ref)
 
+    def _resolve_account_ref_from_api(self, credentials: dict[str, object]) -> str | None:
+        client = self._client(credentials)
+        candidate_paths = (
+            "/core/v1/accounts/self",
+            "/core/v1/accounts",
+            "/messenger/v1/accounts",
+        )
+        for path in candidate_paths:
+            try:
+                payload = client.fetch_json(path)
+            except requests.RequestException:
+                continue
+            resolved = self._extract_account_ref(payload)
+            if resolved:
+                return resolved
+        return None
+
+    def _extract_account_ref(self, payload: dict[str, Any]) -> str | None:
+        if not isinstance(payload, dict):
+            return None
+        direct = self._string_field(payload, "id", "user_id", "account_id", "accountId", "userId")
+        if direct:
+            return direct
+        for list_key in ("accounts", "result.accounts", "data.accounts", "items", "result.items"):
+            rows = self._field(payload, list_key)
+            if not isinstance(rows, list):
+                continue
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                value = self._string_field(row, "id", "user_id", "account_id", "accountId", "userId")
+                if value:
+                    return value
+        return None
+
     def _query_params(self, credentials: dict[str, object], section: str) -> dict[str, object]:
         params = credentials.get(f"{section}_params") or {}
         return dict(params) if isinstance(params, dict) else {}
+
+    def _is_nonfatal_avito_section_error(self, exc: requests.HTTPError) -> bool:
+        status_code = exc.response.status_code if exc.response is not None else None
+        return status_code in {403, 404}
 
     def _source_feed_rows(self, credentials: dict[str, object]) -> list[dict[str, Any]]:
         raw = credentials.get("lead_sources")
@@ -742,6 +820,78 @@ class AvitoAdsProviderAdapter(AdsProvider):
 class MoySkladERPProviderAdapter(ERPProvider):
     provider_name = "moysklad"
 
+    def _cursor_int(self, cursor: SyncCursor | None, key: str, default: int) -> int:
+        if cursor is None or not isinstance(cursor.value, dict):
+            return default
+        value = cursor.value.get(key)
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return default
+
+    def _job_scope_int(self, credentials: dict[str, object], key: str, default: int) -> int:
+        scope = credentials.get("_job_scope") or {}
+        if isinstance(scope, dict):
+            value = scope.get(key)
+            try:
+                return max(1, int(value))
+            except (TypeError, ValueError):
+                pass
+        value = credentials.get(key)
+        try:
+            return max(1, int(value))
+        except (TypeError, ValueError):
+            return default
+
+    def _row_ref(self, row: dict[str, Any]) -> str:
+        return str(
+            row.get("id")
+            or row.get("name")
+            or row.get("article")
+            or row.get("external_id")
+            or "unknown"
+        ).strip()
+
+    def _log_row_skip(self, *, entity_path: str, stage: str, row: dict[str, Any], exc: Exception) -> None:
+        logger.warning(
+            "moysklad_row_skipped entity_path=%s stage=%s row_ref=%s error=%s",
+            entity_path,
+            stage,
+            self._row_ref(row),
+            exc,
+        )
+
+    def _entity_id(self, value, *fallbacks) -> str | None:
+        candidates = (value,) + fallbacks
+        for candidate in candidates:
+            if isinstance(candidate, dict):
+                if candidate.get("id"):
+                    return str(candidate["id"])
+                href = str(candidate.get("href") or "").strip()
+                if href:
+                    normalized_href = href.split("?", 1)[0].rstrip("/")
+                    entity_id = normalized_href.split("/")[-1]
+                    if entity_id:
+                        return entity_id
+                meta = candidate.get("meta") or {}
+                meta_href = str(meta.get("href") or "").strip()
+                if meta_href:
+                    normalized_href = meta_href.split("?", 1)[0].rstrip("/")
+                    entity_id = normalized_href.split("/")[-1]
+                    if entity_id:
+                        return entity_id
+            elif candidate not in (None, ""):
+                text = str(candidate).strip()
+                if not text:
+                    continue
+                if "/" in text or "?" in text:
+                    normalized_href = text.split("?", 1)[0].rstrip("/")
+                    entity_id = normalized_href.split("/")[-1]
+                    if entity_id:
+                        return entity_id
+                return text
+        return None
+
     def connect_account(self, credentials: dict[str, object]) -> dict[str, object]:
         if credentials.get("fixture_payload"):
             return {
@@ -761,100 +911,293 @@ class MoySkladERPProviderAdapter(ERPProvider):
         del cursor
         rows = _load_fixture(credentials, "products")
         if not rows:
-            rows = self._client(credentials).fetch_rows("entity/assortment", params={"limit": 100})
+            rows = self._client(credentials).fetch_all_rows("entity/assortment", params={"limit": 100})
         records: list[ERPProductRecord] = []
+        skipped_rows = 0
         for row in rows:
-            if row.get("archived") is True:
-                status = "archived"
-            else:
-                status = "active"
-            sale_prices = row.get("salePrices") or []
-            sale_price = None
-            if isinstance(sale_prices, list) and sale_prices:
-                sale_price = _decimal(sale_prices[0].get("value"), "100")
-            buy_price = _decimal((row.get("buyPrice") or {}).get("value"), "100")
-            category = row.get("productFolder") or {}
-            records.append(
-                ERPProductRecord(
-                    external_id=str(row["id"]),
-                    sku=str(row["article"]) if row.get("article") else None,
-                    name=str(row["name"]),
-                    unit=str((row.get("uom") or {}).get("name", "pcs")),
-                    status=status,
-                    list_price=sale_price,
-                    cost_price=buy_price,
-                    category_code=str(category.get("id")) if category.get("id") else None,
-                    metadata={
-                        "category_name": category.get("name"),
-                        "path_name": row.get("pathName"),
-                        "raw_type": (row.get("meta") or {}).get("type"),
-                    },
+            try:
+                if row.get("archived") is True:
+                    status = "archived"
+                else:
+                    status = "active"
+                sale_prices = row.get("salePrices") or []
+                sale_price = None
+                if isinstance(sale_prices, list) and sale_prices:
+                    sale_price = _decimal(sale_prices[0].get("value"), "100")
+                buy_price = _decimal((row.get("buyPrice") or {}).get("value"), "100")
+                category = row.get("productFolder") or {}
+                records.append(
+                    ERPProductRecord(
+                        external_id=str(row["id"]),
+                        sku=str(row["article"]) if row.get("article") else None,
+                        name=str(row["name"]),
+                        unit=str((row.get("uom") or {}).get("name", "pcs")),
+                        status=status,
+                        list_price=sale_price,
+                        cost_price=buy_price,
+                        category_code=str(category.get("id")) if category.get("id") else None,
+                        metadata={
+                            "category_name": category.get("name"),
+                            "path_name": row.get("pathName"),
+                            "raw_type": (row.get("meta") or {}).get("type"),
+                        },
+                    )
                 )
-            )
-        return records, SyncCursor(value={"products": len(records)})
+            except Exception as exc:
+                skipped_rows += 1
+                self._log_row_skip(entity_path="entity/assortment", stage="fetch_products", row=row, exc=exc)
+        return records, SyncCursor(value={"products": len(records), "skipped_rows": skipped_rows})
 
     def fetch_stock(self, credentials: dict[str, object], cursor=None):
         del cursor
         rows = _load_fixture(credentials, "stock")
         if not rows:
-            rows = self._client(credentials).fetch_rows("report/stock/all", params={"limit": 100})
-        records = [
-            ERPStockRecord(
-                external_product_id=str(row["external_product_id"] if "external_product_id" in row else row["assortment"]["id"]),
-                external_warehouse_id=str(row["external_warehouse_id"] if "external_warehouse_id" in row else row["store"]["id"]),
-                quantity_on_hand=_decimal(row.get("quantity_on_hand", row.get("stock"))) or Decimal("0"),
-                quantity_reserved=_decimal(row.get("quantity_reserved", row.get("reserve"))) or Decimal("0"),
-                metadata={
-                    "warehouse_name": row.get("warehouse_name") or row.get("store", {}).get("name"),
-                    "product_name": row.get("product_name") or row.get("assortment", {}).get("name"),
-                },
-            )
-            for row in rows
-        ]
-        return records, SyncCursor(value={"stock": len(records)})
+            rows = self._client(credentials).fetch_all_rows("report/stock/bystore", params={"limit": 100})
+        records: list[ERPStockRecord] = []
+        skipped_rows = 0
+        for row in rows:
+            try:
+                stock_by_store = row.get("stockByStore") or row.get("stock_by_store") or []
+                product_id = self._entity_id(
+                    row.get("external_product_id"),
+                    row.get("assortment"),
+                    row.get("product"),
+                    row.get("meta"),
+                    row.get("id"),
+                )
+                product_name = row.get("product_name") or (row.get("assortment") or {}).get("name") or row.get("name")
+                if isinstance(stock_by_store, list) and stock_by_store:
+                    for item in stock_by_store:
+                        warehouse_id = self._entity_id(
+                            item.get("external_warehouse_id"),
+                            item.get("store"),
+                            item.get("warehouse"),
+                            item.get("meta"),
+                            item.get("storeId"),
+                        )
+                        if not product_id or not warehouse_id:
+                            continue
+                        records.append(
+                            ERPStockRecord(
+                                external_product_id=product_id,
+                                external_warehouse_id=warehouse_id,
+                                quantity_on_hand=_decimal(item.get("quantity_on_hand", item.get("stock"))) or Decimal("0"),
+                                quantity_reserved=_decimal(item.get("quantity_reserved", item.get("reserve"))) or Decimal("0"),
+                                metadata={
+                                    "warehouse_name": item.get("warehouse_name")
+                                    or item.get("name")
+                                    or (item.get("store") or {}).get("name")
+                                    or (item.get("warehouse") or {}).get("name"),
+                                    "product_name": product_name,
+                                },
+                            )
+                        )
+                    continue
+                warehouse_id = self._entity_id(
+                    row.get("external_warehouse_id"),
+                    row.get("store"),
+                    row.get("warehouse"),
+                    row.get("storeId"),
+                )
+                if not product_id or not warehouse_id:
+                    continue
+                records.append(
+                    ERPStockRecord(
+                        external_product_id=product_id,
+                        external_warehouse_id=warehouse_id,
+                        quantity_on_hand=_decimal(row.get("quantity_on_hand", row.get("stock"))) or Decimal("0"),
+                        quantity_reserved=_decimal(row.get("quantity_reserved", row.get("reserve"))) or Decimal("0"),
+                        metadata={
+                            "warehouse_name": row.get("warehouse_name")
+                            or row.get("name")
+                            or (row.get("store") or {}).get("name")
+                            or (row.get("warehouse") or {}).get("name"),
+                            "product_name": product_name,
+                        },
+                    )
+                )
+            except Exception as exc:
+                skipped_rows += 1
+                self._log_row_skip(entity_path="report/stock/bystore", stage="fetch_stock", row=row, exc=exc)
+        return records, SyncCursor(value={"stock": len(records), "skipped_rows": skipped_rows})
 
     def fetch_movements(self, credentials: dict[str, object], cursor=None):
-        del cursor
-        rows = _load_fixture(credentials, "movements")
-        records = [
-            ERPStockMovementRecord(
-                external_product_id=str(row["external_product_id"]),
-                external_warehouse_id=str(row["external_warehouse_id"]),
-                movement_type=str(row["movement_type"]),
-                quantity_delta=_decimal(row.get("quantity_delta")) or Decimal("0"),
-                occurred_at=_dt(str(row["occurred_at"])) or datetime.now(timezone.utc),
-                unit_cost=_decimal(row.get("unit_cost")),
-                external_reference_id=str(row["external_reference_id"]) if row.get("external_reference_id") else None,
-                metadata={k: v for k, v in row.items() if k not in {"external_product_id", "external_warehouse_id", "movement_type", "quantity_delta", "occurred_at", "unit_cost", "external_reference_id"}},
+        records: list[ERPStockMovementRecord] = []
+        transfer_rows = _load_fixture(credentials, "movements")
+        demand_rows = _load_fixture(credentials, "demands")
+        demand_offset = self._cursor_int(cursor, "demand_offset", 0)
+        demand_limit = self._job_scope_int(credentials, "movements_demand_page_size", 100)
+        demand_max_pages = self._job_scope_int(credentials, "movements_demand_max_pages", 5)
+        demand_completed = False
+        demand_pages_fetched = 0
+        next_demand_offset = demand_offset
+        if not transfer_rows and not demand_rows:
+            client = self._client(credentials)
+            transfer_rows = client.fetch_all_rows("entity/move", params={"limit": 100, "expand": "positions,targetStore,sourceStore"})
+            logger.info(
+                "moysklad_fetch_movements_window provider=%s stage=%s cursor_offset=%s page_size=%s max_pages=%s result=%s",
+                self.provider_name,
+                "fetch_movements.demand",
+                demand_offset,
+                demand_limit,
+                demand_max_pages,
+                "start",
             )
-            for row in rows
-        ]
-        return records, SyncCursor(value={"movements": len(records)})
+            for page_index in range(demand_max_pages):
+                current_offset = demand_offset + (page_index * demand_limit)
+                rows = client.fetch_rows(
+                    "entity/demand",
+                    params={
+                        "limit": demand_limit,
+                        "offset": current_offset,
+                        "expand": "positions,store,agent",
+                    },
+                )
+                demand_rows.extend(rows)
+                demand_pages_fetched += 1
+                next_demand_offset = current_offset + len(rows)
+                if not rows or len(rows) < demand_limit:
+                    demand_completed = True
+                    break
+            logger.info(
+                "moysklad_fetch_movements_window provider=%s stage=%s cursor_offset=%s fetched_count=%s pages_fetched=%s next_cursor=%s completed_window=%s result=%s",
+                self.provider_name,
+                "fetch_movements.demand",
+                demand_offset,
+                len(demand_rows),
+                demand_pages_fetched,
+                next_demand_offset,
+                demand_completed,
+                "done",
+            )
+        elif demand_rows:
+            next_demand_offset = len(demand_rows)
+            demand_completed = True
+        skipped_rows = 0
+        for row in transfer_rows:
+            try:
+                positions = ((row.get("positions") or {}).get("rows") or []) if isinstance(row.get("positions"), dict) else []
+                warehouse_id = self._entity_id(row.get("targetStore"), row.get("sourceStore"))
+                warehouse_name = ((row.get("targetStore") or {}).get("name") if isinstance(row.get("targetStore"), dict) else None) or ((row.get("sourceStore") or {}).get("name") if isinstance(row.get("sourceStore"), dict) else None)
+                occurred_at = _dt(row.get("moment")) or datetime.now(timezone.utc)
+                move_ref = str(row.get("id") or row.get("name") or "").strip()
+                if not positions:
+                    continue
+                for position in positions:
+                    product_id = self._entity_id(position.get("external_product_id"), position.get("assortment"))
+                    if not product_id or not warehouse_id:
+                        continue
+                    quantity = _decimal(position.get("quantity")) or Decimal("0")
+                    if quantity == 0:
+                        continue
+                    line_ref = str(position.get("id") or product_id).strip()
+                    records.append(
+                        ERPStockMovementRecord(
+                            external_product_id=product_id,
+                            external_warehouse_id=warehouse_id,
+                            movement_type="transfer",
+                            quantity_delta=quantity,
+                            occurred_at=occurred_at,
+                            unit_cost=_decimal(position.get("price"), "100") or _decimal(row.get("sum"), "100"),
+                            external_reference_id=f"move:{move_ref}:{line_ref}" if move_ref else None,
+                            metadata={
+                                "warehouse_name": warehouse_name,
+                                "source_warehouse_name": (row.get("sourceStore") or {}).get("name") if isinstance(row.get("sourceStore"), dict) else None,
+                                "target_warehouse_name": (row.get("targetStore") or {}).get("name") if isinstance(row.get("targetStore"), dict) else None,
+                                "move_name": row.get("name"),
+                            },
+                        )
+                    )
+            except Exception as exc:
+                skipped_rows += 1
+                self._log_row_skip(entity_path="entity/move", stage="fetch_movements.transfer", row=row, exc=exc)
+        for row in demand_rows:
+            try:
+                positions = ((row.get("positions") or {}).get("rows") or []) if isinstance(row.get("positions"), dict) else []
+                warehouse_id = self._entity_id(row.get("external_warehouse_id"), row.get("store"))
+                warehouse_name = row.get("warehouse_name") or (row.get("store") or {}).get("name")
+                occurred_at = _dt(row.get("moment")) or datetime.now(timezone.utc)
+                demand_ref = str(row.get("id") or row.get("name") or row.get("demand_number") or "").strip()
+                if not positions:
+                    continue
+                for position in positions:
+                    product_id = self._entity_id(position.get("external_product_id"), position.get("assortment"))
+                    if not product_id or not warehouse_id:
+                        continue
+                    quantity = _decimal(position.get("quantity")) or Decimal("0")
+                    if quantity == 0:
+                        continue
+                    unit_price = _decimal(position.get("price"), "100")
+                    total_amount = _decimal(position.get("sum"), "100")
+                    line_ref = str(position.get("id") or product_id).strip()
+                    records.append(
+                        ERPStockMovementRecord(
+                            external_product_id=product_id,
+                            external_warehouse_id=warehouse_id,
+                            movement_type="shipment_dispatch",
+                            quantity_delta=-quantity,
+                            occurred_at=occurred_at,
+                            unit_cost=_decimal(position.get("cost"), "100") or _decimal(position.get("buyPrice"), "100"),
+                            external_reference_id=f"demand:{demand_ref}:{line_ref}" if demand_ref else None,
+                            metadata={
+                                "warehouse_name": warehouse_name,
+                                "customer_external_id": self._entity_id(row.get("customer_external_id"), row.get("agent")),
+                                "customer_name": row.get("customer_name") or (row.get("agent") or {}).get("name"),
+                                "unit_price": str(unit_price) if unit_price is not None else None,
+                                "total_amount": str(total_amount) if total_amount is not None else None,
+                                "document_number": row.get("demand_number") or row.get("name"),
+                                "demand_name": row.get("name"),
+                                "source_document_type": "demand",
+                            },
+                        )
+                    )
+            except Exception as exc:
+                skipped_rows += 1
+                self._log_row_skip(entity_path="entity/demand", stage="fetch_movements.demand", row=row, exc=exc)
+        return records, SyncCursor(
+            value={
+                "movements": len(records),
+                "skipped_rows": skipped_rows,
+                "demand_offset": next_demand_offset,
+                "demand_page_size": demand_limit,
+                "demand_pages_fetched": demand_pages_fetched,
+                "demand_documents_fetched": len(demand_rows),
+                "demand_completed": demand_completed,
+                "completed_window": demand_completed,
+                "next_cursor": {"demand_offset": next_demand_offset},
+            }
+        )
 
     def fetch_purchases(self, credentials: dict[str, object], cursor=None):
         del cursor
         rows = _load_fixture(credentials, "purchases")
         if not rows:
-            rows = self._client(credentials).fetch_rows("entity/supply", params={"limit": 100})
-        records = [
-            ERPPurchaseRecord(
-                external_id=str(row["external_id"] if "external_id" in row else row["id"]),
-                purchase_number=str(row.get("purchase_number") or row.get("name")) if row.get("purchase_number") or row.get("name") else None,
-                status=str(row.get("status", "received" if row.get("applicable", True) else "draft")),
-                total_amount=_decimal(row.get("total_amount", row.get("sum")), "100") or Decimal("0"),
-                currency=str(row.get("currency", "RUB")),
-                ordered_at=_dt(row.get("ordered_at") or row.get("moment")),
-                received_at=_dt(row.get("received_at") or row.get("moment")),
-                supplier_external_id=str(row["supplier_external_id"]) if row.get("supplier_external_id") else str((row.get("agent") or {}).get("id")) if (row.get("agent") or {}).get("id") else None,
-                warehouse_external_id=str(row["warehouse_external_id"]) if row.get("warehouse_external_id") else str((row.get("store") or {}).get("id")) if (row.get("store") or {}).get("id") else None,
-                metadata={
-                    "supplier_name": row.get("supplier_name") or (row.get("agent") or {}).get("name"),
-                    "warehouse_name": row.get("warehouse_name") or (row.get("store") or {}).get("name"),
-                },
-            )
-            for row in rows
-        ]
-        return records, SyncCursor(value={"purchases": len(records)})
+            rows = self._client(credentials).fetch_all_rows("entity/supply", params={"limit": 100, "expand": "agent,store"})
+        records: list[ERPPurchaseRecord] = []
+        skipped_rows = 0
+        for row in rows:
+            try:
+                records.append(
+                    ERPPurchaseRecord(
+                        external_id=str(row["external_id"] if "external_id" in row else row["id"]),
+                        purchase_number=str(row.get("purchase_number") or row.get("name")) if row.get("purchase_number") or row.get("name") else None,
+                        status=str(row.get("status", "received" if row.get("applicable", True) else "draft")),
+                        total_amount=_decimal(row.get("total_amount", row.get("sum")), "100") or Decimal("0"),
+                        currency=str(row.get("currency", "RUB")),
+                        ordered_at=_dt(row.get("ordered_at") or row.get("moment")),
+                        received_at=_dt(row.get("received_at") or row.get("moment")),
+                        supplier_external_id=self._entity_id(row.get("supplier_external_id"), row.get("agent")),
+                        warehouse_external_id=self._entity_id(row.get("warehouse_external_id"), row.get("store")),
+                        metadata={
+                            "supplier_name": row.get("supplier_name") or (row.get("agent") or {}).get("name"),
+                            "warehouse_name": row.get("warehouse_name") or (row.get("store") or {}).get("name"),
+                        },
+                    )
+                )
+            except Exception as exc:
+                skipped_rows += 1
+                self._log_row_skip(entity_path="entity/supply", stage="fetch_purchases", row=row, exc=exc)
+        return records, SyncCursor(value={"purchases": len(records), "skipped_rows": skipped_rows})
 
     def _client(self, credentials: dict[str, object]) -> MoySkladAPIClient:
         login = str(credentials.get("login") or "")
@@ -873,22 +1216,24 @@ class TelegramMessagingProviderAdapter(MessagingProvider):
     provider_name = "telegram"
 
     def send(self, credentials: dict[str, object], request):
-        bot_token = str(credentials.get("bot_token") or "")
-        if not bot_token:
-            raise ValueError("Telegram credentials require bot_token.")
-        response = requests.post(
-            f"https://api.telegram.org/bot{bot_token}/sendMessage",
-            json={"chat_id": request.recipient_external_id, "text": request.body},
-            timeout=int(credentials.get("timeout_seconds", 15)),
+        settings = load_platform_settings()
+        if not settings.telegram_api_id or not settings.telegram_api_hash:
+            raise ValueError("PLATFORM_TELEGRAM_API_ID and PLATFORM_TELEGRAM_API_HASH are required.")
+        session_string = str(credentials.get("session_string") or "").strip()
+        if not session_string:
+            raise ValueError("Telegram credentials require session_string.")
+        result = send_saved_message_sync(
+            api_id=settings.telegram_api_id,
+            api_hash=settings.telegram_api_hash,
+            session_string=session_string,
+            text=request.body,
+            peer=str(request.recipient_external_id or "me").strip() or "me",
         )
-        response.raise_for_status()
-        payload = response.json()
-        result = payload.get("result") or {}
         return MessageSendResult(
-            provider_message_id=str(result.get("message_id") or payload.get("ok") or "telegram-message"),
-            sent_at=datetime.now(timezone.utc),
+            provider_message_id=str(result.get("message_id") or "telegram-message"),
+            sent_at=result.get("sent_at") if isinstance(result.get("sent_at"), datetime) else datetime.now(timezone.utc),
             status="sent",
-            metadata={"telegram_response": payload},
+            metadata={"telegram_response": result},
         )
 
     def receive_webhook(self, headers: dict[str, str], body: bytes):
