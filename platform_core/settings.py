@@ -29,6 +29,11 @@ class PlatformSettings:
     worker_poll_interval_seconds: int
     runtime_lease_ttl_seconds: int
     notification_telegram_bot_token: str | None
+    telegram_api_id: str | None
+    telegram_api_hash: str | None
+    avito_client_id: str | None
+    avito_client_secret: str | None
+    avito_oauth_scope: str | None
     openai_api_key: str | None
     openai_model: str
     openai_reasoning_effort: str
@@ -86,6 +91,11 @@ def load_platform_settings() -> PlatformSettings:
         worker_poll_interval_seconds=max(1, int(os.getenv("PLATFORM_WORKER_POLL_INTERVAL_SECONDS", "30"))),
         runtime_lease_ttl_seconds=max(15, int(os.getenv("PLATFORM_RUNTIME_LEASE_TTL_SECONDS", "120"))),
         notification_telegram_bot_token=os.getenv("PLATFORM_NOTIFICATION_TELEGRAM_BOT_TOKEN") or None,
+        telegram_api_id=os.getenv("PLATFORM_TELEGRAM_API_ID") or None,
+        telegram_api_hash=os.getenv("PLATFORM_TELEGRAM_API_HASH") or None,
+        avito_client_id=os.getenv("PLATFORM_AVITO_CLIENT_ID") or None,
+        avito_client_secret=os.getenv("PLATFORM_AVITO_CLIENT_SECRET") or None,
+        avito_oauth_scope=os.getenv("PLATFORM_AVITO_OAUTH_SCOPE") or None,
         openai_api_key=os.getenv("PLATFORM_OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY") or None,
         openai_model=(os.getenv("PLATFORM_OPENAI_MODEL") or os.getenv("OPENAI_MODEL") or "gpt-5-mini").strip() or "gpt-5-mini",
         openai_reasoning_effort=(os.getenv("PLATFORM_OPENAI_REASONING_EFFORT", "medium").strip() or "medium"),
